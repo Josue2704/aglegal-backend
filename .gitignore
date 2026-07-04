@@ -22,6 +22,7 @@ env/
 .env
 .env.*
 !.env.production.example
+CREDENTIALS.md
 secrets.json
 google_tokens.json
 
