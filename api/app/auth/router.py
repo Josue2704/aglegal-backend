@@ -10,10 +10,10 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 def _build_user_info(conn, username: str) -> UserInfo:
     row = conn.execute(
-        """SELECT u.id, u.username, u.full_name, u.role_id,
-                  r.name AS role_name, r.is_system
+        """SELECT u.id, u.username, u.full_name,
+                  r.id AS role_id, r.name AS role_name, r.is_system
            FROM users u
-           LEFT JOIN roles r ON r.id = u.role_id
+           LEFT JOIN roles r ON r.name = u.role OR r.id::text = u.role
            WHERE u.username=%s""",
         (username,),
     ).fetchone()
