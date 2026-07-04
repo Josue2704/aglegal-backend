@@ -1,9 +1,15 @@
 from pydantic import BaseModel, ConfigDict
 
 
+CLIENT_TYPES = ["Física", "Jurídica"]
+
+
 class ClientIn(BaseModel):
     name: str
+    client_type: str = "Física"
+    id_number: str = ""
     phone: str = ""
+    phone2: str = ""
     email: str = ""
     address: str = ""
     notes: str = ""
@@ -12,7 +18,10 @@ class ClientIn(BaseModel):
 class ClientOut(BaseModel):
     id: int
     name: str
+    client_type: str = "Física"
+    id_number: str | None = None
     phone: str | None = None
+    phone2: str | None = None
     email: str | None = None
     address: str | None = None
     notes: str | None = None

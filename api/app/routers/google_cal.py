@@ -30,7 +30,7 @@ class ImportOut(BaseModel):
 
 @router.get("/status", response_model=StatusOut)
 def gcal_status(current_user: CurrentUser, repo: RepoDep) -> StatusOut:
-    row = repo.get_google_tokens(current_user)
+    row = repo.get_google_tokens(current_user["username"])
     return StatusOut(connected=row is not None)
 
 
@@ -39,7 +39,7 @@ def gcal_authorize(current_user: CurrentUser) -> AuthUrlOut:
     s = get_settings()
     if not s.google_client_id or not s.google_client_secret:
         raise HTTPException(503, "Google Calendar no está configurado en el servidor. Añade GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET al .env")
-    url = gcal.get_auth_url(current_user)
+    url = gcal.get_auth_url(current_user["username"])
     return AuthUrlOut(url=url)
 
 
@@ -60,21 +60,7 @@ def gcal_callback(code: str, state: str, repo: RepoDep):
 
 @router.delete("/disconnect", status_code=204)
 def gcal_disconnect(current_user: CurrentUser, repo: RepoDep):
-    repo.delete_google_tokens(current_user)
-
-
-def _google_calendar_client_id(repo: RepoDep) -> int:
-    row = repo.conn.execute(
-        "SELECT id FROM clients WHERE name=? ORDER BY id LIMIT 1",
-        ("Google Calendar",),
-    ).fetchone()
-    if row:
-        return int(row["id"])
-    return repo.create_client(
-        name="Google Calendar",
-        notes="Eventos importados desde Google Calendar sin cliente vinculado.",
-        created_at=now_iso(),
-    )
+    repo.delete_google_tokens(current_user["username"])
 
 
 def _parse_google_event(event: dict) -> dict | None:
@@ -106,7 +92,7 @@ def _parse_google_event(event: dict) -> dict | None:
 
 @router.post("/import", response_model=ImportOut)
 def gcal_import(current_user: CurrentUser, repo: RepoDep) -> ImportOut:
-    token_row = repo.get_google_tokens(current_user)
+    token_row = repo.get_google_tokens(current_user["username"])
     if not token_row:
         raise HTTPException(409, "Google Calendar no está conectado.")
 
@@ -114,7 +100,6 @@ def gcal_import(current_user: CurrentUser, repo: RepoDep) -> ImportOut:
     time_min = datetime.combine(today - timedelta(days=90), datetime.min.time(), tzinfo=timezone.utc)
     time_max = datetime.combine(today + timedelta(days=180), datetime.max.time(), tzinfo=timezone.utc)
     events = gcal.list_events(token_row, time_min, time_max)
-    client_id = _google_calendar_client_id(repo)
     imported = 0
     updated = 0
 
@@ -123,7 +108,7 @@ def gcal_import(current_user: CurrentUser, repo: RepoDep) -> ImportOut:
         if not parsed or not parsed["event_id"]:
             continue
         existing = repo.conn.execute(
-            "SELECT id, status FROM sessions WHERE gcal_event_id=?",
+            "SELECT id, status FROM sessions WHERE gcal_event_id=%s",
             (parsed["event_id"],),
         ).fetchone()
         if existing:
@@ -140,7 +125,7 @@ def gcal_import(current_user: CurrentUser, repo: RepoDep) -> ImportOut:
             updated += 1
         else:
             session_id = repo.create_session(
-                client_id=client_id,
+                client_id=None,
                 case_id=None,
                 session_date=parsed["session_date"],
                 start_time=parsed["start_time"],

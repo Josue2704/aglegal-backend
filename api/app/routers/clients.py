@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, RepoDep
+from ..deps import CurrentUser, LawyerRequired, RepoDep
 from ..schemas.client import ClientIn, ClientOut, HistoryItem
 
 router = APIRouter(prefix="/clients", tags=["clients"])
@@ -24,13 +24,16 @@ def client_choices(current_user: CurrentUser, repo: RepoDep) -> list[dict]:
 def create_client(body: ClientIn, current_user: CurrentUser, repo: RepoDep) -> ClientOut:
     client_id = repo.create_client(
         name=body.name,
+        client_type=body.client_type,
+        id_number=body.id_number,
         phone=body.phone,
+        phone2=body.phone2,
         email=body.email,
         address=body.address,
         notes=body.notes,
         created_at=now_iso(),
     )
-    row = repo.conn.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
+    row = repo.conn.execute("SELECT * FROM clients WHERE id=%s", (client_id,)).fetchone()
     return ClientOut(**dict(row))
 
 
@@ -39,25 +42,28 @@ def update_client(client_id: int, body: ClientIn, current_user: CurrentUser, rep
     repo.update_client(
         client_id,
         name=body.name,
+        client_type=body.client_type,
+        id_number=body.id_number,
         phone=body.phone,
+        phone2=body.phone2,
         email=body.email,
         address=body.address,
         notes=body.notes,
     )
-    row = repo.conn.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
+    row = repo.conn.execute("SELECT * FROM clients WHERE id=%s", (client_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Cliente no encontrado")
     return ClientOut(**dict(row))
 
 
 @router.delete("/{client_id}", status_code=204)
-def delete_client(client_id: int, current_user: CurrentUser, repo: RepoDep):
+def delete_client(client_id: int, current_user: LawyerRequired, repo: RepoDep):
     repo.delete_client(client_id)
 
 
 @router.get("/{client_id}", response_model=ClientOut)
 def get_client(client_id: int, current_user: CurrentUser, repo: RepoDep) -> ClientOut:
-    row = repo.conn.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
+    row = repo.conn.execute("SELECT * FROM clients WHERE id=%s", (client_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Cliente no encontrado")
     return ClientOut(**dict(row))

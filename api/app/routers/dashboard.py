@@ -14,6 +14,32 @@ from ..schemas.dashboard import (
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
+@router.get("/upcoming-sessions")
+def upcoming_sessions(
+    current_user: CurrentUser,
+    repo: RepoDep,
+    days: int = 7,
+) -> list[dict]:
+    return [dict(r) for r in repo.upcoming_sessions(days=days)]
+
+
+@router.get("/alerts")
+def alerts(current_user: CurrentUser, repo: RepoDep) -> dict:
+    return repo.dashboard_alerts()
+
+
+@router.get("/search")
+def global_search(
+    q: str,
+    current_user: CurrentUser,
+    repo: RepoDep,
+    limit: int = 8,
+) -> dict:
+    if not q or len(q.strip()) < 2:
+        return {"clients": [], "cases": [], "sessions": []}
+    return repo.global_search(q.strip(), limit=limit)
+
+
 @router.get("/kpis", response_model=MonthlyMetrics)
 def monthly_kpis(current_user: CurrentUser, repo: RepoDep) -> MonthlyMetrics:
     m = repo.dashboard_metrics_month()

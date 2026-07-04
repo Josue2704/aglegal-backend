@@ -21,6 +21,7 @@ env/
 *.sqlite3
 .env
 .env.*
+!.env.production.example
 secrets.json
 google_tokens.json
 

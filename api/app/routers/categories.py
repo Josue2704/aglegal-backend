@@ -25,14 +25,14 @@ def list_categories(current_user: CurrentUser, repo: RepoDep, kind: str = "incom
 @router.post("", response_model=CategoryOut, status_code=201)
 def create_category(body: CategoryIn, current_user: CurrentUser, repo: RepoDep) -> CategoryOut:
     cat_id = repo.create_category(kind=body.kind, name=body.name, created_at=now_iso())
-    row = repo.conn.execute("SELECT * FROM categories WHERE id=?", (cat_id,)).fetchone()
+    row = repo.conn.execute("SELECT * FROM categories WHERE id=%s", (cat_id,)).fetchone()
     return CategoryOut.from_row(row)
 
 
 @router.put("/{category_id}", response_model=CategoryOut)
 def update_category(category_id: int, body: CategoryUpdate, current_user: CurrentUser, repo: RepoDep) -> CategoryOut:
     repo.update_category(category_id, name=body.name)
-    row = repo.conn.execute("SELECT * FROM categories WHERE id=?", (category_id,)).fetchone()
+    row = repo.conn.execute("SELECT * FROM categories WHERE id=%s", (category_id,)).fetchone()
     return CategoryOut.from_row(row)
 
 

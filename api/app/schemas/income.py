@@ -12,6 +12,7 @@ class IncomeIn(BaseModel):
     category_id: int | None = None
     case_id: int | None = None
     detail: str = ""
+    invoice_id: int | None = None
 
 
 class IncomeOut(BaseModel):
@@ -27,6 +28,8 @@ class IncomeOut(BaseModel):
     product_name: str | None = None
     detail: str | None = None
     concept: str
+    invoice_id: int | None = None
+    invoice_number: str | None = None
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)

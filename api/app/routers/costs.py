@@ -4,7 +4,7 @@ from fastapi import APIRouter
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, RepoDep
+from ..deps import CurrentUser, LawyerRequired, RepoDep
 from ..schemas.cost import CostIn, CostOut
 
 router = APIRouter(prefix="/costs", tags=["costs"])
@@ -32,7 +32,7 @@ def cost_totals(
 
 
 @router.post("", response_model=CostOut, status_code=201)
-def create_cost(body: CostIn, current_user: CurrentUser, repo: RepoDep) -> CostOut:
+def create_cost(body: CostIn, current_user: LawyerRequired, repo: RepoDep) -> CostOut:
     cost_id = repo.create_cost(
         client_id=body.client_id,
         case_id=body.case_id,
@@ -49,7 +49,7 @@ def create_cost(body: CostIn, current_user: CurrentUser, repo: RepoDep) -> CostO
 
 
 @router.put("/{cost_id}", response_model=CostOut)
-def update_cost(cost_id: int, body: CostIn, current_user: CurrentUser, repo: RepoDep) -> CostOut:
+def update_cost(cost_id: int, body: CostIn, current_user: LawyerRequired, repo: RepoDep) -> CostOut:
     from fastapi import HTTPException
     repo.update_cost(
         cost_id,
@@ -68,5 +68,5 @@ def update_cost(cost_id: int, body: CostIn, current_user: CurrentUser, repo: Rep
 
 
 @router.delete("/{cost_id}", status_code=204)
-def delete_cost(cost_id: int, current_user: CurrentUser, repo: RepoDep):
+def delete_cost(cost_id: int, current_user: LawyerRequired, repo: RepoDep):
     repo.delete_cost(cost_id)

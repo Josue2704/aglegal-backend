@@ -4,8 +4,8 @@ from fastapi import APIRouter, HTTPException
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, RepoDep
-from ..schemas.case import CaseAttachmentOut, CaseIn, CaseOut, CaseTaskDone, CaseTaskIn, CaseTaskOut, CaseUpdate
+from ..deps import CurrentUser, LawyerRequired, RepoDep
+from ..schemas.case import CaseAttachmentOut, CaseIn, CaseOut, CaseTaskDone, CaseTaskIn, CaseTaskNotesUpdate, CaseTaskOut, CaseUpdate, GlobalCaseTaskOut
 
 router = APIRouter(prefix="/cases", tags=["cases"])
 
@@ -37,6 +37,11 @@ def create_case(body: CaseIn, current_user: CurrentUser, repo: RepoDep) -> CaseO
         opened_at=body.opened_at,
         notes=body.notes,
         service_product_id=body.service_product_id,
+        internal_ref=body.internal_ref,
+        official_ref=body.official_ref,
+        opposing_party=body.opposing_party,
+        court_entity=body.court_entity,
+        responsible_username=body.responsible_username,
         created_at=now_iso(),
     )
     rows = repo.list_cases()
@@ -58,6 +63,11 @@ def update_case(case_id: int, body: CaseUpdate, current_user: CurrentUser, repo:
         closed_at=body.closed_at,
         notes=body.notes,
         service_product_id=body.service_product_id,
+        internal_ref=body.internal_ref,
+        official_ref=body.official_ref,
+        opposing_party=body.opposing_party,
+        court_entity=body.court_entity,
+        responsible_username=body.responsible_username,
     )
     rows = repo.list_cases()
     row = next((r for r in rows if r["id"] == case_id), None)
@@ -67,11 +77,22 @@ def update_case(case_id: int, body: CaseUpdate, current_user: CurrentUser, repo:
 
 
 @router.delete("/{case_id}", status_code=204)
-def delete_case(case_id: int, current_user: CurrentUser, repo: RepoDep):
+def delete_case(case_id: int, current_user: LawyerRequired, repo: RepoDep):
     repo.delete_case(case_id)
 
 
 # --- Tasks ---
+
+@router.get("/tasks", response_model=list[GlobalCaseTaskOut])
+def list_all_tasks(
+    current_user: CurrentUser,
+    repo: RepoDep,
+    done: bool | None = None,
+    search: str | None = None,
+    case_id: int | None = None,
+) -> list[GlobalCaseTaskOut]:
+    return [GlobalCaseTaskOut.from_row(r) for r in repo.list_all_case_tasks(done=done, search=search, case_id=case_id)]
+
 
 @router.get("/{case_id}/tasks", response_model=list[CaseTaskOut])
 def list_tasks(case_id: int, current_user: CurrentUser, repo: RepoDep) -> list[CaseTaskOut]:
@@ -84,16 +105,27 @@ def create_task(case_id: int, body: CaseTaskIn, current_user: CurrentUser, repo:
         case_id=case_id,
         title=body.title,
         due_date=body.due_date,
+        notes=body.notes,
+        responsible_username=body.responsible_username,
         created_at=now_iso(),
     )
-    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=?", (task_id,)).fetchone()
+    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
     return CaseTaskOut.from_row(row)
 
 
 @router.patch("/tasks/{task_id}/done", response_model=CaseTaskOut)
 def set_task_done(task_id: int, body: CaseTaskDone, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
-    repo.set_case_task_done(task_id, body.done)
-    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=?", (task_id,)).fetchone()
+    repo.set_case_task_done(task_id, body.done, body.completed_notes)
+    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Tarea no encontrada")
+    return CaseTaskOut.from_row(row)
+
+
+@router.patch("/tasks/{task_id}/notes", response_model=CaseTaskOut)
+def update_task_notes(task_id: int, body: CaseTaskNotesUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
+    repo.update_case_task_notes(task_id, body.notes, body.completed_notes)
+    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Tarea no encontrada")
     return CaseTaskOut.from_row(row)

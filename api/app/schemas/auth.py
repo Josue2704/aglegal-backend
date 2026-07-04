@@ -11,6 +11,9 @@ class UserInfo(BaseModel):
     username: str
     full_name: str
     role: str
+    role_id: int | None = None
+    is_admin: bool = False
+    permissions: list[str] = []
 
 
 class TokenResponse(BaseModel):

@@ -7,6 +7,7 @@ class AttachmentOut(BaseModel):
     entity_id: int
     original_name: str
     stored_path: str
+    doc_role: str | None = None
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import logging
 import os
-import sqlite3
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -88,7 +88,7 @@ def exchange_code(code: str) -> tuple[str, str, str]:
 
 # ── Credentials helper ─────────────────────────────────────────────────────────
 
-def _build_creds(row: sqlite3.Row) -> Credentials:
+def _build_creds(row: Any) -> Credentials:
     s = _settings()
     creds = Credentials(
         token=row["access_token"],
@@ -121,7 +121,7 @@ def _service(creds: Credentials):
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
-def _session_to_event(session_row: sqlite3.Row) -> dict:
+def _session_to_event(session_row: Any) -> dict:
     date_str = str(session_row["session_date"])
     start_time = (session_row["start_time"] or "").strip() if "start_time" in session_row.keys() else ""
     end_time = (session_row["end_time"] or "").strip() if "end_time" in session_row.keys() else ""
@@ -156,7 +156,7 @@ def _session_to_event(session_row: sqlite3.Row) -> dict:
     return event
 
 
-def create_event(token_row: sqlite3.Row, session_row: sqlite3.Row) -> str | None:
+def create_event(token_row: Any, session_row: Any) -> str | None:
     """Create a GCal event. Returns event_id or None on failure."""
     try:
         creds = _refresh_if_needed(_build_creds(token_row))
@@ -174,7 +174,7 @@ def create_event(token_row: sqlite3.Row, session_row: sqlite3.Row) -> str | None
         return None
 
 
-def update_event(token_row: sqlite3.Row, event_id: str, session_row: sqlite3.Row) -> None:
+def update_event(token_row: Any, event_id: str, session_row: Any) -> None:
     try:
         creds = _refresh_if_needed(_build_creds(token_row))
         svc = _service(creds)
@@ -189,7 +189,7 @@ def update_event(token_row: sqlite3.Row, event_id: str, session_row: sqlite3.Row
         log.warning("GCal update_event unexpected error: %s", e)
 
 
-def delete_event(token_row: sqlite3.Row, event_id: str) -> None:
+def delete_event(token_row: Any, event_id: str) -> None:
     try:
         creds = _refresh_if_needed(_build_creds(token_row))
         svc = _service(creds)
@@ -200,7 +200,7 @@ def delete_event(token_row: sqlite3.Row, event_id: str) -> None:
         log.warning("GCal delete_event unexpected error: %s", e)
 
 
-def list_events(token_row: sqlite3.Row, time_min: datetime, time_max: datetime) -> list[dict]:
+def list_events(token_row: Any, time_min: datetime, time_max: datetime) -> list[dict]:
     try:
         creds = _refresh_if_needed(_build_creds(token_row))
         svc = _service(creds)

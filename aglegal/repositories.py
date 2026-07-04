@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Iterable
@@ -13,7 +12,7 @@ from .security import hash_password, verify_password
 
 
 SESSION_STATUSES = ["Pendiente", "En proceso", "Finalizada"]
-ATTACH_ENTITY_TYPES = ["session", "income", "expense", "case"]
+ATTACH_ENTITY_TYPES = ["session", "income", "expense", "case", "client", "cost"]
 CATEGORY_KINDS = ["income", "expense", "cost", "service"]
 CASE_STATUSES = ["Abierto", "En trámite", "En pausa", "Cerrado"]
 CASE_PRIORITIES = ["Baja", "Media", "Alta"]
@@ -48,7 +47,7 @@ class DashboardSummary:
 
 
 class Repository:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: Any):
         self.conn = conn
 
     @staticmethod
@@ -61,17 +60,17 @@ class Repository:
     def _date_where(column: str, start_date: str | None, end_date: str | None) -> tuple[str, tuple]:
         s, e = Repository._normalize_date_range(start_date, end_date)
         if s and e:
-            return f" WHERE {column} >= ? AND {column} <= ?", (s, e)
+            return f" WHERE {column} >= %s AND {column} <= %s", (s, e)
         if s:
-            return f" WHERE {column} >= ?", (s,)
+            return f" WHERE {column} >= %s", (s,)
         if e:
-            return f" WHERE {column} <= ?", (e,)
+            return f" WHERE {column} <= %s", (e,)
         return "", ()
 
     # --- Auth
     def authenticate(self, username: str, password: str) -> bool:
         row = self.conn.execute(
-            "SELECT password_hash FROM users WHERE username = ? AND COALESCE(active, 1) = 1",
+            "SELECT password_hash FROM users WHERE username = %s AND COALESCE(active, 1) = 1",
             (username.strip(),),
         ).fetchone()
         if not row:
@@ -80,7 +79,7 @@ class Repository:
 
 
     # --- Users / access
-    def list_users(self) -> list[sqlite3.Row]:
+    def list_users(self) -> list[Any]:
         return list(
             self.conn.execute(
                 "SELECT id, username, full_name, role, active, created_at FROM users ORDER BY username ASC"
@@ -103,7 +102,7 @@ class Repository:
         if not password:
             raise ValueError("Contraseña requerida")
         cur = self.conn.execute(
-            "INSERT INTO users(username, password_hash, full_name, role, active, created_at) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO users(username, password_hash, full_name, role, active, created_at) VALUES(%s,%s,%s,%s,%s,%s)",
             (username_clean, hash_password(password), (full_name or "").strip(), role, 1 if active else 0, created_at),
         )
         self.conn.commit()
@@ -111,7 +110,7 @@ class Repository:
 
     def update_user(self, user_id: int, *, full_name: str, role: str, active: bool) -> None:
         self.conn.execute(
-            "UPDATE users SET full_name=?, role=?, active=? WHERE id=?",
+            "UPDATE users SET full_name=%s, role=%s, active=%s WHERE id=%s",
             ((full_name or "").strip(), role, 1 if active else 0, int(user_id)),
         )
         self.conn.commit()
@@ -120,21 +119,21 @@ class Repository:
         if not password:
             raise ValueError("Contraseña requerida")
         self.conn.execute(
-            "UPDATE users SET password_hash=? WHERE id=?",
+            "UPDATE users SET password_hash=%s WHERE id=%s",
             (hash_password(password), int(user_id)),
         )
         self.conn.commit()
 
     def delete_user(self, user_id: int) -> None:
         active_count = int(self.conn.execute("SELECT COUNT(1) AS n FROM users WHERE COALESCE(active, 1)=1").fetchone()["n"])
-        row = self.conn.execute("SELECT active FROM users WHERE id=?", (int(user_id),)).fetchone()
+        row = self.conn.execute("SELECT active FROM users WHERE id=%s", (int(user_id),)).fetchone()
         if row and int(row["active"] or 0) == 1 and active_count <= 1:
             raise ValueError("Debe quedar al menos un usuario activo")
-        self.conn.execute("DELETE FROM users WHERE id=?", (int(user_id),))
+        self.conn.execute("DELETE FROM users WHERE id=%s", (int(user_id),))
         self.conn.commit()
 
     # --- Clients
-    def list_clients(self, search: str | None = None) -> list[sqlite3.Row]:
+    def list_clients(self, search: str | None = None) -> list[Any]:
         base = (
             "SELECT c.*, "
             "COUNT(DISTINCT s.id) AS session_count, "
@@ -146,13 +145,13 @@ class Repository:
         if search:
             like = f"%{search.strip()}%"
             return list(self.conn.execute(
-                base + "WHERE c.name LIKE ? OR c.phone LIKE ? OR c.email LIKE ? "
+                base + "WHERE c.name ILIKE %s OR c.phone ILIKE %s OR c.email ILIKE %s "
                 "GROUP BY c.id ORDER BY c.id DESC",
                 (like, like, like),
             ).fetchall())
         return list(self.conn.execute(base + "GROUP BY c.id ORDER BY c.id DESC").fetchall())
 
-    def list_case_all_attachments(self, case_id: int) -> list[sqlite3.Row]:
+    def list_case_all_attachments(self, case_id: int) -> list[Any]:
         """Return attachments for the case itself plus attachments from its sessions."""
         return list(self.conn.execute(
             "SELECT a.*, "
@@ -160,8 +159,8 @@ class Repository:
             "CASE WHEN a.entity_type='session' THEN s.consult_type ELSE NULL END AS session_type "
             "FROM attachments a "
             "LEFT JOIN sessions s ON (a.entity_type='session' AND a.entity_id = s.id) "
-            "WHERE (a.entity_type='case' AND a.entity_id=?) "
-            "   OR (a.entity_type='session' AND s.case_id=?) "
+            "WHERE (a.entity_type='case' AND a.entity_id=%s) "
+            "   OR (a.entity_type='session' AND s.case_id=%s) "
             "ORDER BY a.created_at DESC",
             (int(case_id), int(case_id)),
         ).fetchall())
@@ -170,15 +169,20 @@ class Repository:
         self,
         *,
         name: str,
+        client_type: str = "Física",
+        id_number: str = "",
         phone: str = "",
+        phone2: str = "",
         email: str = "",
         address: str = "",
         notes: str = "",
         created_at: str,
     ) -> int:
         cur = self.conn.execute(
-            "INSERT INTO clients(name, phone, email, address, notes, created_at) VALUES(?,?,?,?,?,?)",
-            (name.strip(), phone.strip(), email.strip(), address.strip(), notes.strip(), created_at),
+            "INSERT INTO clients(name, client_type, id_number, phone, phone2, email, address, notes, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (name.strip(), client_type, (id_number or "").strip(), (phone or "").strip(), (phone2 or "").strip(),
+             (email or "").strip(), (address or "").strip(), (notes or "").strip(), created_at),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -188,14 +192,19 @@ class Repository:
         client_id: int,
         *,
         name: str,
+        client_type: str = "Física",
+        id_number: str = "",
         phone: str = "",
+        phone2: str = "",
         email: str = "",
         address: str = "",
         notes: str = "",
     ) -> None:
         self.conn.execute(
-            "UPDATE clients SET name=?, phone=?, email=?, address=?, notes=? WHERE id=?",
-            (name.strip(), phone.strip(), email.strip(), address.strip(), notes.strip(), int(client_id)),
+            "UPDATE clients SET name=%s, client_type=%s, id_number=%s, phone=%s, phone2=%s, "
+            "email=%s, address=%s, notes=%s WHERE id=%s",
+            (name.strip(), client_type, (id_number or "").strip(), (phone or "").strip(), (phone2 or "").strip(),
+             (email or "").strip(), (address or "").strip(), (notes or "").strip(), int(client_id)),
         )
         self.conn.commit()
 
@@ -204,17 +213,17 @@ class Repository:
         cid = int(client_id)
         items: list[dict[str, Any]] = []
         for row in self.conn.execute(
-            "SELECT id, title, status, opened_at FROM cases WHERE client_id=? ORDER BY opened_at DESC, id DESC",
+            "SELECT id, title, status, opened_at FROM cases WHERE client_id=%s ORDER BY opened_at DESC, id DESC",
             (cid,),
         ).fetchall():
             items.append({"date": row["opened_at"], "type": "Caso", "detail": row["title"], "status": row["status"]})
         for row in self.conn.execute(
-            "SELECT id, session_date, consult_type, status FROM sessions WHERE client_id=? ORDER BY session_date DESC, id DESC",
+            "SELECT id, session_date, consult_type, status FROM sessions WHERE client_id=%s ORDER BY session_date DESC, id DESC",
             (cid,),
         ).fetchall():
             items.append({"date": row["session_date"], "type": "Sesión", "detail": row["consult_type"], "status": row["status"]})
         for row in self.conn.execute(
-            "SELECT id, income_date, detail, concept, amount_cents FROM incomes WHERE client_id=? ORDER BY income_date DESC, id DESC",
+            "SELECT id, income_date, detail, concept, amount_cents FROM incomes WHERE client_id=%s ORDER BY income_date DESC, id DESC",
             (cid,),
         ).fetchall():
             amount = self.cents_to_text(int(row["amount_cents"] or 0))
@@ -222,7 +231,7 @@ class Repository:
         return sorted(items, key=lambda item: item["date"] or "", reverse=True)
 
     def delete_client(self, client_id: int) -> None:
-        self.conn.execute("DELETE FROM clients WHERE id = ?", (int(client_id),))
+        self.conn.execute("DELETE FROM clients WHERE id = %s", (int(client_id),))
         self.conn.commit()
 
     # --- Sessions
@@ -232,37 +241,37 @@ class Repository:
         start_date: str | None = None,
         end_date: str | None = None,
         status: str | None = None,
-    ) -> list[sqlite3.Row]:
+    ) -> list[Any]:
         conditions: list[str] = []
         params: list = []
         if client_id:
-            conditions.append("s.client_id=?")
+            conditions.append("s.client_id=%s")
             params.append(int(client_id))
         if start_date:
-            conditions.append("s.session_date>=?")
+            conditions.append("s.session_date>=%s")
             params.append(start_date)
         if end_date:
-            conditions.append("s.session_date<=?")
+            conditions.append("s.session_date<=%s")
             params.append(end_date)
         if status:
-            conditions.append("s.status=?")
+            conditions.append("s.status=%s")
             params.append(status)
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         return list(
             self.conn.execute(
                 f"SELECT s.*, c.name AS client_name FROM sessions s "
-                f"JOIN clients c ON c.id=s.client_id {where} "
+                f"LEFT JOIN clients c ON c.id=s.client_id {where} "
                 f"ORDER BY s.session_date DESC, COALESCE(s.start_time, '99:99') ASC, s.id DESC",
                 params,
             ).fetchall()
         )
 
-    def list_sessions_by_case(self, case_id: int) -> list[sqlite3.Row]:
+    def list_sessions_by_case(self, case_id: int) -> list[Any]:
         return list(
             self.conn.execute(
                 "SELECT s.*, c.name AS client_name FROM sessions s "
-                "JOIN clients c ON c.id=s.client_id "
-                "WHERE s.case_id=? ORDER BY s.session_date DESC, COALESCE(s.start_time, '99:99') ASC, s.id DESC",
+                "LEFT JOIN clients c ON c.id=s.client_id "
+                "WHERE s.case_id=%s ORDER BY s.session_date DESC, COALESCE(s.start_time, '99:99') ASC, s.id DESC",
                 (int(case_id),),
             ).fetchall()
         )
@@ -270,7 +279,7 @@ class Repository:
     def create_session(
         self,
         *,
-        client_id: int,
+        client_id: int | None,
         case_id: int | None,
         session_date: str,
         consult_type: str,
@@ -284,9 +293,9 @@ class Repository:
             raise ValueError("Estado inválido")
         cur = self.conn.execute(
             "INSERT INTO sessions(client_id, case_id, session_date, start_time, end_time, consult_type, notes, status, created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
-                int(client_id),
+                int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
                 session_date,
                 (start_time or "").strip() or None,
@@ -315,7 +324,7 @@ class Repository:
         if status not in SESSION_STATUSES:
             raise ValueError("Estado inválido")
         self.conn.execute(
-            "UPDATE sessions SET case_id=?, session_date=?, start_time=?, end_time=?, consult_type=?, notes=?, status=? WHERE id=?",
+            "UPDATE sessions SET case_id=%s, session_date=%s, start_time=%s, end_time=%s, consult_type=%s, notes=%s, status=%s WHERE id=%s",
             (
                 int(case_id) if case_id else None,
                 session_date,
@@ -330,32 +339,32 @@ class Repository:
         self.conn.commit()
 
     def delete_session(self, session_id: int) -> None:
-        self.conn.execute("DELETE FROM sessions WHERE id = ?", (int(session_id),))
+        self.conn.execute("DELETE FROM sessions WHERE id = %s", (int(session_id),))
         self.conn.commit()
 
-    def get_session(self, session_id: int) -> sqlite3.Row | None:
+    def get_session(self, session_id: int) -> Any | None:
         return self.conn.execute(
             "SELECT s.*, c.name AS client_name "
             "FROM sessions s LEFT JOIN clients c ON c.id=s.client_id "
-            "WHERE s.id=?",
+            "WHERE s.id=%s",
             (int(session_id),),
         ).fetchone()
 
     def set_session_gcal_event_id(self, session_id: int, event_id: str | None) -> None:
         self.conn.execute(
-            "UPDATE sessions SET gcal_event_id=? WHERE id=?", (event_id, int(session_id))
+            "UPDATE sessions SET gcal_event_id=%s WHERE id=%s", (event_id, int(session_id))
         )
         self.conn.commit()
 
     # --- Google tokens
-    def get_google_tokens(self, username: str) -> sqlite3.Row | None:
+    def get_google_tokens(self, username: str) -> Any | None:
         return self.conn.execute(
-            "SELECT * FROM google_tokens WHERE username=?", (username,)
+            "SELECT * FROM google_tokens WHERE username=%s", (username,)
         ).fetchone()
 
     def save_google_tokens(self, username: str, access_token: str, refresh_token: str, expiry_at: str) -> None:
         self.conn.execute(
-            "INSERT INTO google_tokens(username, access_token, refresh_token, expiry_at) VALUES(?,?,?,?) "
+            "INSERT INTO google_tokens(username, access_token, refresh_token, expiry_at) VALUES(%s,%s,%s,%s) "
             "ON CONFLICT(username) DO UPDATE SET access_token=excluded.access_token, "
             "refresh_token=excluded.refresh_token, expiry_at=excluded.expiry_at",
             (username, access_token, refresh_token, expiry_at),
@@ -363,11 +372,11 @@ class Repository:
         self.conn.commit()
 
     def delete_google_tokens(self, username: str) -> None:
-        self.conn.execute("DELETE FROM google_tokens WHERE username=?", (username,))
+        self.conn.execute("DELETE FROM google_tokens WHERE username=%s", (username,))
         self.conn.commit()
 
     # --- Incomes
-    def list_incomes(self) -> list[sqlite3.Row]:
+    def list_incomes(self) -> list[Any]:
         return list(
             self.conn.execute(
                 "SELECT i.*, c.name AS client_name, cat.name AS category_name, "
@@ -381,7 +390,7 @@ class Repository:
             ).fetchall()
         )
 
-    def list_incomes_range(self, *, start_date: str | None, end_date: str | None) -> list[sqlite3.Row]:
+    def list_incomes_range(self, *, start_date: str | None, end_date: str | None) -> list[Any]:
         where, params = self._date_where("i.income_date", start_date, end_date)
         sql = (
             "SELECT i.*, c.name AS client_name, cat.name AS category_name, "
@@ -407,13 +416,14 @@ class Repository:
         case_id: int | None = None,
         detail: str = "",
         concept: str | None = None,
+        invoice_id: int | None = None,
     ) -> int:
         amount_cents = _to_cents(amount_text)
         resolved_detail = (detail or concept or "").strip()
         resolved_concept = resolved_detail or "(Sin detalle)"
         cur = self.conn.execute(
-            "INSERT INTO incomes(client_id, case_id, concept, amount_cents, income_date, created_at, category_id, detail) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO incomes(client_id, case_id, concept, amount_cents, income_date, created_at, category_id, detail, invoice_id) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
@@ -423,12 +433,13 @@ class Repository:
                 created_at,
                 int(category_id) if category_id else None,
                 resolved_detail,
+                int(invoice_id) if invoice_id else None,
             ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def get_income(self, income_id: int) -> sqlite3.Row | None:
+    def get_income(self, income_id: int) -> Any | None:
         return self.conn.execute(
             "SELECT i.*, c.name AS client_name, cat.name AS category_name, "
             "cs.title AS case_title, sp.name AS product_name "
@@ -437,7 +448,7 @@ class Repository:
             "LEFT JOIN categories cat ON cat.id=i.category_id "
             "LEFT JOIN cases cs ON cs.id=i.case_id "
             "LEFT JOIN service_products sp ON sp.id=cs.service_product_id "
-            "WHERE i.id=?",
+            "WHERE i.id=%s",
             (int(income_id),),
         ).fetchone()
 
@@ -456,8 +467,8 @@ class Repository:
         resolved_detail = (detail or "").strip()
         resolved_concept = resolved_detail or "(Sin detalle)"
         self.conn.execute(
-            "UPDATE incomes SET amount_cents=?, income_date=?, client_id=?, category_id=?, "
-            "case_id=?, detail=?, concept=? WHERE id=?",
+            "UPDATE incomes SET amount_cents=%s, income_date=%s, client_id=%s, category_id=%s, "
+            "case_id=%s, detail=%s, concept=%s WHERE id=%s",
             (
                 amount_cents,
                 income_date,
@@ -472,11 +483,11 @@ class Repository:
         self.conn.commit()
 
     def delete_income(self, income_id: int) -> None:
-        self.conn.execute("DELETE FROM incomes WHERE id = ?", (int(income_id),))
+        self.conn.execute("DELETE FROM incomes WHERE id = %s", (int(income_id),))
         self.conn.commit()
 
     # --- Expenses
-    def list_expenses(self) -> list[sqlite3.Row]:
+    def list_expenses(self) -> list[Any]:
         return list(
             self.conn.execute(
                 "SELECT e.*, cat.name AS category_name "
@@ -486,7 +497,7 @@ class Repository:
             ).fetchall()
         )
 
-    def list_expenses_range(self, *, start_date: str | None, end_date: str | None) -> list[sqlite3.Row]:
+    def list_expenses_range(self, *, start_date: str | None, end_date: str | None) -> list[Any]:
         where, params = self._date_where("e.expense_date", start_date, end_date)
         sql = (
             "SELECT e.*, cat.name AS category_name "
@@ -511,7 +522,7 @@ class Repository:
         concept = (detail or "").strip() or "(Sin detalle)"
         cur = self.conn.execute(
             "INSERT INTO expenses(concept, amount_cents, expense_date, notes, created_at, category_id, detail) "
-            "VALUES(?,?,?,?,?,?,?)",
+            "VALUES(%s,%s,%s,%s,%s,%s,%s)",
             (
                 concept,
                 amount_cents,
@@ -525,10 +536,10 @@ class Repository:
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def get_expense(self, expense_id: int) -> sqlite3.Row | None:
+    def get_expense(self, expense_id: int) -> Any | None:
         return self.conn.execute(
             "SELECT e.*, cat.name AS category_name FROM expenses e "
-            "LEFT JOIN categories cat ON cat.id=e.category_id WHERE e.id=?",
+            "LEFT JOIN categories cat ON cat.id=e.category_id WHERE e.id=%s",
             (int(expense_id),),
         ).fetchone()
 
@@ -545,7 +556,7 @@ class Repository:
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
         self.conn.execute(
-            "UPDATE expenses SET category_id=?, detail=?, concept=?, amount_cents=?, expense_date=?, notes=? WHERE id=?",
+            "UPDATE expenses SET category_id=%s, detail=%s, concept=%s, amount_cents=%s, expense_date=%s, notes=%s WHERE id=%s",
             (
                 int(category_id) if category_id else None,
                 (detail or "").strip(),
@@ -559,11 +570,11 @@ class Repository:
         self.conn.commit()
 
     def delete_expense(self, expense_id: int) -> None:
-        self.conn.execute("DELETE FROM expenses WHERE id = ?", (int(expense_id),))
+        self.conn.execute("DELETE FROM expenses WHERE id = %s", (int(expense_id),))
         self.conn.commit()
 
     # --- Costs (direct costs tied to what is sold)
-    def list_costs_range(self, *, start_date: str | None, end_date: str | None) -> list[sqlite3.Row]:
+    def list_costs_range(self, *, start_date: str | None, end_date: str | None) -> list[Any]:
         where, params = self._date_where("co.cost_date", start_date, end_date)
         sql = (
             "SELECT co.*, c.name AS client_name, cs.title AS case_title, "
@@ -594,7 +605,7 @@ class Repository:
         concept = (detail or "").strip() or "(Sin detalle)"
         cur = self.conn.execute(
             "INSERT INTO costs(client_id, case_id, category_id, concept, detail, amount_cents, cost_date, notes, created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
@@ -610,7 +621,7 @@ class Repository:
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def get_cost(self, cost_id: int) -> sqlite3.Row | None:
+    def get_cost(self, cost_id: int) -> Any | None:
         return self.conn.execute(
             "SELECT co.*, c.name AS client_name, cs.title AS case_title, "
             "cat.name AS category_name, sp.name AS product_name "
@@ -619,7 +630,7 @@ class Repository:
             "LEFT JOIN cases cs ON cs.id=co.case_id "
             "LEFT JOIN service_products sp ON sp.id=cs.service_product_id "
             "LEFT JOIN categories cat ON cat.id=co.category_id "
-            "WHERE co.id=?",
+            "WHERE co.id=%s",
             (int(cost_id),),
         ).fetchone()
 
@@ -638,8 +649,8 @@ class Repository:
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
         self.conn.execute(
-            "UPDATE costs SET client_id=?, case_id=?, category_id=?, concept=?, detail=?, "
-            "amount_cents=?, cost_date=?, notes=? WHERE id=?",
+            "UPDATE costs SET client_id=%s, case_id=%s, category_id=%s, concept=%s, detail=%s, "
+            "amount_cents=%s, cost_date=%s, notes=%s WHERE id=%s",
             (
                 int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
@@ -655,7 +666,7 @@ class Repository:
         self.conn.commit()
 
     def delete_cost(self, cost_id: int) -> None:
-        self.conn.execute("DELETE FROM costs WHERE id=?", (int(cost_id),))
+        self.conn.execute("DELETE FROM costs WHERE id=%s", (int(cost_id),))
         self.conn.commit()
 
     def cost_totals(self, *, start_date: str | None, end_date: str | None) -> int:
@@ -669,7 +680,7 @@ class Repository:
 
 
     # --- Payroll / nominas
-    def list_payrolls(self) -> list[sqlite3.Row]:
+    def list_payrolls(self) -> list[Any]:
         return list(self.conn.execute("SELECT * FROM payrolls ORDER BY payment_date DESC, id DESC").fetchall())
 
     def create_payroll(
@@ -704,26 +715,26 @@ class Repository:
         )
         amount_cents = _to_cents(amount_text)
         cur = self.conn.execute(
-            "INSERT INTO payrolls(employee_name, role, period, amount_cents, payment_date, notes, expense_id, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO payrolls(employee_name, role, period, amount_cents, payment_date, notes, expense_id, created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
             (employee, (role or "").strip(), period.strip(), amount_cents, payment_date.strip(), (notes or "").strip(), expense_id, created_at),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
     def delete_payroll(self, payroll_id: int) -> None:
-        row = self.conn.execute("SELECT expense_id FROM payrolls WHERE id=?", (int(payroll_id),)).fetchone()
-        self.conn.execute("DELETE FROM payrolls WHERE id=?", (int(payroll_id),))
+        row = self.conn.execute("SELECT expense_id FROM payrolls WHERE id=%s", (int(payroll_id),)).fetchone()
+        self.conn.execute("DELETE FROM payrolls WHERE id=%s", (int(payroll_id),))
         if row and row["expense_id"]:
-            self.conn.execute("DELETE FROM expenses WHERE id=?", (int(row["expense_id"]),))
+            self.conn.execute("DELETE FROM expenses WHERE id=%s", (int(row["expense_id"]),))
         self.conn.commit()
 
     # --- Attachments (stored on disk + metadata in SQLite)
-    def list_attachments(self, *, entity_type: str, entity_id: int) -> list[sqlite3.Row]:
+    def list_attachments(self, *, entity_type: str, entity_id: int) -> list[Any]:
         if entity_type not in ATTACH_ENTITY_TYPES:
             raise ValueError("Tipo de adjunto inválido")
         return list(
             self.conn.execute(
-                "SELECT * FROM attachments WHERE entity_type=? AND entity_id=? ORDER BY id DESC",
+                "SELECT * FROM attachments WHERE entity_type=%s AND entity_id=%s ORDER BY id DESC",
                 (entity_type, int(entity_id)),
             ).fetchall()
         )
@@ -752,7 +763,7 @@ class Repository:
         shutil.copy2(src, dst)
 
         cur = self.conn.execute(
-            "INSERT INTO attachments(entity_type, entity_id, original_name, stored_path, created_at) VALUES(?,?,?,?,?)",
+            "INSERT INTO attachments(entity_type, entity_id, original_name, stored_path, created_at) VALUES(%s,%s,%s,%s,%s)",
             (
                 entity_type,
                 int(entity_id),
@@ -766,9 +777,9 @@ class Repository:
 
     def delete_attachment(self, attachment_id: int) -> None:
         row = self.conn.execute(
-            "SELECT stored_path FROM attachments WHERE id=?", (int(attachment_id),)
+            "SELECT stored_path FROM attachments WHERE id=%s", (int(attachment_id),)
         ).fetchone()
-        self.conn.execute("DELETE FROM attachments WHERE id=?", (int(attachment_id),))
+        self.conn.execute("DELETE FROM attachments WHERE id=%s", (int(attachment_id),))
         self.conn.commit()
         if row and row["stored_path"]:
             try:
@@ -787,18 +798,18 @@ class Repository:
         return str(out)
 
     # --- Cases (Expedientes) + Tasks
-    def list_cases(self, *, search: str | None = None, status: str | None = None, client_id: int | None = None) -> list[sqlite3.Row]:
+    def list_cases(self, *, search: str | None = None, status: str | None = None, client_id: int | None = None) -> list[Any]:
         where = []
         params: list[Any] = []
         if search:
-            where.append("(cs.title LIKE ? OR cs.service_area LIKE ? OR cl.name LIKE ? OR sp.name LIKE ?)")
+            where.append("(cs.title ILIKE %s OR cs.service_area ILIKE %s OR cl.name ILIKE %s OR sp.name ILIKE %s)")
             like = f"%{search.strip()}%"
             params.extend([like, like, like, like])
         if status and status != "Todos":
-            where.append("cs.status = ?")
+            where.append("cs.status = %s")
             params.append(status)
         if client_id:
-            where.append("cs.client_id = ?")
+            where.append("cs.client_id = %s")
             params.append(int(client_id))
 
         w = (" WHERE " + " AND ".join(where)) if where else ""
@@ -820,17 +831,23 @@ class Repository:
         status: str,
         priority: str,
         opened_at: str,
-        notes: str,
+        notes: str | None = None,
         created_at: str,
         service_product_id: int | None = None,
+        internal_ref: str | None = None,
+        official_ref: str | None = None,
+        opposing_party: str | None = None,
+        court_entity: str | None = None,
+        responsible_username: str | None = None,
     ) -> int:
         if status not in CASE_STATUSES:
             raise ValueError("Estado de caso inválido")
         if priority not in CASE_PRIORITIES:
             raise ValueError("Prioridad inválida")
         cur = self.conn.execute(
-            "INSERT INTO cases(client_id, service_area, title, status, priority, opened_at, closed_at, notes, created_at, service_product_id) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO cases(client_id, service_area, title, status, priority, opened_at, closed_at, notes, created_at, "
+            "service_product_id, internal_ref, official_ref, opposing_party, court_entity, responsible_username) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id),
                 service_area.strip(),
@@ -839,9 +856,14 @@ class Repository:
                 priority,
                 opened_at,
                 None,
-                notes.strip(),
+                (notes or "").strip(),
                 created_at,
                 int(service_product_id) if service_product_id else None,
+                (internal_ref or "").strip() or None,
+                (official_ref or "").strip() or None,
+                (opposing_party or "").strip() or None,
+                (court_entity or "").strip() or None,
+                (responsible_username or "").strip() or None,
             ),
         )
         self.conn.commit()
@@ -857,15 +879,22 @@ class Repository:
         priority: str,
         opened_at: str,
         closed_at: str | None,
-        notes: str,
+        notes: str | None = None,
         service_product_id: int | None = None,
+        internal_ref: str | None = None,
+        official_ref: str | None = None,
+        opposing_party: str | None = None,
+        court_entity: str | None = None,
+        responsible_username: str | None = None,
     ) -> None:
         if status not in CASE_STATUSES:
             raise ValueError("Estado de caso inválido")
         if priority not in CASE_PRIORITIES:
             raise ValueError("Prioridad inválida")
         self.conn.execute(
-            "UPDATE cases SET service_area=?, title=?, status=?, priority=?, opened_at=?, closed_at=?, notes=?, service_product_id=? WHERE id=?",
+            "UPDATE cases SET service_area=%s, title=%s, status=%s, priority=%s, opened_at=%s, closed_at=%s, notes=%s, "
+            "service_product_id=%s, internal_ref=%s, official_ref=%s, opposing_party=%s, court_entity=%s, responsible_username=%s "
+            "WHERE id=%s",
             (
                 service_area.strip(),
                 title.strip(),
@@ -873,61 +902,124 @@ class Repository:
                 priority,
                 opened_at,
                 (closed_at or "").strip() or None,
-                notes.strip(),
+                (notes or "").strip(),
                 int(service_product_id) if service_product_id else None,
+                (internal_ref or "").strip() or None,
+                (official_ref or "").strip() or None,
+                (opposing_party or "").strip() or None,
+                (court_entity or "").strip() or None,
+                (responsible_username or "").strip() or None,
                 int(case_id),
             ),
         )
         self.conn.commit()
 
     def delete_case(self, case_id: int) -> None:
-        self.conn.execute("DELETE FROM cases WHERE id=?", (int(case_id),))
+        self.conn.execute("DELETE FROM cases WHERE id=%s", (int(case_id),))
         self.conn.commit()
 
     def case_choices(self, *, client_id: int | None = None) -> list[tuple[int, str]]:
         if client_id:
             rows = self.conn.execute(
-                "SELECT id, title FROM cases WHERE client_id=? ORDER BY id DESC",
+                "SELECT id, title FROM cases WHERE client_id=%s ORDER BY id DESC",
                 (int(client_id),),
             ).fetchall()
         else:
             rows = self.conn.execute("SELECT id, title FROM cases ORDER BY id DESC").fetchall()
         return [(int(r["id"]), str(r["title"])) for r in rows]
 
-    def list_case_tasks(self, case_id: int) -> list[sqlite3.Row]:
+    def list_case_tasks(self, case_id: int) -> list[Any]:
         return list(
             self.conn.execute(
-                "SELECT * FROM case_tasks WHERE case_id=? ORDER BY done ASC, id DESC",
+                "SELECT * FROM case_tasks WHERE case_id=%s ORDER BY done ASC, id DESC",
                 (int(case_id),),
             ).fetchall()
         )
 
-    def create_case_task(self, *, case_id: int, title: str, due_date: str | None, created_at: str) -> int:
+    def list_all_case_tasks(
+        self,
+        done: bool | None = None,
+        search: str | None = None,
+        case_id: int | None = None,
+    ) -> list[Any]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if done is not None:
+            conditions.append("ct.done = %s")
+            params.append(1 if done else 0)
+        if case_id is not None:
+            conditions.append("ct.case_id = %s")
+            params.append(int(case_id))
+        if search:
+            conditions.append("(ct.title ILIKE %s OR cs.title ILIKE %s OR cl.name ILIKE %s)")
+            like = f"%{search.strip()}%"
+            params.extend([like, like, like])
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        return list(
+            self.conn.execute(
+                f"SELECT ct.*, cs.title AS case_title, cs.status AS case_status, "
+                f"cs.client_id, cl.name AS client_name "
+                f"FROM case_tasks ct "
+                f"JOIN cases cs ON cs.id = ct.case_id "
+                f"LEFT JOIN clients cl ON cl.id = cs.client_id "
+                f"{where} "
+                f"ORDER BY ct.done ASC, ct.due_date ASC NULLS LAST, ct.id DESC",
+                params,
+            ).fetchall()
+        )
+
+    def create_case_task(
+        self,
+        *,
+        case_id: int,
+        title: str,
+        due_date: str | None,
+        created_at: str,
+        notes: str | None = None,
+        responsible_username: str | None = None,
+    ) -> int:
         t = (title or "").strip()
         if not t:
             raise ValueError("Título requerido")
         cur = self.conn.execute(
-            "INSERT INTO case_tasks(case_id, title, done, due_date, created_at) VALUES(?,?,?,?,?)",
-            (int(case_id), t, 0, (due_date or "").strip() or None, created_at),
+            "INSERT INTO case_tasks(case_id, title, done, due_date, notes, responsible_username, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s)",
+            (
+                int(case_id), t, 0,
+                (due_date or "").strip() or None,
+                (notes or "").strip() or None,
+                (responsible_username or "").strip() or None,
+                created_at,
+            ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def set_case_task_done(self, task_id: int, done: bool) -> None:
-        self.conn.execute("UPDATE case_tasks SET done=? WHERE id=?", (1 if done else 0, int(task_id)))
+    def set_case_task_done(self, task_id: int, done: bool, completed_notes: str | None = None) -> None:
+        self.conn.execute(
+            "UPDATE case_tasks SET done=%s, completed_notes=%s WHERE id=%s",
+            (1 if done else 0, (completed_notes or "").strip() or None, int(task_id)),
+        )
+        self.conn.commit()
+
+    def update_case_task_notes(self, task_id: int, notes: str | None, completed_notes: str | None = None) -> None:
+        self.conn.execute(
+            "UPDATE case_tasks SET notes=%s, completed_notes=%s WHERE id=%s",
+            ((notes or "").strip() or None, (completed_notes or "").strip() or None, int(task_id)),
+        )
         self.conn.commit()
 
     def delete_case_task(self, task_id: int) -> None:
-        self.conn.execute("DELETE FROM case_tasks WHERE id=?", (int(task_id),))
+        self.conn.execute("DELETE FROM case_tasks WHERE id=%s", (int(task_id),))
         self.conn.commit()
 
     # --- Categories
-    def list_categories(self, *, kind: str) -> list[sqlite3.Row]:
+    def list_categories(self, *, kind: str) -> list[Any]:
         if kind not in CATEGORY_KINDS:
             raise ValueError("Tipo de categoría inválido")
         return list(
             self.conn.execute(
-                "SELECT * FROM categories WHERE kind=? ORDER BY name ASC", (kind,)
+                "SELECT * FROM categories WHERE kind=%s ORDER BY name ASC", (kind,)
             ).fetchall()
         )
 
@@ -938,7 +1030,7 @@ class Repository:
         if not n:
             raise ValueError("Nombre requerido")
         cur = self.conn.execute(
-            "INSERT INTO categories(kind, name, created_at) VALUES(?,?,?)",
+            "INSERT INTO categories(kind, name, created_at) VALUES(%s,%s,%s)",
             (kind, n, created_at),
         )
         self.conn.commit()
@@ -948,12 +1040,12 @@ class Repository:
         n = (name or "").strip()
         if not n:
             raise ValueError("Nombre requerido")
-        self.conn.execute("UPDATE categories SET name=? WHERE id=?", (n, int(category_id)))
+        self.conn.execute("UPDATE categories SET name=%s WHERE id=%s", (n, int(category_id)))
         self.conn.commit()
 
     def delete_category(self, category_id: int) -> None:
         # Leave existing records with category_id dangling; UI will show empty name.
-        self.conn.execute("DELETE FROM categories WHERE id=?", (int(category_id),))
+        self.conn.execute("DELETE FROM categories WHERE id=%s", (int(category_id),))
         self.conn.commit()
 
     def category_choices(self, *, kind: str) -> list[tuple[int, str]]:
@@ -961,11 +1053,11 @@ class Repository:
 
 
     # --- Service catalog / products offered
-    def list_service_products(self, *, category_id: int | None = None, active_only: bool = False) -> list[sqlite3.Row]:
+    def list_service_products(self, *, category_id: int | None = None, active_only: bool = False) -> list[Any]:
         where = []
         params: list[Any] = []
         if category_id:
-            where.append("sp.category_id=?")
+            where.append("sp.category_id=%s")
             params.append(int(category_id))
         if active_only:
             where.append("sp.active=1")
@@ -996,7 +1088,7 @@ class Repository:
             raise ValueError("Nombre del producto requerido")
         base_price_cents = _to_cents(base_price_text) if (base_price_text or "").strip() else None
         cur = self.conn.execute(
-            "INSERT INTO service_products(category_id, name, description, base_price_cents, active, created_at) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO service_products(category_id, name, description, base_price_cents, active, created_at) VALUES(%s,%s,%s,%s,%s,%s)",
             (int(category_id), product_name, (description or "").strip(), base_price_cents, 1 if active else 0, created_at),
         )
         self.conn.commit()
@@ -1017,17 +1109,83 @@ class Repository:
             raise ValueError("Nombre del producto requerido")
         base_price_cents = _to_cents(base_price_text) if (base_price_text or "").strip() else None
         self.conn.execute(
-            "UPDATE service_products SET category_id=?, name=?, description=?, base_price_cents=?, active=? WHERE id=?",
+            "UPDATE service_products SET category_id=%s, name=%s, description=%s, base_price_cents=%s, active=%s WHERE id=%s",
             (int(category_id), product_name, (description or "").strip(), base_price_cents, 1 if active else 0, int(product_id)),
         )
         self.conn.commit()
 
     def delete_service_product(self, product_id: int) -> None:
-        self.conn.execute("DELETE FROM service_products WHERE id=?", (int(product_id),))
+        self.conn.execute("DELETE FROM service_products WHERE id=%s", (int(product_id),))
         self.conn.commit()
 
     def service_product_choices(self, *, category_id: int | None = None) -> list[tuple[int, str]]:
         return [(int(row["id"]), str(row["name"])) for row in self.list_service_products(category_id=category_id, active_only=True)]
+
+    # --- Dashboard helpers
+
+    def upcoming_sessions(self, *, days: int = 7) -> list:
+        today = date.today().isoformat()
+        until = (date.today() + __import__('datetime').timedelta(days=days)).isoformat()
+        return self.conn.execute(
+            """SELECT s.id, s.session_date, s.start_time, s.end_time,
+                      s.consult_type, s.status, s.notes,
+                      cl.name AS client_name, ca.title AS case_title
+               FROM sessions s
+               LEFT JOIN clients cl ON cl.id = s.client_id
+               LEFT JOIN cases ca ON ca.id = s.case_id
+               WHERE s.session_date >= %s AND s.session_date <= %s
+                 AND s.status != 'Realizada'
+               ORDER BY s.session_date, s.start_time NULLS LAST""",
+            (today, until),
+        ).fetchall()
+
+    def dashboard_alerts(self) -> dict:
+        today = date.today().isoformat()
+        overdue_tasks = self.conn.execute(
+            """SELECT COUNT(*) AS n FROM case_tasks
+               WHERE done = 0 AND due_date IS NOT NULL AND due_date < %s""",
+            (today,),
+        ).fetchone()["n"]
+        overdue_invoices = self.conn.execute(
+            """SELECT COUNT(*) AS n FROM invoices
+               WHERE status NOT IN ('Pagada','Cancelada') AND due_date IS NOT NULL AND due_date < %s""",
+            (today,),
+        ).fetchone()["n"]
+        today_sessions = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM sessions WHERE session_date = %s AND status != 'Realizada'",
+            (today,),
+        ).fetchone()["n"]
+        return {
+            "overdue_tasks": int(overdue_tasks),
+            "overdue_invoices": int(overdue_invoices),
+            "today_sessions": int(today_sessions),
+        }
+
+    def global_search(self, q: str, *, limit: int = 8) -> dict:
+        like = f"%{q}%"
+        clients = self.conn.execute(
+            "SELECT id, name, client_type FROM clients WHERE name ILIKE %s ORDER BY name LIMIT %s",
+            (like, limit),
+        ).fetchall()
+        cases = self.conn.execute(
+            """SELECT ca.id, ca.title, ca.status, cl.name AS client_name
+               FROM cases ca LEFT JOIN clients cl ON cl.id = ca.client_id
+               WHERE ca.title ILIKE %s OR ca.internal_ref ILIKE %s OR ca.official_ref ILIKE %s
+               ORDER BY ca.id DESC LIMIT %s""",
+            (like, like, like, limit),
+        ).fetchall()
+        sessions = self.conn.execute(
+            """SELECT s.id, s.session_date, s.consult_type, s.status, cl.name AS client_name
+               FROM sessions s LEFT JOIN clients cl ON cl.id = s.client_id
+               WHERE s.consult_type ILIKE %s OR s.notes ILIKE %s OR cl.name ILIKE %s
+               ORDER BY s.session_date DESC LIMIT %s""",
+            (like, like, like, limit),
+        ).fetchall()
+        return {
+            "clients": [dict(r) for r in clients],
+            "cases": [dict(r) for r in cases],
+            "sessions": [dict(r) for r in sessions],
+        }
 
     # --- Dashboard
     def dashboard_summary(self) -> DashboardSummary:
@@ -1038,7 +1196,7 @@ class Repository:
         month_prefix = date.today().strftime("%Y-%m-")
         sessions_this_month = int(
             self.conn.execute(
-                "SELECT COUNT(1) AS n FROM sessions WHERE session_date LIKE ?",
+                "SELECT COUNT(1) AS n FROM sessions WHERE session_date LIKE %s",
                 (f"{month_prefix}%",),
             ).fetchone()["n"]
         )
@@ -1058,31 +1216,31 @@ class Repository:
 
         clients_attended = int(
             self.conn.execute(
-                "SELECT COUNT(DISTINCT client_id) AS n FROM sessions WHERE session_date LIKE ?",
+                "SELECT COUNT(DISTINCT client_id) AS n FROM sessions WHERE session_date LIKE %s",
                 (f"{month_prefix}%",),
             ).fetchone()["n"]
         )
         sessions_total = int(
             self.conn.execute(
-                "SELECT COUNT(1) AS n FROM sessions WHERE session_date LIKE ?",
+                "SELECT COUNT(1) AS n FROM sessions WHERE session_date LIKE %s",
                 (f"{month_prefix}%",),
             ).fetchone()["n"]
         )
         sessions_finalized = int(
             self.conn.execute(
-                "SELECT COUNT(1) AS n FROM sessions WHERE session_date LIKE ? AND status = ?",
+                "SELECT COUNT(1) AS n FROM sessions WHERE session_date LIKE %s AND status = %s",
                 (f"{month_prefix}%", "Finalizada"),
             ).fetchone()["n"]
         )
         incomes_cents = int(
             self.conn.execute(
-                "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM incomes WHERE income_date LIKE ?",
+                "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM incomes WHERE income_date LIKE %s",
                 (f"{month_prefix}%",),
             ).fetchone()["s"]
         )
         expenses_cents = int(
             self.conn.execute(
-                "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM expenses WHERE expense_date LIKE ?",
+                "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM expenses WHERE expense_date LIKE %s",
                 (f"{month_prefix}%",),
             ).fetchone()["s"]
         )
@@ -1208,10 +1366,10 @@ class Repository:
             FROM incomes i
             LEFT JOIN clients c ON c.id=i.client_id
             {where}
-            GROUP BY name
-            HAVING total > 0
+            GROUP BY c.name
+            HAVING COALESCE(SUM(i.amount_cents), 0) > 0
             ORDER BY total DESC
-            LIMIT ?
+            LIMIT %s
             """,
             (*params, int(limit)),
         ).fetchall()
@@ -1230,10 +1388,10 @@ class Repository:
             LEFT JOIN cases cs ON cs.id=i.case_id
             LEFT JOIN service_products sp ON sp.id=cs.service_product_id
             {where}{service_filter}
-            GROUP BY name
-            HAVING total > 0
+            GROUP BY COALESCE(sp.name, cs.service_area, '(Sin servicio)')
+            HAVING COALESCE(SUM(i.amount_cents), 0) > 0
             ORDER BY total DESC
-            LIMIT ?
+            LIMIT %s
             """,
             (*params, int(limit)),
         ).fetchall()
@@ -1262,7 +1420,7 @@ class Repository:
             LEFT JOIN cases cs ON cs.id=i.case_id
             LEFT JOIN service_products sp ON sp.id=cs.service_product_id
             {income_where}{' AND i.case_id IS NOT NULL' if income_where else ' WHERE i.case_id IS NOT NULL'}
-            GROUP BY name
+            GROUP BY COALESCE(sp.name, cs.service_area, '(Sin servicio)')
             """,
             income_params,
         ).fetchall()
@@ -1274,7 +1432,7 @@ class Repository:
             LEFT JOIN cases cs ON cs.id=co.case_id
             LEFT JOIN service_products sp ON sp.id=cs.service_product_id
             {cost_where}{' AND co.case_id IS NOT NULL' if cost_where else ' WHERE co.case_id IS NOT NULL'}
-            GROUP BY name
+            GROUP BY COALESCE(sp.name, cs.service_area, '(Sin servicio)')
             """,
             cost_params,
         ).fetchall()
@@ -1371,6 +1529,243 @@ class Repository:
             })
 
         return sorted(result, key=lambda x: x["income"], reverse=True)
+
+    # --- Roles & Permissions
+
+    def list_roles(self) -> list:
+        return self.conn.execute(
+            """SELECT r.id, r.name, r.description, r.is_system, r.created_at,
+                      COUNT(rp.permission_id) AS permission_count
+               FROM roles r
+               LEFT JOIN role_permissions rp ON rp.role_id = r.id
+               GROUP BY r.id ORDER BY r.is_system DESC, r.name"""
+        ).fetchall()
+
+    def get_role(self, role_id: int):
+        return self.conn.execute(
+            "SELECT id, name, description, is_system, created_at FROM roles WHERE id=%s",
+            (role_id,),
+        ).fetchone()
+
+    def get_role_permissions(self, role_id: int) -> list:
+        return self.conn.execute(
+            """SELECT p.id, p.module, p.action, p.label
+               FROM role_permissions rp
+               JOIN permissions p ON p.id = rp.permission_id
+               WHERE rp.role_id = %s
+               ORDER BY p.module, p.action""",
+            (role_id,),
+        ).fetchall()
+
+    def list_all_permissions(self) -> list:
+        return self.conn.execute(
+            "SELECT id, module, action, label FROM permissions ORDER BY module, action"
+        ).fetchall()
+
+    def create_role(self, name: str, description: str | None, created_at: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO roles(name, description, is_system, created_at) VALUES(%s,%s,0,%s)",
+            (name, description, created_at),
+        )
+        self.conn.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def update_role(self, role_id: int, name: str, description: str | None) -> None:
+        self.conn.execute(
+            "UPDATE roles SET name=%s, description=%s WHERE id=%s AND is_system=0",
+            (name, description, role_id),
+        )
+        self.conn.commit()
+
+    def set_role_permissions(self, role_id: int, permission_ids: list[int]) -> None:
+        self.conn.execute("DELETE FROM role_permissions WHERE role_id=%s", (role_id,))
+        for pid in permission_ids:
+            self.conn.execute(
+                "INSERT INTO role_permissions(role_id, permission_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                (role_id, pid),
+            )
+        self.conn.commit()
+
+    def delete_role(self, role_id: int) -> None:
+        self.conn.execute(
+            "UPDATE users SET role_id=NULL WHERE role_id=%s", (role_id,)
+        )
+        self.conn.execute("DELETE FROM roles WHERE id=%s AND is_system=0", (role_id,))
+        self.conn.commit()
+
+    def get_user_permissions(self, username: str) -> set[str]:
+        rows = self.conn.execute(
+            """SELECT p.module || '.' || p.action AS perm
+               FROM users u
+               JOIN role_permissions rp ON rp.role_id = u.role_id
+               JOIN permissions p ON p.id = rp.permission_id
+               WHERE u.username = %s""",
+            (username,),
+        ).fetchall()
+        return {str(r["perm"]) for r in rows}
+
+    def assign_user_role(self, user_id: int, role_id: int | None) -> None:
+        self.conn.execute(
+            "UPDATE users SET role_id=%s WHERE id=%s", (role_id, user_id)
+        )
+        self.conn.commit()
+
+    # --- Invoices
+
+    def list_invoices(self, client_id: int | None = None) -> list:
+        if client_id is not None:
+            return self.conn.execute(
+                """SELECT i.*, cl.name AS client_name, ca.title AS case_title,
+                          EXISTS(SELECT 1 FROM incomes WHERE invoice_id = i.id) AS has_income
+                   FROM invoices i
+                   LEFT JOIN clients cl ON cl.id = i.client_id
+                   LEFT JOIN cases ca ON ca.id = i.case_id
+                   WHERE i.client_id = %s
+                   ORDER BY i.id DESC""",
+                (client_id,),
+            ).fetchall()
+        return self.conn.execute(
+            """SELECT i.*, cl.name AS client_name, ca.title AS case_title,
+                      EXISTS(SELECT 1 FROM incomes WHERE invoice_id = i.id) AS has_income
+               FROM invoices i
+               LEFT JOIN clients cl ON cl.id = i.client_id
+               LEFT JOIN cases ca ON ca.id = i.case_id
+               ORDER BY i.id DESC"""
+        ).fetchall()
+
+    def get_invoice(self, invoice_id: int):
+        return self.conn.execute(
+            """SELECT i.*, cl.name AS client_name, ca.title AS case_title,
+                      EXISTS(SELECT 1 FROM incomes WHERE invoice_id = i.id) AS has_income
+               FROM invoices i
+               LEFT JOIN clients cl ON cl.id = i.client_id
+               LEFT JOIN cases ca ON ca.id = i.case_id
+               WHERE i.id = %s""",
+            (invoice_id,),
+        ).fetchone()
+
+    def get_invoice_items(self, invoice_id: int) -> list:
+        return self.conn.execute(
+            "SELECT * FROM invoice_items WHERE invoice_id = %s ORDER BY id",
+            (invoice_id,),
+        ).fetchall()
+
+    def next_invoice_number(self) -> str:
+        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM invoices").fetchone()
+        n = int(row["cnt"]) + 1
+        return f"FAC-{n:04d}"
+
+    def create_invoice(
+        self,
+        client_id: int,
+        case_id: int | None,
+        invoice_number: str,
+        invoice_date: str,
+        due_date: str | None,
+        notes: str | None,
+        firm_name: str | None,
+        firm_phone: str | None,
+        firm_email: str | None,
+        firm_address: str | None,
+        firm_tax_id: str | None,
+        items: list[dict],
+        created_at: str,
+    ) -> int:
+        total_cents = sum(
+            round(float(it.get("unit_price", 0)) * float(it.get("quantity", 1)) * 100)
+            for it in items
+        )
+        cur = self.conn.execute(
+            """INSERT INTO invoices(client_id, case_id, invoice_number, invoice_date, due_date,
+               status, notes, firm_name, firm_phone, firm_email, firm_address, firm_tax_id,
+               total_cents, created_at)
+               VALUES(%s,%s,%s,%s,%s,'Borrador',%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (client_id, case_id, invoice_number, invoice_date, due_date, notes,
+             firm_name, firm_phone, firm_email, firm_address, firm_tax_id,
+             total_cents, created_at),
+        )
+        invoice_id = cur.lastrowid
+        for it in items:
+            price_cents = round(float(it.get("unit_price", 0)) * 100)
+            self.conn.execute(
+                """INSERT INTO invoice_items(invoice_id, description, quantity, unit_price_cents,
+                   entity_type, entity_id, created_at) VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                (invoice_id, it["description"], float(it.get("quantity", 1)),
+                 price_cents, it.get("entity_type"), it.get("entity_id"), created_at),
+            )
+        self.conn.commit()
+        return invoice_id
+
+    def update_invoice(
+        self,
+        invoice_id: int,
+        invoice_number: str,
+        invoice_date: str,
+        due_date: str | None,
+        status: str,
+        notes: str | None,
+        firm_name: str | None,
+        firm_phone: str | None,
+        firm_email: str | None,
+        firm_address: str | None,
+        firm_tax_id: str | None,
+        items: list[dict],
+        created_at: str,
+    ) -> None:
+        total_cents = sum(
+            round(float(it.get("unit_price", 0)) * float(it.get("quantity", 1)) * 100)
+            for it in items
+        )
+        self.conn.execute(
+            """UPDATE invoices SET invoice_number=%s, invoice_date=%s, due_date=%s, status=%s,
+               notes=%s, firm_name=%s, firm_phone=%s, firm_email=%s, firm_address=%s,
+               firm_tax_id=%s, total_cents=%s WHERE id=%s""",
+            (invoice_number, invoice_date, due_date, status, notes,
+             firm_name, firm_phone, firm_email, firm_address, firm_tax_id,
+             total_cents, invoice_id),
+        )
+        self.conn.execute("DELETE FROM invoice_items WHERE invoice_id=%s", (invoice_id,))
+        for it in items:
+            price_cents = round(float(it.get("unit_price", 0)) * 100)
+            self.conn.execute(
+                """INSERT INTO invoice_items(invoice_id, description, quantity, unit_price_cents,
+                   entity_type, entity_id, created_at) VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                (invoice_id, it["description"], float(it.get("quantity", 1)),
+                 price_cents, it.get("entity_type"), it.get("entity_id"), created_at),
+            )
+        self.conn.commit()
+
+    def update_invoice_status(self, invoice_id: int, status: str) -> None:
+        self.conn.execute(
+            "UPDATE invoices SET status=%s WHERE id=%s", (status, invoice_id)
+        )
+        self.conn.commit()
+
+    def delete_invoice(self, invoice_id: int) -> None:
+        self.conn.execute("DELETE FROM invoices WHERE id=%s", (invoice_id,))
+        self.conn.commit()
+
+    def get_unbilled_items(self, client_id: int) -> dict:
+        sessions = self.conn.execute(
+            """SELECT id, session_date, consult_type, notes FROM sessions
+               WHERE client_id=%s AND (invoice_id IS NULL)
+               ORDER BY session_date DESC""",
+            (client_id,),
+        ).fetchall()
+        tasks = self.conn.execute(
+            """SELECT ct.id, ct.title, ct.due_date, ca.title AS case_title, ca.id AS case_id
+               FROM case_tasks ct
+               JOIN cases ca ON ca.id = ct.case_id
+               WHERE ca.client_id=%s AND (ct.invoice_id IS NULL)
+               ORDER BY ct.due_date DESC NULLS LAST""",
+            (client_id,),
+        ).fetchall()
+        costs = self.conn.execute(
+            """SELECT id, concept, detail, amount_cents, cost_date FROM costs
+               WHERE client_id=%s ORDER BY cost_date DESC""",
+            (client_id,),
+        ).fetchall()
+        return {"sessions": sessions, "tasks": tasks, "costs": costs}
 
     # --- Helpers for UI
     def client_choices(self) -> list[tuple[int, str]]:

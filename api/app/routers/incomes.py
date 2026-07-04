@@ -4,7 +4,7 @@ from fastapi import APIRouter
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, RepoDep
+from ..deps import CurrentUser, LawyerRequired, RepoDep
 from ..schemas.income import IncomeIn, IncomeOut
 
 router = APIRouter(prefix="/incomes", tags=["incomes"])
@@ -21,7 +21,7 @@ def list_incomes(
 
 
 @router.post("", response_model=IncomeOut, status_code=201)
-def create_income(body: IncomeIn, current_user: CurrentUser, repo: RepoDep) -> IncomeOut:
+def create_income(body: IncomeIn, current_user: LawyerRequired, repo: RepoDep) -> IncomeOut:
     income_id = repo.create_income(
         amount_text=str(body.amount),
         income_date=body.income_date,
@@ -29,6 +29,7 @@ def create_income(body: IncomeIn, current_user: CurrentUser, repo: RepoDep) -> I
         category_id=body.category_id,
         case_id=body.case_id,
         detail=body.detail,
+        invoice_id=body.invoice_id,
         created_at=now_iso(),
     )
     rows = repo.list_incomes_range(start_date=None, end_date=None)
@@ -37,7 +38,7 @@ def create_income(body: IncomeIn, current_user: CurrentUser, repo: RepoDep) -> I
 
 
 @router.put("/{income_id}", response_model=IncomeOut)
-def update_income(income_id: int, body: IncomeIn, current_user: CurrentUser, repo: RepoDep) -> IncomeOut:
+def update_income(income_id: int, body: IncomeIn, current_user: LawyerRequired, repo: RepoDep) -> IncomeOut:
     from fastapi import HTTPException
     repo.update_income(
         income_id,
@@ -55,5 +56,5 @@ def update_income(income_id: int, body: IncomeIn, current_user: CurrentUser, rep
 
 
 @router.delete("/{income_id}", status_code=204)
-def delete_income(income_id: int, current_user: CurrentUser, repo: RepoDep):
+def delete_income(income_id: int, current_user: LawyerRequired, repo: RepoDep):
     repo.delete_income(income_id)

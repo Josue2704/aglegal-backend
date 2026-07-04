@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     google_redirect_uri: str = "http://localhost:8000/google-cal/callback"
     frontend_url: str = "http://localhost:5173"
 
+    # Email (Resend)
+    resend_api_key: str = ""
+    resend_from_email: str = "AGLegal <noreply@aglegal.cr>"
+    firm_name: str = "AGLegal"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 

@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict
 
 
 class SessionIn(BaseModel):
-    client_id: int
+    client_id: int | None = None
     case_id: int | None = None
     session_date: str
     start_time: str | None = None
@@ -18,7 +18,7 @@ class SessionIn(BaseModel):
 
 class SessionOut(BaseModel):
     id: int
-    client_id: int
+    client_id: int | None = None
     client_name: str | None = None
     case_id: int | None = None
     session_date: str

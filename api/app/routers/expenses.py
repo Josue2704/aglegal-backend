@@ -4,7 +4,7 @@ from fastapi import APIRouter
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, RepoDep
+from ..deps import CurrentUser, LawyerRequired, RepoDep
 from ..schemas.expense import ExpenseIn, ExpenseOut
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
@@ -21,7 +21,7 @@ def list_expenses(
 
 
 @router.post("", response_model=ExpenseOut, status_code=201)
-def create_expense(body: ExpenseIn, current_user: CurrentUser, repo: RepoDep) -> ExpenseOut:
+def create_expense(body: ExpenseIn, current_user: LawyerRequired, repo: RepoDep) -> ExpenseOut:
     expense_id = repo.create_expense(
         category_id=body.category_id,
         detail=body.detail,
@@ -36,7 +36,7 @@ def create_expense(body: ExpenseIn, current_user: CurrentUser, repo: RepoDep) ->
 
 
 @router.put("/{expense_id}", response_model=ExpenseOut)
-def update_expense(expense_id: int, body: ExpenseIn, current_user: CurrentUser, repo: RepoDep) -> ExpenseOut:
+def update_expense(expense_id: int, body: ExpenseIn, current_user: LawyerRequired, repo: RepoDep) -> ExpenseOut:
     from fastapi import HTTPException
     repo.update_expense(
         expense_id,
@@ -53,5 +53,5 @@ def update_expense(expense_id: int, body: ExpenseIn, current_user: CurrentUser, 
 
 
 @router.delete("/{expense_id}", status_code=204)
-def delete_expense(expense_id: int, current_user: CurrentUser, repo: RepoDep):
+def delete_expense(expense_id: int, current_user: LawyerRequired, repo: RepoDep):
     repo.delete_expense(expense_id)

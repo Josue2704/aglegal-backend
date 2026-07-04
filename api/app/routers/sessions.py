@@ -1,17 +1,48 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, HTTPException
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, RepoDep
+from ..config import get_settings
+from ..deps import CurrentUser, LawyerRequired, RepoDep
 from ..schemas.session import SessionIn, SessionOut
 from ..services import google_calendar as gcal
+from ..services.email import send_session_email
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/sessions", tags=["sessions"])
+_executor = ThreadPoolExecutor(max_workers=2)
+
+
+def _email_notify(session_row, repo: RepoDep, is_update: bool = False) -> None:
+    """Send email confirmation to client if they have an email address."""
+    try:
+        s = get_settings()
+        if not s.resend_api_key:
+            return
+        client_id = session_row.get("client_id")
+        if not client_id:
+            return
+        client = repo.conn.execute(
+            "SELECT name, email FROM clients WHERE id=%s", (int(client_id),)
+        ).fetchone()
+        if not client or not client["email"]:
+            return
+        send_session_email(
+            session_row=session_row,
+            client_email=str(client["email"]),
+            client_name=str(client["name"]),
+            firm_name=s.firm_name,
+            resend_api_key=s.resend_api_key,
+            resend_from=s.resend_from_email,
+            is_update=is_update,
+        )
+    except Exception as e:
+        log.warning("Email notify failed: %s", e)
 
 
 def _sync_create(current_user: str, session_id: int, repo: RepoDep) -> None:
@@ -83,10 +114,11 @@ def create_session(body: SessionIn, current_user: CurrentUser, repo: RepoDep) ->
         status=body.status,
         created_at=now_iso(),
     )
-    _sync_create(current_user, session_id, repo)
+    _sync_create(current_user["username"], session_id, repo)
     row = repo.get_session(session_id)
     if not row:
         raise HTTPException(500, "Error al recuperar la sesión creada")
+    _executor.submit(_email_notify, dict(row), repo, False)
     return SessionOut.from_row(row)
 
 
@@ -102,14 +134,15 @@ def update_session(session_id: int, body: SessionIn, current_user: CurrentUser, 
         notes=body.notes,
         status=body.status,
     )
-    _sync_update(current_user, session_id, repo)
+    _sync_update(current_user["username"], session_id, repo)
     row = repo.get_session(session_id)
     if not row:
         raise HTTPException(404, "Sesión no encontrada")
+    _executor.submit(_email_notify, dict(row), repo, True)
     return SessionOut.from_row(row)
 
 
 @router.delete("/{session_id}", status_code=204)
-def delete_session(session_id: int, current_user: CurrentUser, repo: RepoDep):
-    _sync_delete(current_user, session_id, repo)
+def delete_session(session_id: int, current_user: LawyerRequired, repo: RepoDep):
+    _sync_delete(current_user["username"], session_id, repo)
     repo.delete_session(session_id)
