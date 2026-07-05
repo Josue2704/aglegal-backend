@@ -12,7 +12,7 @@ router = APIRouter(prefix="/incomes", tags=["incomes"])
 
 @router.get("", response_model=list[IncomeOut])
 def list_incomes(
-    current_user: CurrentUser,
+    current_user: LawyerRequired,
     repo: RepoDep,
     start_date: str | None = None,
     end_date: str | None = None,

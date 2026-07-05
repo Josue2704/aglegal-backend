@@ -22,6 +22,9 @@ def client_choices(current_user: CurrentUser, repo: RepoDep) -> list[dict]:
 
 @router.post("", response_model=ClientOut, status_code=201)
 def create_client(body: ClientIn, current_user: CurrentUser, repo: RepoDep) -> ClientOut:
+    if not current_user["is_admin"] and "clientes.crear" not in current_user["permissions"]:
+        from fastapi import HTTPException
+        raise HTTPException(403, "Sin permiso: clientes.crear")
     client_id = repo.create_client(
         name=body.name,
         client_type=body.client_type,
@@ -39,6 +42,9 @@ def create_client(body: ClientIn, current_user: CurrentUser, repo: RepoDep) -> C
 
 @router.put("/{client_id}", response_model=ClientOut)
 def update_client(client_id: int, body: ClientIn, current_user: CurrentUser, repo: RepoDep) -> ClientOut:
+    if not current_user["is_admin"] and "clientes.editar" not in current_user["permissions"]:
+        from fastapi import HTTPException
+        raise HTTPException(403, "Sin permiso: clientes.editar")
     repo.update_client(
         client_id,
         name=body.name,

@@ -28,6 +28,8 @@ def case_choices(current_user: CurrentUser, repo: RepoDep, client_id: int | None
 
 @router.post("", response_model=CaseOut, status_code=201)
 def create_case(body: CaseIn, current_user: CurrentUser, repo: RepoDep) -> CaseOut:
+    if not current_user["is_admin"] and "expedientes.crear" not in current_user["permissions"]:
+        raise HTTPException(403, "Sin permiso: expedientes.crear")
     case_id = repo.create_case(
         client_id=body.client_id,
         service_area=body.service_area,
@@ -53,6 +55,8 @@ def create_case(body: CaseIn, current_user: CurrentUser, repo: RepoDep) -> CaseO
 
 @router.put("/{case_id}", response_model=CaseOut)
 def update_case(case_id: int, body: CaseUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseOut:
+    if not current_user["is_admin"] and "expedientes.editar" not in current_user["permissions"]:
+        raise HTTPException(403, "Sin permiso: expedientes.editar")
     repo.update_case(
         case_id,
         service_area=body.service_area,
@@ -101,6 +105,8 @@ def list_tasks(case_id: int, current_user: CurrentUser, repo: RepoDep) -> list[C
 
 @router.post("/{case_id}/tasks", response_model=CaseTaskOut, status_code=201)
 def create_task(case_id: int, body: CaseTaskIn, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
+    if not current_user["is_admin"] and "tareas.crear" not in current_user["permissions"]:
+        raise HTTPException(403, "Sin permiso: tareas.crear")
     task_id = repo.create_case_task(
         case_id=case_id,
         title=body.title,
@@ -132,7 +138,7 @@ def update_task_notes(task_id: int, body: CaseTaskNotesUpdate, current_user: Cur
 
 
 @router.delete("/tasks/{task_id}", status_code=204)
-def delete_task(task_id: int, current_user: CurrentUser, repo: RepoDep):
+def delete_task(task_id: int, current_user: LawyerRequired, repo: RepoDep):
     repo.delete_case_task(task_id)
 
 
