@@ -12,7 +12,7 @@ from .security import hash_password, verify_password
 
 
 SESSION_STATUSES = ["Pendiente", "En proceso", "Finalizada"]
-ATTACH_ENTITY_TYPES = ["session", "income", "expense", "case", "client", "cost"]
+ATTACH_ENTITY_TYPES = ["session", "income", "expense", "case", "client", "cost", "user"]
 CATEGORY_KINDS = ["income", "expense", "cost", "service"]
 CASE_STATUSES = ["Abierto", "En trámite", "En pausa", "Cerrado"]
 CASE_PRIORITIES = ["Baja", "Media", "Alta"]

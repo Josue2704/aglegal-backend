@@ -36,7 +36,20 @@ _ALLOWED_EXTENSIONS = {
 }
 
 
-_VALID_DOC_ROLES = {"guide", "evidence"}
+_VALID_DOC_ROLES = {"guide", "evidence", "avatar"}
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+@router.get("/avatar/{entity_type}/{entity_id}", response_model=AttachmentOut)
+def get_avatar(entity_type: str, entity_id: int, current_user: CurrentUser, conn: DbDep) -> AttachmentOut:
+    """Return the avatar attachment for an entity, or 404 if none."""
+    row = conn.execute(
+        "SELECT * FROM attachments WHERE entity_type=%s AND entity_id=%s AND doc_role='avatar' ORDER BY id DESC LIMIT 1",
+        (entity_type, entity_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Sin avatar")
+    return AttachmentOut(**dict(row))
 
 
 @router.post("/upload", response_model=AttachmentOut, status_code=201)
@@ -55,11 +68,27 @@ async def upload_attachment(
     if suffix not in _ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Tipo de archivo no permitido: {suffix}")
 
+    role = doc_role if doc_role in _VALID_DOC_ROLES else None
+
+    # Avatar must be an image
+    if role == "avatar" and suffix not in _IMAGE_EXTENSIONS:
+        raise HTTPException(400, "El avatar debe ser una imagen (png, jpg, jpeg, webp)")
+
     content = await file.read()
     if len(content) > _MAX_UPLOAD_BYTES:
         raise HTTPException(413, "El archivo supera el límite de 20 MB")
 
-    role = doc_role if doc_role in _VALID_DOC_ROLES else None
+    # Replace previous avatar: delete old file from disk and DB
+    if role == "avatar":
+        old_rows = conn.execute(
+            "SELECT id, stored_path FROM attachments WHERE entity_type=%s AND entity_id=%s AND doc_role='avatar'",
+            (entity_type, entity_id),
+        ).fetchall()
+        for old in old_rows:
+            old_path = Path(str(old["stored_path"]))
+            if old_path.exists():
+                old_path.unlink(missing_ok=True)
+            conn.execute("DELETE FROM attachments WHERE id=%s", (old["id"],))
 
     token = uuid.uuid4().hex[:12]
     dest = _DATA_DIR / "attachments" / entity_type / str(entity_id) / f"{token}{suffix}"

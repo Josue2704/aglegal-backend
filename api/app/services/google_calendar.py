@@ -25,10 +25,9 @@ log = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 _CALENDAR_ID = "primary"
-_TIMEZONE = "America/El_Salvador"
 
-# Local development uses http://localhost callbacks. OAuthlib can reject that
-# during the token exchange unless this flag is enabled.
+# Allow http://localhost callbacks in dev. In production the redirect URI is
+# already https so this env var is effectively ignored.
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 
 
@@ -139,17 +138,18 @@ def _session_to_event(session_row: Any) -> dict:
     if notes:
         description += f"\n{notes}"
 
+    s = get_settings()
     event = {
         "summary": summary,
         "description": description,
         "source": {
             "title": "AGLegal",
-            "url": "http://localhost:5173/sessions",
+            "url": f"{s.frontend_url}/sessions",
         },
     }
     if start_time and end_time:
-        event["start"] = {"dateTime": f"{date_str}T{start_time}:00", "timeZone": _TIMEZONE}
-        event["end"] = {"dateTime": f"{date_str}T{end_time}:00", "timeZone": _TIMEZONE}
+        event["start"] = {"dateTime": f"{date_str}T{start_time}:00", "timeZone": s.timezone}
+        event["end"] = {"dateTime": f"{date_str}T{end_time}:00", "timeZone": s.timezone}
     else:
         event["start"] = {"date": date_str}
         event["end"] = {"date": end_date}
