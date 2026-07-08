@@ -1168,24 +1168,33 @@ class Repository:
 
     def dashboard_alerts(self) -> dict:
         today = date.today().isoformat()
-        overdue_tasks = self.conn.execute(
-            """SELECT COUNT(*) AS n FROM case_tasks
-               WHERE done = 0 AND due_date IS NOT NULL AND due_date < %s""",
+        overdue_rows = self.conn.execute(
+            """SELECT ct.id, ct.title, ct.due_date, ct.case_id,
+                      ca.title AS case_title, cl.name AS client_name
+               FROM case_tasks ct
+               JOIN cases ca ON ca.id = ct.case_id
+               LEFT JOIN clients cl ON cl.id = ca.client_id
+               WHERE ct.done = 0 AND ct.due_date IS NOT NULL AND ct.due_date < %s
+               ORDER BY ct.due_date ASC
+               LIMIT 20""",
             (today,),
-        ).fetchone()["n"]
-        overdue_invoices = self.conn.execute(
-            """SELECT COUNT(*) AS n FROM invoices
-               WHERE status NOT IN ('Pagada','Cancelada') AND due_date IS NOT NULL AND due_date < %s""",
-            (today,),
-        ).fetchone()["n"]
-        today_sessions = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM sessions WHERE session_date = %s AND status != 'Realizada'",
-            (today,),
-        ).fetchone()["n"]
+        ).fetchall()
+        stale_rows = self.conn.execute(
+            """SELECT ca.id, ca.title, ca.status, cl.name AS client_name,
+                      MAX(s.session_date) AS last_session
+               FROM cases ca
+               LEFT JOIN clients cl ON cl.id = ca.client_id
+               LEFT JOIN sessions s ON s.case_id = ca.id
+               WHERE ca.status NOT IN ('Cerrado')
+               GROUP BY ca.id, ca.title, ca.status, cl.name
+               HAVING MAX(s.session_date) < (CURRENT_DATE - INTERVAL '30 days')
+                   OR MAX(s.session_date) IS NULL
+               ORDER BY last_session ASC NULLS FIRST
+               LIMIT 10""",
+        ).fetchall()
         return {
-            "overdue_tasks": int(overdue_tasks),
-            "overdue_invoices": int(overdue_invoices),
-            "today_sessions": int(today_sessions),
+            "overdue_tasks": [dict(r) for r in overdue_rows],
+            "stale_cases": [dict(r) for r in stale_rows],
         }
 
     def global_search(self, q: str, *, limit: int = 8) -> dict:
