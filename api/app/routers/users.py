@@ -4,14 +4,18 @@ from fastapi import APIRouter, HTTPException, status
 
 from aglegal.db import now_iso
 
-from ..deps import AdminRequired, CurrentUser, RepoDep
+from ..deps import AdminRequired, CurrentUser, RepoDep, require_permission
 from ..schemas.user import PasswordChange, UserCreate, UserOut, UserUpdate
 
 router = APIRouter(prefix="/users", tags=["users"])
 
 
 @router.get("", response_model=list[UserOut])
-def list_users(current_user: AdminRequired, repo: RepoDep) -> list[UserOut]:
+def list_users(
+    current_user: CurrentUser,
+    repo: RepoDep,
+    _: dict = require_permission("usuarios", "ver"),
+) -> list[UserOut]:
     return [UserOut.from_row(row) for row in repo.list_users()]
 
 
