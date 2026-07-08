@@ -33,6 +33,7 @@ class ServiceProductIn(BaseModel):
     description: str = ""
     base_price: float | None = None
     active: bool = True
+    service_area: str | None = None
 
 
 class ServiceProductUpdate(BaseModel):
@@ -41,6 +42,7 @@ class ServiceProductUpdate(BaseModel):
     description: str = ""
     base_price: float | None = None
     active: bool = True
+    service_area: str | None = None
 
 
 class ServiceProductOut(BaseModel):
@@ -51,6 +53,7 @@ class ServiceProductOut(BaseModel):
     description: str | None = None
     base_price: float | None = None
     active: bool
+    service_area: str | None = None
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)

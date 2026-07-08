@@ -822,6 +822,24 @@ class Repository:
         )
         return list(self.conn.execute(sql, tuple(params)).fetchall())
 
+    def _generate_case_ref(self, opened_at: str) -> str:
+        parts = opened_at.split("-")
+        year, month = parts[0], parts[1]
+        prefix = f"EXP-{month}-{year}-"
+        row = self.conn.execute(
+            "SELECT internal_ref FROM cases WHERE internal_ref LIKE %s ORDER BY internal_ref DESC LIMIT 1",
+            (f"{prefix}%",),
+        ).fetchone()
+        if row and row["internal_ref"]:
+            try:
+                last_num = int(row["internal_ref"].rsplit("-", 1)[-1])
+                next_num = last_num + 1
+            except (ValueError, IndexError):
+                next_num = 1
+        else:
+            next_num = 1
+        return f"{prefix}{next_num:04d}"
+
     def create_case(
         self,
         *,
@@ -844,6 +862,8 @@ class Repository:
             raise ValueError("Estado de caso inválido")
         if priority not in CASE_PRIORITIES:
             raise ValueError("Prioridad inválida")
+        if not (internal_ref or "").strip():
+            internal_ref = self._generate_case_ref(opened_at)
         cur = self.conn.execute(
             "INSERT INTO cases(client_id, service_area, title, status, priority, opened_at, closed_at, notes, created_at, "
             "service_product_id, internal_ref, official_ref, opposing_party, court_entity, responsible_username) "
@@ -1053,12 +1073,15 @@ class Repository:
 
 
     # --- Service catalog / products offered
-    def list_service_products(self, *, category_id: int | None = None, active_only: bool = False) -> list[Any]:
+    def list_service_products(self, *, category_id: int | None = None, service_area: str | None = None, active_only: bool = False) -> list[Any]:
         where = []
         params: list[Any] = []
         if category_id:
             where.append("sp.category_id=%s")
             params.append(int(category_id))
+        if service_area:
+            where.append("sp.service_area=%s")
+            params.append(service_area)
         if active_only:
             where.append("sp.active=1")
         clause = " WHERE " + " AND ".join(where) if where else ""
@@ -1081,6 +1104,7 @@ class Repository:
         description: str = "",
         base_price_text: str = "",
         active: bool = True,
+        service_area: str | None = None,
         created_at: str,
     ) -> int:
         product_name = (name or "").strip()
@@ -1088,8 +1112,8 @@ class Repository:
             raise ValueError("Nombre del producto requerido")
         base_price_cents = _to_cents(base_price_text) if (base_price_text or "").strip() else None
         cur = self.conn.execute(
-            "INSERT INTO service_products(category_id, name, description, base_price_cents, active, created_at) VALUES(%s,%s,%s,%s,%s,%s)",
-            (int(category_id), product_name, (description or "").strip(), base_price_cents, 1 if active else 0, created_at),
+            "INSERT INTO service_products(category_id, name, description, base_price_cents, active, service_area, created_at) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+            (int(category_id), product_name, (description or "").strip(), base_price_cents, 1 if active else 0, service_area or None, created_at),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -1103,14 +1127,15 @@ class Repository:
         description: str = "",
         base_price_text: str = "",
         active: bool = True,
+        service_area: str | None = None,
     ) -> None:
         product_name = (name or "").strip()
         if not product_name:
             raise ValueError("Nombre del producto requerido")
         base_price_cents = _to_cents(base_price_text) if (base_price_text or "").strip() else None
         self.conn.execute(
-            "UPDATE service_products SET category_id=%s, name=%s, description=%s, base_price_cents=%s, active=%s WHERE id=%s",
-            (int(category_id), product_name, (description or "").strip(), base_price_cents, 1 if active else 0, int(product_id)),
+            "UPDATE service_products SET category_id=%s, name=%s, description=%s, base_price_cents=%s, active=%s, service_area=%s WHERE id=%s",
+            (int(category_id), product_name, (description or "").strip(), base_price_cents, 1 if active else 0, service_area or None, int(product_id)),
         )
         self.conn.commit()
 
@@ -1118,8 +1143,8 @@ class Repository:
         self.conn.execute("DELETE FROM service_products WHERE id=%s", (int(product_id),))
         self.conn.commit()
 
-    def service_product_choices(self, *, category_id: int | None = None) -> list[tuple[int, str]]:
-        return [(int(row["id"]), str(row["name"])) for row in self.list_service_products(category_id=category_id, active_only=True)]
+    def service_product_choices(self, *, category_id: int | None = None, service_area: str | None = None) -> list[tuple[int, str]]:
+        return [(int(row["id"]), str(row["name"])) for row in self.list_service_products(category_id=category_id, service_area=service_area, active_only=True)]
 
     # --- Dashboard helpers
 
@@ -1738,6 +1763,32 @@ class Repository:
     def update_invoice_status(self, invoice_id: int, status: str) -> None:
         self.conn.execute(
             "UPDATE invoices SET status=%s WHERE id=%s", (status, invoice_id)
+        )
+        self.conn.commit()
+
+    def auto_income_from_invoice(self, invoice_id: int) -> None:
+        existing = self.conn.execute(
+            "SELECT id FROM incomes WHERE invoice_id=%s LIMIT 1", (invoice_id,)
+        ).fetchone()
+        if existing:
+            return
+        inv = self.get_invoice(invoice_id)
+        if not inv or not inv["total_cents"]:
+            return
+        from aglegal.db import now_iso
+        self.conn.execute(
+            """INSERT INTO incomes(client_id, concept, amount_cents, income_date, case_id, invoice_id, detail, created_at)
+               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (
+                inv["client_id"],
+                f"Factura {inv['invoice_number']}",
+                inv["total_cents"],
+                inv["invoice_date"],
+                inv.get("case_id"),
+                invoice_id,
+                "Ingreso generado automáticamente desde facturación",
+                now_iso(),
+            ),
         )
         self.conn.commit()
 

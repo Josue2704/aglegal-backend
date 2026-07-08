@@ -58,8 +58,9 @@ def service_product_choices(
     current_user: CurrentUser,
     repo: RepoDep,
     category_id: int | None = None,
+    service_area: str | None = None,
 ) -> list[dict]:
-    return [{"id": pid, "name": name} for pid, name in repo.service_product_choices(category_id=category_id)]
+    return [{"id": pid, "name": name} for pid, name in repo.service_product_choices(category_id=category_id, service_area=service_area)]
 
 
 @router.post("/service-products", response_model=ServiceProductOut, status_code=201)
@@ -71,6 +72,7 @@ def create_service_product(body: ServiceProductIn, current_user: CurrentUser, re
         description=body.description,
         base_price_text=price_text,
         active=body.active,
+        service_area=body.service_area,
         created_at=now_iso(),
     )
     rows = repo.list_service_products()
@@ -93,6 +95,7 @@ def update_service_product(
         description=body.description,
         base_price_text=price_text,
         active=body.active,
+        service_area=body.service_area,
     )
     rows = repo.list_service_products()
     row = next((r for r in rows if r["id"] == product_id), None)

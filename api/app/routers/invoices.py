@@ -151,6 +151,8 @@ def update_status(
     if not repo.get_invoice(invoice_id):
         raise HTTPException(404, "Factura no encontrada")
     repo.update_invoice_status(invoice_id, body.status)
+    if body.status == "Pagada":
+        repo.auto_income_from_invoice(invoice_id)
     return _load(repo, invoice_id)
 
 
