@@ -4,19 +4,19 @@ from fastapi import APIRouter
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, LawyerRequired, RepoDep
+from ..deps import CurrentUser, RepoDep, require_permission
 from ..schemas.payroll import PayrollIn, PayrollOut
 
 router = APIRouter(prefix="/payroll", tags=["payroll"])
 
 
 @router.get("", response_model=list[PayrollOut])
-def list_payroll(current_user: CurrentUser, repo: RepoDep) -> list[PayrollOut]:
+def list_payroll(current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("nominas", "ver")) -> list[PayrollOut]:
     return [PayrollOut.from_row(row) for row in repo.list_payrolls()]
 
 
 @router.post("", response_model=PayrollOut, status_code=201)
-def create_payroll(body: PayrollIn, current_user: LawyerRequired, repo: RepoDep) -> PayrollOut:
+def create_payroll(body: PayrollIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("nominas", "crear")) -> PayrollOut:
     payroll_id = repo.create_payroll(
         employee_name=body.employee_name,
         role=body.role,
@@ -32,5 +32,5 @@ def create_payroll(body: PayrollIn, current_user: LawyerRequired, repo: RepoDep)
 
 
 @router.delete("/{payroll_id}", status_code=204)
-def delete_payroll(payroll_id: int, current_user: LawyerRequired, repo: RepoDep):
+def delete_payroll(payroll_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("nominas", "eliminar")):
     repo.delete_payroll(payroll_id)

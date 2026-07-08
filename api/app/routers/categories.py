@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, RepoDep
+from ..deps import CurrentUser, RepoDep, require_permission
 from ..schemas.category import (
     CategoryIn,
     CategoryOut,
@@ -23,21 +23,26 @@ def list_categories(current_user: CurrentUser, repo: RepoDep, kind: str = "incom
 
 
 @router.post("", response_model=CategoryOut, status_code=201)
-def create_category(body: CategoryIn, current_user: CurrentUser, repo: RepoDep) -> CategoryOut:
+def create_category(body: CategoryIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("categorias", "crear")) -> CategoryOut:
+    existing = repo.conn.execute(
+        "SELECT id FROM categories WHERE kind=%s AND name=%s", (body.kind, body.name)
+    ).fetchone()
+    if existing:
+        raise HTTPException(409, "Ya existe una categoría con ese nombre y tipo")
     cat_id = repo.create_category(kind=body.kind, name=body.name, created_at=now_iso())
     row = repo.conn.execute("SELECT * FROM categories WHERE id=%s", (cat_id,)).fetchone()
     return CategoryOut.from_row(row)
 
 
 @router.put("/{category_id}", response_model=CategoryOut)
-def update_category(category_id: int, body: CategoryUpdate, current_user: CurrentUser, repo: RepoDep) -> CategoryOut:
+def update_category(category_id: int, body: CategoryUpdate, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("categorias", "editar")) -> CategoryOut:
     repo.update_category(category_id, name=body.name)
     row = repo.conn.execute("SELECT * FROM categories WHERE id=%s", (category_id,)).fetchone()
     return CategoryOut.from_row(row)
 
 
 @router.delete("/{category_id}", status_code=204)
-def delete_category(category_id: int, current_user: CurrentUser, repo: RepoDep):
+def delete_category(category_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("categorias", "eliminar")):
     repo.delete_category(category_id)
 
 

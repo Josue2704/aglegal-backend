@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from aglegal.db import now_iso
 
 from ..config import get_settings
-from ..deps import CurrentUser, LawyerRequired, RepoDep
+from ..deps import CurrentUser, RepoDep, require_permission
 from ..schemas.session import SessionIn, SessionOut
 from ..services import google_calendar as gcal
 from ..services.email import send_session_email
@@ -102,7 +102,7 @@ def list_sessions(
 
 
 @router.post("", response_model=SessionOut, status_code=201)
-def create_session(body: SessionIn, current_user: CurrentUser, repo: RepoDep) -> SessionOut:
+def create_session(body: SessionIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("agenda", "crear")) -> SessionOut:
     session_id = repo.create_session(
         client_id=body.client_id,
         case_id=body.case_id,
@@ -123,7 +123,7 @@ def create_session(body: SessionIn, current_user: CurrentUser, repo: RepoDep) ->
 
 
 @router.put("/{session_id}", response_model=SessionOut)
-def update_session(session_id: int, body: SessionIn, current_user: CurrentUser, repo: RepoDep) -> SessionOut:
+def update_session(session_id: int, body: SessionIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("agenda", "editar")) -> SessionOut:
     repo.update_session(
         session_id,
         case_id=body.case_id,
@@ -143,6 +143,6 @@ def update_session(session_id: int, body: SessionIn, current_user: CurrentUser, 
 
 
 @router.delete("/{session_id}", status_code=204)
-def delete_session(session_id: int, current_user: LawyerRequired, repo: RepoDep):
+def delete_session(session_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("agenda", "eliminar")):
     _sync_delete(current_user["username"], session_id, repo)
     repo.delete_session(session_id)

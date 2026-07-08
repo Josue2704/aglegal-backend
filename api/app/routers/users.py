@@ -21,6 +21,9 @@ def list_users(
 
 @router.post("", response_model=UserOut, status_code=201)
 def create_user(body: UserCreate, current_user: AdminRequired, repo: RepoDep) -> UserOut:
+    existing = repo.conn.execute("SELECT id FROM users WHERE username=%s", (body.username,)).fetchone()
+    if existing:
+        raise HTTPException(409, "El nombre de usuario ya existe")
     user_id = repo.create_user(
         username=body.username,
         password=body.password,
