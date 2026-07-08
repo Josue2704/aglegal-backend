@@ -291,6 +291,8 @@ class Repository:
     ) -> int:
         if status not in SESSION_STATUSES:
             raise ValueError("Estado inválido")
+        if start_time and end_time and end_time <= start_time:
+            raise ValueError("La hora de fin debe ser posterior a la hora de inicio")
         cur = self.conn.execute(
             "INSERT INTO sessions(client_id, case_id, session_date, start_time, end_time, consult_type, notes, status, created_at) "
             "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",

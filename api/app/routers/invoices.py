@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, LawyerRequired, RepoDep
+from ..deps import CurrentUser, RepoDep, require_permission
 from ..schemas.invoice import (
     InvoiceIn,
     InvoiceItemOut,
@@ -93,7 +93,7 @@ def get_invoice(invoice_id: int, current_user: CurrentUser, repo: RepoDep) -> In
 
 
 @router.post("", response_model=InvoiceOut, status_code=201)
-def create_invoice(body: InvoiceIn, current_user: LawyerRequired, repo: RepoDep) -> InvoiceOut:
+def create_invoice(body: InvoiceIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("facturas", "crear")) -> InvoiceOut:
     items = [item.model_dump() for item in body.items]
     invoice_id = repo.create_invoice(
         client_id=body.client_id,
@@ -117,8 +117,9 @@ def create_invoice(body: InvoiceIn, current_user: LawyerRequired, repo: RepoDep)
 def update_invoice(
     invoice_id: int,
     body: InvoiceUpdate,
-    current_user: LawyerRequired,
+    current_user: CurrentUser,
     repo: RepoDep,
+    _: dict = require_permission("facturas", "editar"),
 ) -> InvoiceOut:
     if not repo.get_invoice(invoice_id):
         raise HTTPException(404, "Factura no encontrada")
@@ -145,8 +146,9 @@ def update_invoice(
 def update_status(
     invoice_id: int,
     body: InvoiceStatusUpdate,
-    current_user: LawyerRequired,
+    current_user: CurrentUser,
     repo: RepoDep,
+    _: dict = require_permission("facturas", "editar"),
 ) -> InvoiceOut:
     if not repo.get_invoice(invoice_id):
         raise HTTPException(404, "Factura no encontrada")
@@ -157,7 +159,7 @@ def update_status(
 
 
 @router.delete("/{invoice_id}", status_code=204)
-def delete_invoice(invoice_id: int, current_user: LawyerRequired, repo: RepoDep):
+def delete_invoice(invoice_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("facturas", "eliminar")):
     if not repo.get_invoice(invoice_id):
         raise HTTPException(404, "Factura no encontrada")
     repo.delete_invoice(invoice_id)

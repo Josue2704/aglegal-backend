@@ -11,17 +11,17 @@ router = APIRouter(prefix="/roles", tags=["roles"])
 
 
 @router.get("/permissions", response_model=list[PermissionOut])
-def list_permissions(current_user: CurrentUser, repo: RepoDep) -> list[PermissionOut]:
+def list_permissions(current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("roles", "ver")) -> list[PermissionOut]:
     return [PermissionOut.from_row(r) for r in repo.list_all_permissions()]
 
 
 @router.get("", response_model=list[RoleOut])
-def list_roles(current_user: CurrentUser, repo: RepoDep) -> list[RoleOut]:
+def list_roles(current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("roles", "ver")) -> list[RoleOut]:
     return [RoleOut.from_row(r) for r in repo.list_roles()]
 
 
 @router.get("/{role_id}", response_model=RoleDetailOut)
-def get_role(role_id: int, current_user: CurrentUser, repo: RepoDep) -> RoleDetailOut:
+def get_role(role_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("roles", "ver")) -> RoleDetailOut:
     row = repo.get_role(role_id)
     if not row:
         raise HTTPException(404, "Rol no encontrado")

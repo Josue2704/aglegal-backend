@@ -9,7 +9,7 @@ class CostIn(BaseModel):
     client_id: int | None = None
     case_id: int | None = None
     category_id: int | None = None
-    detail: str
+    detail: str = ""
     amount: float
     cost_date: str
     notes: str = ""
