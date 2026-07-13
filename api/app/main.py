@@ -18,6 +18,7 @@ from .routers import (
     dashboard,
     expenses,
     google_cal,
+    outlook_cal,
     incomes,
     invoices,
     payroll,
@@ -66,6 +67,7 @@ app.include_router(users.router)
 app.include_router(dashboard.router)
 app.include_router(attachments.router)
 app.include_router(google_cal.router)
+app.include_router(outlook_cal.router)
 app.include_router(invoices.router)
 app.include_router(roles.router)
 

@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     google_redirect_uri: str = "http://localhost:8000/google-cal/callback"
     frontend_url: str = "http://localhost:5173"
 
+    # Microsoft Outlook Calendar OAuth2
+    outlook_client_id: str = ""
+    outlook_client_secret: str = ""
+    outlook_redirect_uri: str = "http://localhost:8000/outlook-cal/callback"
+
     # Timezone (IANA, e.g. "America/Costa_Rica")
     timezone: str = "America/Costa_Rica"
 

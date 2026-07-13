@@ -377,6 +377,31 @@ class Repository:
         self.conn.execute("DELETE FROM google_tokens WHERE username=%s", (username,))
         self.conn.commit()
 
+    # --- Outlook tokens
+    def get_outlook_tokens(self, username: str) -> Any | None:
+        return self.conn.execute(
+            "SELECT * FROM outlook_tokens WHERE username=%s", (username,)
+        ).fetchone()
+
+    def save_outlook_tokens(self, username: str, access_token: str, refresh_token: str, expiry_at: str) -> None:
+        self.conn.execute(
+            "INSERT INTO outlook_tokens(username, access_token, refresh_token, expiry_at) VALUES(%s,%s,%s,%s) "
+            "ON CONFLICT(username) DO UPDATE SET access_token=excluded.access_token, "
+            "refresh_token=excluded.refresh_token, expiry_at=excluded.expiry_at",
+            (username, access_token, refresh_token, expiry_at),
+        )
+        self.conn.commit()
+
+    def delete_outlook_tokens(self, username: str) -> None:
+        self.conn.execute("DELETE FROM outlook_tokens WHERE username=%s", (username,))
+        self.conn.commit()
+
+    def set_session_outlook_event_id(self, session_id: int, event_id: str | None) -> None:
+        self.conn.execute(
+            "UPDATE sessions SET outlook_event_id=%s WHERE id=%s", (event_id, int(session_id))
+        )
+        self.conn.commit()
+
     # --- Incomes
     def list_incomes(self) -> list[Any]:
         return list(

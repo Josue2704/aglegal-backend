@@ -11,6 +11,7 @@ from ..config import get_settings
 from ..deps import CurrentUser, RepoDep, require_permission
 from ..schemas.session import SessionIn, SessionOut
 from ..services import google_calendar as gcal
+from ..services import outlook_calendar as ocal
 from ..services.email import send_session_email
 
 log = logging.getLogger(__name__)
@@ -46,45 +47,53 @@ def _email_notify(session_row, repo: RepoDep, is_update: bool = False) -> None:
 
 
 def _sync_create(current_user: str, session_id: int, repo: RepoDep) -> None:
-    """After creating a session, push it to Google Calendar if connected."""
+    """Push new session to Google Calendar and Outlook Calendar if connected."""
     try:
-        token_row = repo.get_google_tokens(current_user)
-        if not token_row:
-            return
         session_row = repo.get_session(session_id)
         if not session_row:
             return
-        event_id = gcal.create_event(token_row, session_row)
-        if event_id:
-            repo.set_session_gcal_event_id(session_id, event_id)
+        gcal_row = repo.get_google_tokens(current_user)
+        if gcal_row:
+            event_id = gcal.create_event(gcal_row, session_row)
+            if event_id:
+                repo.set_session_gcal_event_id(session_id, event_id)
+        outlook_row = repo.get_outlook_tokens(current_user)
+        if outlook_row:
+            event_id = ocal.create_event(outlook_row, session_row)
+            if event_id:
+                repo.set_session_outlook_event_id(session_id, event_id)
     except Exception as e:
-        log.warning("GCal sync_create failed for session %s: %s", session_id, e)
+        log.warning("Calendar sync_create failed for session %s: %s", session_id, e)
 
 
 def _sync_update(current_user: str, session_id: int, repo: RepoDep) -> None:
     try:
-        token_row = repo.get_google_tokens(current_user)
-        if not token_row:
-            return
         session_row = repo.get_session(session_id)
-        if not session_row or not session_row["gcal_event_id"]:
+        if not session_row:
             return
-        gcal.update_event(token_row, session_row["gcal_event_id"], session_row)
+        gcal_row = repo.get_google_tokens(current_user)
+        if gcal_row and session_row["gcal_event_id"]:
+            gcal.update_event(gcal_row, session_row["gcal_event_id"], session_row)
+        outlook_row = repo.get_outlook_tokens(current_user)
+        if outlook_row and session_row["outlook_event_id"]:
+            ocal.update_event(outlook_row, session_row["outlook_event_id"], session_row)
     except Exception as e:
-        log.warning("GCal sync_update failed for session %s: %s", session_id, e)
+        log.warning("Calendar sync_update failed for session %s: %s", session_id, e)
 
 
 def _sync_delete(current_user: str, session_id: int, repo: RepoDep) -> None:
     try:
-        token_row = repo.get_google_tokens(current_user)
-        if not token_row:
-            return
         session_row = repo.get_session(session_id)
-        if not session_row or not session_row["gcal_event_id"]:
+        if not session_row:
             return
-        gcal.delete_event(token_row, session_row["gcal_event_id"])
+        gcal_row = repo.get_google_tokens(current_user)
+        if gcal_row and session_row["gcal_event_id"]:
+            gcal.delete_event(gcal_row, session_row["gcal_event_id"])
+        outlook_row = repo.get_outlook_tokens(current_user)
+        if outlook_row and session_row["outlook_event_id"]:
+            ocal.delete_event(outlook_row, session_row["outlook_event_id"])
     except Exception as e:
-        log.warning("GCal sync_delete failed for session %s: %s", session_id, e)
+        log.warning("Calendar sync_delete failed for session %s: %s", session_id, e)
 
 
 @router.get("", response_model=list[SessionOut])
