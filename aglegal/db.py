@@ -28,7 +28,7 @@ def _database_url() -> str:
 # Gives psycopg2 connections the same .execute() / .commit() / .close() surface
 # that the rest of the codebase expects from sqlite3, including .lastrowid.
 
-_TABLES_WITHOUT_ID = {"meta", "role_permissions", "google_tokens"}
+_TABLES_WITHOUT_ID = {"meta", "role_permissions", "google_tokens", "outlook_tokens"}
 
 
 class _Cursor:
