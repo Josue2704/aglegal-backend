@@ -1212,7 +1212,7 @@ class Repository:
                LEFT JOIN sessions s ON s.case_id = ca.id
                WHERE ca.status NOT IN ('Cerrado')
                GROUP BY ca.id, ca.title, ca.status, cl.name
-               HAVING MAX(s.session_date) < (CURRENT_DATE - INTERVAL '30 days')
+               HAVING MAX(s.session_date::date) < (CURRENT_DATE - INTERVAL '30 days')
                    OR MAX(s.session_date) IS NULL
                ORDER BY last_session ASC NULLS FIRST
                LIMIT 10""",
