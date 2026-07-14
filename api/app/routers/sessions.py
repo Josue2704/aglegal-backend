@@ -12,7 +12,7 @@ from ..deps import CurrentUser, RepoDep, require_permission
 from ..schemas.session import SessionIn, SessionOut
 from ..services import google_calendar as gcal
 from ..services import outlook_calendar as ocal
-from ..services.email import send_session_email
+from ..services.email import send_session_email, send_session_cancel_email
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -153,5 +153,25 @@ def update_session(session_id: int, body: SessionIn, current_user: CurrentUser, 
 
 @router.delete("/{session_id}", status_code=204)
 def delete_session(session_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("agenda", "eliminar")):
+    # Fetch session + client email BEFORE deleting so we can send cancel notification
+    row = repo.get_session(session_id)
+    if row:
+        s = get_settings()
+        if s.resend_api_key:
+            client_id = row.get("client_id")
+            if client_id:
+                client = repo.conn.execute(
+                    "SELECT name, email FROM clients WHERE id=%s", (int(client_id),)
+                ).fetchone()
+                if client and client["email"]:
+                    _executor.submit(
+                        send_session_cancel_email,
+                        session_row=dict(row),
+                        client_email=str(client["email"]),
+                        client_name=str(client["name"]),
+                        firm_name=s.firm_name,
+                        resend_api_key=s.resend_api_key,
+                        resend_from=s.resend_from_email,
+                    )
     _sync_delete(current_user["username"], session_id, repo)
     repo.delete_session(session_id)
