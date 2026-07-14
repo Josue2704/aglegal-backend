@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     resend_from_email: str = "AGLegal <noreply@aglegal.cr>"
     firm_name: str = "AGLegal"
 
+    # Internal cron key (protects /internal/* endpoints)
+    cron_key: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 

@@ -78,3 +78,71 @@ def get_client(client_id: int, current_user: CurrentUser, repo: RepoDep) -> Clie
 @router.get("/{client_id}/history", response_model=list[HistoryItem])
 def client_history(client_id: int, current_user: CurrentUser, repo: RepoDep) -> list[HistoryItem]:
     return [HistoryItem(**item) for item in repo.client_history(client_id)]
+
+
+@router.get("/{client_id}/statement")
+def client_statement(client_id: int, current_user: CurrentUser, repo: RepoDep) -> dict:
+    """Estado de cuenta completo del cliente: sesiones, facturas, pagos y saldo."""
+    row = repo.conn.execute("SELECT * FROM clients WHERE id=%s", (client_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Cliente no encontrado")
+
+    # Sessions summary
+    sessions = repo.conn.execute(
+        """SELECT id, session_date, start_time, end_time, consult_type, status, notes
+           FROM sessions WHERE client_id=%s ORDER BY session_date DESC""",
+        (client_id,),
+    ).fetchall()
+
+    sessions_by_status: dict[str, int] = {}
+    for s in sessions:
+        sessions_by_status[s["status"]] = sessions_by_status.get(s["status"], 0) + 1
+
+    # Cases
+    cases = repo.conn.execute(
+        "SELECT id, title, status, priority, created_at FROM cases WHERE client_id=%s ORDER BY created_at DESC",
+        (client_id,),
+    ).fetchall()
+
+    # Invoices
+    invoices = repo.conn.execute(
+        """SELECT id, invoice_number, issued_at, total_cents, status
+           FROM invoices WHERE client_id=%s ORDER BY issued_at DESC""",
+        (client_id,),
+    ).fetchall()
+
+    total_invoiced_cents = sum(int(i["total_cents"] or 0) for i in invoices)
+    paid_invoices_cents = sum(
+        int(i["total_cents"] or 0) for i in invoices if str(i["status"]).lower() == "pagada"
+    )
+    pending_invoices_cents = total_invoiced_cents - paid_invoices_cents
+
+    # Incomes linked to client
+    incomes = repo.conn.execute(
+        """SELECT id, amount_cents, description, income_date, category_id
+           FROM incomes WHERE client_id=%s ORDER BY income_date DESC""",
+        (client_id,),
+    ).fetchall()
+    total_received_cents = sum(int(i["amount_cents"] or 0) for i in incomes)
+
+    return {
+        "client": dict(row),
+        "sessions": {
+            "total": len(sessions),
+            "by_status": sessions_by_status,
+            "list": [dict(s) for s in sessions[:20]],
+        },
+        "cases": {
+            "total": len(cases),
+            "list": [dict(c) for c in cases],
+        },
+        "financial": {
+            "total_invoiced_cents": total_invoiced_cents,
+            "paid_invoices_cents": paid_invoices_cents,
+            "pending_invoices_cents": pending_invoices_cents,
+            "total_received_cents": total_received_cents,
+            "balance_cents": pending_invoices_cents - total_received_cents,
+            "invoices": [dict(i) for i in invoices],
+            "incomes": [dict(i) for i in incomes[:20]],
+        },
+    }

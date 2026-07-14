@@ -22,6 +22,7 @@ from .routers import (
     incomes,
     invoices,
     payroll,
+    reminders,
     roles,
     sessions,
     users,
@@ -70,6 +71,7 @@ app.include_router(google_cal.router)
 app.include_router(outlook_cal.router)
 app.include_router(invoices.router)
 app.include_router(roles.router)
+app.include_router(reminders.router)
 
 
 @app.get("/health", tags=["system"])

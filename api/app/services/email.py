@@ -227,6 +227,101 @@ def _build_html(
 </html>"""
 
 
+# ─── Reminder HTML ───────────────────────────────────────────────────────────
+
+def _build_reminder_html(
+    *,
+    client_name: str,
+    session_date: str,
+    start_time: str | None,
+    end_time: str | None,
+    consult_type: str,
+    notes: str | None,
+    firm_name: str,
+    hours_ahead: int,
+) -> str:
+    date_fmt = _fmt_date(session_date)
+    time_start = _fmt_time(start_time)
+    time_end = _fmt_time(end_time)
+
+    if hours_ahead <= 2:
+        urgency = "En pocas horas"
+        urgency_color = "#ef4444"
+        intro = "Su cita comienza en breve."
+    elif hours_ahead <= 24:
+        urgency = "Mañana"
+        urgency_color = "#f59e0b"
+        intro = "Le recordamos que tiene una cita programada para mañana."
+    else:
+        urgency = f"En {hours_ahead // 24} días"
+        urgency_color = "#3b82f6"
+        intro = f"Le recordamos que tiene una cita programada en {hours_ahead // 24} días."
+
+    time_block = ""
+    if time_start:
+        time_label = f"{time_start} — {time_end}" if time_end else time_start
+        time_block = f"""
+        <tr>
+          <td style="padding:10px 16px;border-bottom:1px solid #1e2a3a;color:#8fa3b8;font-size:13px;white-space:nowrap;width:1%">Hora</td>
+          <td style="padding:10px 16px;border-bottom:1px solid #1e2a3a;color:#e8edf2;font-size:14px;font-weight:600">{time_label}</td>
+        </tr>"""
+
+    notes_block = ""
+    if notes and notes.strip():
+        notes_block = f"""
+        <tr>
+          <td style="padding:10px 16px;color:#8fa3b8;font-size:13px;vertical-align:top;white-space:nowrap;width:1%">Notas</td>
+          <td style="padding:10px 16px;color:#e8edf2;font-size:14px;line-height:1.6">{notes.strip()}</td>
+        </tr>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Recordatorio de cita</title></head>
+<body style="margin:0;padding:0;background:#0d1117;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0d1117;padding:32px 16px">
+<tr><td align="center">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:560px">
+
+  <tr><td style="background:linear-gradient(135deg,#0f1f35 0%,#162840 100%);border-radius:12px 12px 0 0;padding:36px 40px 28px;text-align:center;border-bottom:2px solid #c9a84c">
+    <div style="display:inline-block;background:{urgency_color};border-radius:20px;padding:5px 16px;margin-bottom:16px">
+      <span style="color:#fff;font-size:12px;font-weight:700;letter-spacing:1px">⏰ {urgency}</span>
+    </div>
+    <h1 style="margin:0;color:#e8edf2;font-size:24px;font-weight:300">Recordatorio de cita</h1>
+    <p style="margin:8px 0 0;color:#8fa3b8;font-size:13px">{firm_name} · Servicios Legales</p>
+  </td></tr>
+
+  <tr><td style="background:#111827;padding:36px 40px">
+    <p style="margin:0 0 6px;color:#8fa3b8;font-size:13px;text-transform:uppercase;letter-spacing:1px">Estimado/a</p>
+    <h2 style="margin:0 0 20px;color:#e8edf2;font-size:20px;font-weight:400">{client_name}</h2>
+    <p style="margin:0 0 24px;color:#a8b8cc;font-size:15px;line-height:1.7">{intro}</p>
+
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#0d1117;border-radius:10px;overflow:hidden;border:1px solid #1e2a3a;margin-bottom:28px">
+      <tr>
+        <td style="padding:10px 16px;border-bottom:1px solid #1e2a3a;color:#8fa3b8;font-size:13px;white-space:nowrap;width:1%">Tipo</td>
+        <td style="padding:10px 16px;border-bottom:1px solid #1e2a3a;color:#c9a84c;font-size:14px;font-weight:600">{consult_type}</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 16px;border-bottom:1px solid #1e2a3a;color:#8fa3b8;font-size:13px;white-space:nowrap;width:1%">Fecha</td>
+        <td style="padding:10px 16px;border-bottom:1px solid #1e2a3a;color:#e8edf2;font-size:14px">{date_fmt}</td>
+      </tr>{time_block}{notes_block}
+    </table>
+
+    <p style="margin:0;color:#6b7f94;font-size:13px;line-height:1.6">
+      Si necesita cancelar o reprogramar, comuníquese con nosotros con la mayor anticipación posible.
+    </p>
+  </td></tr>
+
+  <tr><td style="background:#0a0f1a;border-radius:0 0 12px 12px;padding:20px 40px;text-align:center;border-top:1px solid #1e2a3a">
+    <p style="margin:0 0 4px;color:#c9a84c;font-size:13px;font-weight:600">{firm_name}</p>
+    <p style="margin:0;color:#4a5a6a;font-size:12px">Recordatorio automático · No responda este correo</p>
+  </td></tr>
+
+</table>
+</td></tr>
+</table>
+</body></html>"""
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def send_session_email(
@@ -293,6 +388,63 @@ def send_session_email(
         log.info("Email+ICS enviado a %s (session %s, mode=%s)", client_email, session_row["id"], mode)
     except Exception as e:
         log.warning("Error enviando email de sesión: %s", e)
+
+
+def send_reminder_email(
+    *,
+    session_row: Any,
+    client_email: str,
+    client_name: str,
+    firm_name: str,
+    resend_api_key: str,
+    resend_from: str,
+    hours_ahead: int = 24,
+) -> None:
+    """Send a reminder email with ICS attachment so client can add to calendar if they don't have it."""
+    try:
+        import resend as resend_lib
+        resend_lib.api_key = resend_api_key
+
+        organizer_email = _extract_email(resend_from)
+
+        html = _build_reminder_html(
+            client_name=client_name,
+            session_date=str(session_row["session_date"]),
+            start_time=session_row.get("start_time"),
+            end_time=session_row.get("end_time"),
+            consult_type=str(session_row["consult_type"]),
+            notes=session_row.get("notes"),
+            firm_name=firm_name,
+            hours_ahead=hours_ahead,
+        )
+
+        ics = _build_ics(
+            session_id=int(session_row["id"]),
+            session_date=str(session_row["session_date"]),
+            start_time=session_row.get("start_time"),
+            end_time=session_row.get("end_time"),
+            consult_type=str(session_row["consult_type"]),
+            notes=session_row.get("notes"),
+            organizer_email=organizer_email,
+            organizer_name=firm_name,
+            attendee_email=client_email,
+            attendee_name=client_name,
+            method="REQUEST",
+            sequence=0,
+        )
+
+        label = "mañana" if hours_ahead <= 24 else f"en {hours_ahead // 24} días"
+        params: resend_lib.Emails.SendParams = {
+            "from": resend_from,
+            "to": [client_email],
+            "subject": f"Recordatorio: su cita es {label} — {firm_name}",
+            "html": html,
+            "attachments": [{"filename": "cita.ics", "content": list(ics)}],
+        }
+        resend_lib.Emails.send(params)
+        log.info("Recordatorio enviado a %s (session %s, %dh)", client_email, session_row["id"], hours_ahead)
+    except Exception as e:
+        log.warning("Error enviando recordatorio: %s", e)
 
 
 def send_session_cancel_email(
