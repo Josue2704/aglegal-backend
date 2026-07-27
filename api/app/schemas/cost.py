@@ -8,7 +8,6 @@ from pydantic import BaseModel, ConfigDict
 class CostIn(BaseModel):
     client_id: int | None = None
     case_id: int | None = None
-    category_id: int | None = None
     detail: str = ""
     amount: float
     cost_date: str
@@ -25,9 +24,6 @@ class CostOut(BaseModel):
     client_name: str | None = None
     case_id: int | None = None
     case_title: str | None = None
-    category_id: int | None = None
-    category_name: str | None = None
-    product_name: str | None = None
     detail: str | None = None
     concept: str
     amount: float

@@ -17,7 +17,6 @@ from .security import hash_password, verify_password
 
 SESSION_STATUSES = ["Pendiente", "En proceso", "Finalizada"]
 ATTACH_ENTITY_TYPES = ["session", "income", "expense", "case", "client", "cost", "user"]
-CATEGORY_KINDS = ["income", "expense", "cost", "service"]
 CASE_STATUSES = ["Abierto", "En trámite", "En pausa", "Cerrado"]
 CASE_PRIORITIES = ["Baja", "Media", "Alta"]
 # Ciclo de facturación/cobro del expediente — independiente de `status` (progreso legal).
@@ -470,14 +469,12 @@ class Repository:
 
     # --- Incomes
     _INCOME_SELECT = (
-        "SELECT i.*, c.name AS client_name, cat.name AS category_name, "
-        "cs.title AS case_title, sp.name AS product_name, "
+        "SELECT i.*, c.name AS client_name, "
+        "cs.title AS case_title, "
         "ac.account_code, ac.nombre AS account_nombre, sv.service_code, sv.nombre AS service_nombre "
         "FROM incomes i "
         "LEFT JOIN clients c ON c.id=i.client_id "
-        "LEFT JOIN categories cat ON cat.id=i.category_id "
         "LEFT JOIN cases cs ON cs.id=i.case_id "
-        "LEFT JOIN service_products sp ON sp.id=cs.service_product_id "
         "LEFT JOIN plan_cuentas ac ON ac.id=i.account_id "
         "LEFT JOIN servicios sv ON sv.id=i.service_id "
     )
@@ -497,7 +494,6 @@ class Repository:
         income_date: str,
         created_at: str,
         client_id: int | None = None,
-        category_id: int | None = None,
         case_id: int | None = None,
         detail: str = "",
         concept: str | None = None,
@@ -518,9 +514,9 @@ class Repository:
         if iva_cents + reembolsable_cents > amount_cents:
             raise ValueError("IVA + reembolsable no puede superar el monto bruto")
         cur = self.conn.execute(
-            "INSERT INTO incomes(client_id, case_id, concept, amount_cents, income_date, created_at, category_id, detail, "
+            "INSERT INTO incomes(client_id, case_id, concept, amount_cents, income_date, created_at, detail, "
             "invoice_id, account_id, service_id, monto_iva_cents, monto_reembolsable_cents) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
@@ -528,7 +524,6 @@ class Repository:
                 amount_cents,
                 income_date,
                 created_at,
-                int(category_id) if category_id else None,
                 resolved_detail,
                 int(invoice_id) if invoice_id else None,
                 int(account_id) if account_id else None,
@@ -550,7 +545,6 @@ class Repository:
         amount_text: str,
         income_date: str,
         client_id: int | None = None,
-        category_id: int | None = None,
         case_id: int | None = None,
         detail: str = "",
         account_id: int | None = None,
@@ -569,14 +563,13 @@ class Repository:
         if iva_cents + reembolsable_cents > amount_cents:
             raise ValueError("IVA + reembolsable no puede superar el monto bruto")
         self.conn.execute(
-            "UPDATE incomes SET amount_cents=%s, income_date=%s, client_id=%s, category_id=%s, "
+            "UPDATE incomes SET amount_cents=%s, income_date=%s, client_id=%s, "
             "case_id=%s, detail=%s, concept=%s, account_id=%s, service_id=%s, monto_iva_cents=%s, monto_reembolsable_cents=%s "
             "WHERE id=%s",
             (
                 amount_cents,
                 income_date,
                 int(client_id) if client_id else None,
-                int(category_id) if category_id else None,
                 int(case_id) if case_id else None,
                 resolved_detail,
                 resolved_concept,
@@ -595,9 +588,8 @@ class Repository:
 
     # --- Expenses
     _EXPENSE_SELECT = (
-        "SELECT e.*, cat.name AS category_name, ac.account_code, ac.nombre AS account_nombre "
+        "SELECT e.*, ac.account_code, ac.nombre AS account_nombre "
         "FROM expenses e "
-        "LEFT JOIN categories cat ON cat.id=e.category_id "
         "LEFT JOIN plan_cuentas ac ON ac.id=e.account_id "
     )
 
@@ -612,7 +604,6 @@ class Repository:
     def create_expense(
         self,
         *,
-        category_id: int | None,
         detail: str,
         amount_text: str,
         expense_date: str,
@@ -630,16 +621,15 @@ class Repository:
         if iva_cents + reembolsable_cents > amount_cents:
             raise ValueError("IVA + reembolsable no puede superar el monto bruto")
         cur = self.conn.execute(
-            "INSERT INTO expenses(concept, amount_cents, expense_date, notes, created_at, category_id, detail, "
+            "INSERT INTO expenses(concept, amount_cents, expense_date, notes, created_at, detail, "
             "account_id, monto_iva_cents, monto_reembolsable_cents) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 concept,
                 amount_cents,
                 expense_date,
                 notes.strip(),
                 created_at,
-                int(category_id) if category_id else None,
                 (detail or "").strip(),
                 int(account_id) if account_id else None,
                 iva_cents,
@@ -656,7 +646,6 @@ class Repository:
         self,
         expense_id: int,
         *,
-        category_id: int | None,
         detail: str,
         amount_text: str,
         expense_date: str,
@@ -673,10 +662,9 @@ class Repository:
         if iva_cents + reembolsable_cents > amount_cents:
             raise ValueError("IVA + reembolsable no puede superar el monto bruto")
         self.conn.execute(
-            "UPDATE expenses SET category_id=%s, detail=%s, concept=%s, amount_cents=%s, expense_date=%s, notes=%s, "
+            "UPDATE expenses SET detail=%s, concept=%s, amount_cents=%s, expense_date=%s, notes=%s, "
             "account_id=%s, monto_iva_cents=%s, monto_reembolsable_cents=%s WHERE id=%s",
             (
-                int(category_id) if category_id else None,
                 (detail or "").strip(),
                 concept,
                 amount_cents,
@@ -697,13 +685,10 @@ class Repository:
     # --- Costs (direct costs tied to what is sold)
     _COST_SELECT = (
         "SELECT co.*, c.name AS client_name, cs.title AS case_title, "
-        "cat.name AS category_name, sp.name AS product_name, "
         "ac.account_code, ac.nombre AS account_nombre, sv.service_code, sv.nombre AS service_nombre "
         "FROM costs co "
         "LEFT JOIN clients c ON c.id=co.client_id "
         "LEFT JOIN cases cs ON cs.id=co.case_id "
-        "LEFT JOIN service_products sp ON sp.id=cs.service_product_id "
-        "LEFT JOIN categories cat ON cat.id=co.category_id "
         "LEFT JOIN plan_cuentas ac ON ac.id=co.account_id "
         "LEFT JOIN servicios sv ON sv.id=co.service_id "
     )
@@ -718,7 +703,6 @@ class Repository:
         *,
         client_id: int | None = None,
         case_id: int | None = None,
-        category_id: int | None = None,
         detail: str,
         amount_text: str,
         cost_date: str,
@@ -739,13 +723,12 @@ class Repository:
         if iva_cents + reembolsable_cents > amount_cents:
             raise ValueError("IVA + reembolsable no puede superar el monto bruto")
         cur = self.conn.execute(
-            "INSERT INTO costs(client_id, case_id, category_id, concept, detail, amount_cents, cost_date, notes, created_at, "
+            "INSERT INTO costs(client_id, case_id, concept, detail, amount_cents, cost_date, notes, created_at, "
             "account_id, service_id, monto_iva_cents, monto_reembolsable_cents) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
-                int(category_id) if category_id else None,
                 concept,
                 (detail or "").strip(),
                 amount_cents,
@@ -770,7 +753,6 @@ class Repository:
         *,
         client_id: int | None = None,
         case_id: int | None = None,
-        category_id: int | None = None,
         detail: str,
         amount_text: str,
         cost_date: str,
@@ -790,13 +772,12 @@ class Repository:
         if iva_cents + reembolsable_cents > amount_cents:
             raise ValueError("IVA + reembolsable no puede superar el monto bruto")
         self.conn.execute(
-            "UPDATE costs SET client_id=%s, case_id=%s, category_id=%s, concept=%s, detail=%s, "
+            "UPDATE costs SET client_id=%s, case_id=%s, concept=%s, detail=%s, "
             "amount_cents=%s, cost_date=%s, notes=%s, account_id=%s, service_id=%s, monto_iva_cents=%s, monto_reembolsable_cents=%s "
             "WHERE id=%s",
             (
                 int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
-                int(category_id) if category_id else None,
                 concept,
                 (detail or "").strip(),
                 amount_cents,
@@ -845,19 +826,22 @@ class Repository:
             raise ValueError("Empleado requerido")
         if not period.strip() or not payment_date.strip():
             raise ValueError("Periodo y fecha de pago requeridos")
-        category = self.conn.execute("SELECT id FROM categories WHERE kind='expense' AND name='Nóminas'").fetchone()
-        if not category:
-            category_id = self.create_category(kind="expense", name="Nóminas", created_at=created_at)
-        else:
-            category_id = int(category["id"])
+        # Plan de cuentas tiene una cuenta EGR-PER-XXX por persona (grupo 'Personal'); se busca la
+        # que coincide con el nombre del empleado. Si no hay una cuenta que calce, queda sin asignar
+        # — no es obligatorio y se puede corregir luego desde Flujo de Caja.
+        account = self.conn.execute(
+            "SELECT id FROM plan_cuentas WHERE tipo='Egreso' AND grupo='Personal' AND nombre ILIKE %s LIMIT 1",
+            (f"%{employee}%",),
+        ).fetchone()
+        account_id = int(account["id"]) if account else None
         detail = f"Nómina - {employee} - {period.strip()}"
         expense_id = self.create_expense(
-            category_id=category_id,
             detail=detail,
             amount_text=amount_text,
             expense_date=payment_date,
             notes=notes,
             created_at=created_at,
+            account_id=account_id,
         )
         amount_cents = _to_cents(amount_text)
         cur = self.conn.execute(
@@ -982,7 +966,7 @@ class Repository:
 
         w = (" WHERE " + " AND ".join(where)) if where else ""
         sql = (
-            "SELECT cs.*, cl.name AS client_name, sp.name AS product_name, "
+            "SELECT cs.*, cl.name AS client_name, "
             "sv.service_code, sv.nombre AS service_nombre, "
             "sc.id AS subcategory_id, sc.subcategory_code, sc.nombre AS subcategory_nombre, "
             "ct.id AS category_id, ct.category_code, ct.nombre AS category_nombre, "
@@ -993,7 +977,6 @@ class Repository:
             "COALESCE((SELECT SUM(monto_neto_operativo_cents) FROM costs WHERE case_id = cs.id), 0) AS costos_directos_reales_cents, "
             "(COALESCE(cs.fecha_cierre_real, CURRENT_DATE::text)::date - cs.opened_at::date) AS dias_duracion "
             "FROM cases cs JOIN clients cl ON cl.id=cs.client_id "
-            "LEFT JOIN service_products sp ON sp.id=cs.service_product_id "
             "LEFT JOIN servicios sv ON sv.id = cs.service_id "
             "LEFT JOIN subcategorias sc ON sc.id = sv.subcategory_id "
             "LEFT JOIN categorias ct ON ct.id = sc.category_id "
@@ -1062,7 +1045,6 @@ class Repository:
         opened_at: str,
         notes: str | None = None,
         created_at: str,
-        service_product_id: int | None = None,
         internal_ref: str | None = None,
         official_ref: str | None = None,
         opposing_party: str | None = None,
@@ -1094,10 +1076,10 @@ class Repository:
         costos_cents = self._to_cents_or_zero(costos_directos_estimados_text)
         cur = self.conn.execute(
             "INSERT INTO cases(client_id, service_area, title, status, priority, opened_at, closed_at, notes, created_at, "
-            "service_product_id, internal_ref, official_ref, opposing_party, court_entity, responsible_username, "
+            "internal_ref, official_ref, opposing_party, court_entity, responsible_username, "
             "service_id, honorarios_contratados_cents, costos_directos_estimados_cents, mes_cobro_esperado, "
             "estado_cobro, fecha_cierre_estimada, proxima_accion) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id),
                 service_area.strip(),
@@ -1108,7 +1090,6 @@ class Repository:
                 None,
                 (notes or "").strip(),
                 created_at,
-                int(service_product_id) if service_product_id else None,
                 (internal_ref or "").strip() or None,
                 (official_ref or "").strip() or None,
                 (opposing_party or "").strip() or None,
@@ -1137,7 +1118,6 @@ class Repository:
         opened_at: str,
         closed_at: str | None,
         notes: str | None = None,
-        service_product_id: int | None = None,
         internal_ref: str | None = None,
         official_ref: str | None = None,
         opposing_party: str | None = None,
@@ -1174,7 +1154,7 @@ class Repository:
         costos_cents = self._to_cents_or_zero(costos_directos_estimados_text)
         self.conn.execute(
             "UPDATE cases SET service_area=%s, title=%s, status=%s, priority=%s, opened_at=%s, closed_at=%s, notes=%s, "
-            "service_product_id=%s, internal_ref=%s, official_ref=%s, opposing_party=%s, court_entity=%s, responsible_username=%s, "
+            "internal_ref=%s, official_ref=%s, opposing_party=%s, court_entity=%s, responsible_username=%s, "
             "service_id=%s, honorarios_contratados_cents=%s, costos_directos_estimados_cents=%s, mes_cobro_esperado=%s, "
             "estado_cobro=%s, fecha_cierre_estimada=%s, fecha_cierre_real=%s, proxima_accion=%s "
             "WHERE id=%s",
@@ -1186,7 +1166,6 @@ class Repository:
                 opened_at,
                 (closed_at or "").strip() or None,
                 (notes or "").strip(),
-                int(service_product_id) if service_product_id else None,
                 (internal_ref or "").strip() or None,
                 (official_ref or "").strip() or None,
                 (opposing_party or "").strip() or None,
@@ -1303,119 +1282,6 @@ class Repository:
     def delete_case_task(self, task_id: int) -> None:
         self.conn.execute("DELETE FROM case_tasks WHERE id=%s", (int(task_id),))
         self.conn.commit()
-
-    # --- Categories
-    def list_categories(self, *, kind: str) -> list[Any]:
-        if kind not in CATEGORY_KINDS:
-            raise ValueError("Tipo de categoría inválido")
-        return list(
-            self.conn.execute(
-                "SELECT * FROM categories WHERE kind=%s ORDER BY name ASC", (kind,)
-            ).fetchall()
-        )
-
-    def create_category(self, *, kind: str, name: str, created_at: str) -> int:
-        if kind not in CATEGORY_KINDS:
-            raise ValueError("Tipo de categoría inválido")
-        n = (name or "").strip()
-        if not n:
-            raise ValueError("Nombre requerido")
-        cur = self.conn.execute(
-            "INSERT INTO categories(kind, name, created_at) VALUES(%s,%s,%s)",
-            (kind, n, created_at),
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
-
-    def update_category(self, category_id: int, *, name: str) -> None:
-        n = (name or "").strip()
-        if not n:
-            raise ValueError("Nombre requerido")
-        self.conn.execute("UPDATE categories SET name=%s WHERE id=%s", (n, int(category_id)))
-        self.conn.commit()
-
-    def delete_category(self, category_id: int) -> None:
-        # Leave existing records with category_id dangling; UI will show empty name.
-        self.conn.execute("DELETE FROM categories WHERE id=%s", (int(category_id),))
-        self.conn.commit()
-
-    def category_choices(self, *, kind: str) -> list[tuple[int, str]]:
-        return [(int(r["id"]), str(r["name"])) for r in self.list_categories(kind=kind)]
-
-
-    # --- Service catalog / products offered
-    def list_service_products(self, *, category_id: int | None = None, service_area: str | None = None, active_only: bool = False) -> list[Any]:
-        where = []
-        params: list[Any] = []
-        if category_id:
-            where.append("sp.category_id=%s")
-            params.append(int(category_id))
-        if service_area:
-            where.append("sp.service_area=%s")
-            params.append(service_area)
-        if active_only:
-            where.append("sp.active=1")
-        clause = " WHERE " + " AND ".join(where) if where else ""
-        return list(
-            self.conn.execute(
-                "SELECT sp.*, cat.name AS category_name "
-                "FROM service_products sp "
-                "JOIN categories cat ON cat.id=sp.category_id "
-                f"{clause} "
-                "ORDER BY cat.name ASC, sp.name ASC",
-                tuple(params),
-            ).fetchall()
-        )
-
-    def create_service_product(
-        self,
-        *,
-        category_id: int,
-        name: str,
-        description: str = "",
-        base_price_text: str = "",
-        active: bool = True,
-        service_area: str | None = None,
-        created_at: str,
-    ) -> int:
-        product_name = (name or "").strip()
-        if not product_name:
-            raise ValueError("Nombre del producto requerido")
-        base_price_cents = _to_cents(base_price_text) if (base_price_text or "").strip() else None
-        cur = self.conn.execute(
-            "INSERT INTO service_products(category_id, name, description, base_price_cents, active, service_area, created_at) VALUES(%s,%s,%s,%s,%s,%s,%s)",
-            (int(category_id), product_name, (description or "").strip(), base_price_cents, 1 if active else 0, service_area or None, created_at),
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
-
-    def update_service_product(
-        self,
-        product_id: int,
-        *,
-        category_id: int,
-        name: str,
-        description: str = "",
-        base_price_text: str = "",
-        active: bool = True,
-        service_area: str | None = None,
-    ) -> None:
-        product_name = (name or "").strip()
-        if not product_name:
-            raise ValueError("Nombre del producto requerido")
-        base_price_cents = _to_cents(base_price_text) if (base_price_text or "").strip() else None
-        self.conn.execute(
-            "UPDATE service_products SET category_id=%s, name=%s, description=%s, base_price_cents=%s, active=%s, service_area=%s WHERE id=%s",
-            (int(category_id), product_name, (description or "").strip(), base_price_cents, 1 if active else 0, service_area or None, int(product_id)),
-        )
-        self.conn.commit()
-
-    def delete_service_product(self, product_id: int) -> None:
-        self.conn.execute("DELETE FROM service_products WHERE id=%s", (int(product_id),))
-        self.conn.commit()
-
-    def service_product_choices(self, *, category_id: int | None = None, service_area: str | None = None) -> list[tuple[int, str]]:
-        return [(int(row["id"]), str(row["name"])) for row in self.list_service_products(category_id=category_id, service_area=service_area, active_only=True)]
 
     # --- Dashboard helpers
 
@@ -1577,15 +1443,12 @@ class Repository:
                 (f"{month_prefix}%",),
             ).fetchone()["s"]
         )
-        categories_total = int(self.conn.execute("SELECT COUNT(1) AS n FROM categories").fetchone()["n"])
-
         return {
             "clients_attended": clients_attended,
             "sessions_total": sessions_total,
             "sessions_finalized": sessions_finalized,
             "incomes_cents": incomes_cents,
             "expenses_cents": expenses_cents,
-            "categories_total": categories_total,
         }
 
     def cashflow_totals(self, *, start_date: str | None, end_date: str | None) -> tuple[int, int]:
@@ -1639,53 +1502,26 @@ class Repository:
         all_months = sorted(set(incomes.keys()) | set(expenses.keys()))
         return [(m, incomes.get(m, 0), expenses.get(m, 0)) for m in all_months]
 
-    def category_totals(self, *, kind: str, start_date: str | None, end_date: str | None) -> list[tuple[str, int]]:
-        if kind not in CATEGORY_KINDS:
-            raise ValueError("Tipo de categoría inválido")
-
-        if kind == "income":
-            where, params = self._date_where("i.income_date", start_date, end_date)
-            rows = self.conn.execute(
-                f"""
-                SELECT COALESCE(cat.name, '(Sin categoría)') AS name,
-                       COALESCE(SUM(i.amount_cents), 0) AS total
-                FROM incomes i
-                LEFT JOIN categories cat ON cat.id=i.category_id
-                {where}
-                GROUP BY name
-                ORDER BY total DESC
-                """,
-                params,
-            ).fetchall()
-        elif kind == "cost":
-            where, params = self._date_where("co.cost_date", start_date, end_date)
-            rows = self.conn.execute(
-                f"""
-                SELECT COALESCE(cat.name, '(Sin categoría)') AS name,
-                       COALESCE(SUM(co.amount_cents), 0) AS total
-                FROM costs co
-                LEFT JOIN categories cat ON cat.id=co.category_id
-                {where}
-                GROUP BY name
-                ORDER BY total DESC
-                """,
-                params,
-            ).fetchall()
-        else:
-            where, params = self._date_where("e.expense_date", start_date, end_date)
-            rows = self.conn.execute(
-                f"""
-                SELECT COALESCE(cat.name, '(Sin categoría)') AS name,
-                       COALESCE(SUM(e.amount_cents), 0) AS total
-                FROM expenses e
-                LEFT JOIN categories cat ON cat.id=e.category_id
-                {where}
-                GROUP BY name
-                ORDER BY total DESC
-                """,
-                params,
-            ).fetchall()
-
+    def account_totals(self, *, movimiento: str, start_date: str | None, end_date: str | None) -> list[tuple[str, int]]:
+        """Totales agrupados por cuenta contable (plan_cuentas) — reemplaza las categorías planas
+        heredadas del sistema anterior a la Fase 1, que ya no se alimentan."""
+        table_by_movimiento = {"income": ("incomes", "i", "income_date"), "expense": ("expenses", "e", "expense_date"), "cost": ("costs", "co", "cost_date")}
+        if movimiento not in table_by_movimiento:
+            raise ValueError("Tipo de movimiento inválido")
+        table, alias, date_col = table_by_movimiento[movimiento]
+        where, params = self._date_where(f"{alias}.{date_col}", start_date, end_date)
+        rows = self.conn.execute(
+            f"""
+            SELECT COALESCE(pc.nombre, '(Sin cuenta)') AS name,
+                   COALESCE(SUM({alias}.amount_cents), 0) AS total
+            FROM {table} {alias}
+            LEFT JOIN plan_cuentas pc ON pc.id={alias}.account_id
+            {where}
+            GROUP BY name
+            ORDER BY total DESC
+            """,
+            params,
+        ).fetchall()
         return [(str(r["name"]), int(r["total"] or 0)) for r in rows]
 
     def top_clients_by_revenue(
@@ -1715,13 +1551,13 @@ class Repository:
         service_filter = " AND i.case_id IS NOT NULL" if where else " WHERE i.case_id IS NOT NULL"
         rows = self.conn.execute(
             f"""
-            SELECT COALESCE(sp.name, cs.service_area, '(Sin servicio)') AS name,
+            SELECT COALESCE(sv.nombre, cs.service_area, '(Sin servicio)') AS name,
                    COALESCE(SUM(i.amount_cents), 0) AS total
             FROM incomes i
             LEFT JOIN cases cs ON cs.id=i.case_id
-            LEFT JOIN service_products sp ON sp.id=cs.service_product_id
+            LEFT JOIN servicios sv ON sv.id=cs.service_id
             {where}{service_filter}
-            GROUP BY COALESCE(sp.name, cs.service_area, '(Sin servicio)')
+            GROUP BY COALESCE(sv.nombre, cs.service_area, '(Sin servicio)')
             HAVING COALESCE(SUM(i.amount_cents), 0) > 0
             ORDER BY total DESC
             LIMIT %s
@@ -1730,15 +1566,15 @@ class Repository:
         ).fetchall()
         return [(str(row["name"]), int(row["total"] or 0)) for row in rows]
 
-    def top_expenses_by_category(
+    def top_expenses_by_account(
         self, *, start_date: str | None = None, end_date: str | None = None, limit: int = 8
     ) -> list[tuple[str, int]]:
-        return self.category_totals(kind="expense", start_date=start_date, end_date=end_date)[: int(limit)]
+        return self.account_totals(movimiento="expense", start_date=start_date, end_date=end_date)[: int(limit)]
 
-    def top_costs_by_category(
+    def top_costs_by_account(
         self, *, start_date: str | None = None, end_date: str | None = None, limit: int = 8
     ) -> list[tuple[str, int]]:
-        return self.category_totals(kind="cost", start_date=start_date, end_date=end_date)[: int(limit)]
+        return self.account_totals(movimiento="cost", start_date=start_date, end_date=end_date)[: int(limit)]
 
     def top_services_by_gross_profit(
         self, *, start_date: str | None = None, end_date: str | None = None, limit: int = 8
@@ -1747,25 +1583,25 @@ class Repository:
         cost_where, cost_params = self._date_where("co.cost_date", start_date, end_date)
         income_rows = self.conn.execute(
             f"""
-            SELECT COALESCE(sp.name, cs.service_area, '(Sin servicio)') AS name,
+            SELECT COALESCE(sv.nombre, cs.service_area, '(Sin servicio)') AS name,
                    COALESCE(SUM(i.amount_cents), 0) AS total
             FROM incomes i
             LEFT JOIN cases cs ON cs.id=i.case_id
-            LEFT JOIN service_products sp ON sp.id=cs.service_product_id
+            LEFT JOIN servicios sv ON sv.id=cs.service_id
             {income_where}{' AND i.case_id IS NOT NULL' if income_where else ' WHERE i.case_id IS NOT NULL'}
-            GROUP BY COALESCE(sp.name, cs.service_area, '(Sin servicio)')
+            GROUP BY COALESCE(sv.nombre, cs.service_area, '(Sin servicio)')
             """,
             income_params,
         ).fetchall()
         cost_rows = self.conn.execute(
             f"""
-            SELECT COALESCE(sp.name, cs.service_area, '(Sin servicio)') AS name,
+            SELECT COALESCE(sv.nombre, cs.service_area, '(Sin servicio)') AS name,
                    COALESCE(SUM(co.amount_cents), 0) AS total
             FROM costs co
             LEFT JOIN cases cs ON cs.id=co.case_id
-            LEFT JOIN service_products sp ON sp.id=cs.service_product_id
+            LEFT JOIN servicios sv ON sv.id=cs.service_id
             {cost_where}{' AND co.case_id IS NOT NULL' if cost_where else ' WHERE co.case_id IS NOT NULL'}
-            GROUP BY COALESCE(sp.name, cs.service_area, '(Sin servicio)')
+            GROUP BY COALESCE(sv.nombre, cs.service_area, '(Sin servicio)')
             """,
             cost_params,
         ).fetchall()

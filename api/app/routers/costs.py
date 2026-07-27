@@ -36,7 +36,6 @@ def create_cost(body: CostIn, current_user: LawyerRequired, repo: RepoDep) -> Co
     cost_id = repo.create_cost(
         client_id=body.client_id,
         case_id=body.case_id,
-        category_id=body.category_id,
         detail=body.detail,
         amount_text=str(body.amount),
         cost_date=body.cost_date,
@@ -59,7 +58,6 @@ def update_cost(cost_id: int, body: CostIn, current_user: LawyerRequired, repo: 
         cost_id,
         client_id=body.client_id,
         case_id=body.case_id,
-        category_id=body.category_id,
         detail=body.detail,
         amount_text=str(body.amount),
         cost_date=body.cost_date,

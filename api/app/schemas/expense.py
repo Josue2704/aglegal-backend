@@ -6,7 +6,6 @@ from pydantic import BaseModel, ConfigDict
 
 
 class ExpenseIn(BaseModel):
-    category_id: int | None = None
     detail: str
     amount: float
     expense_date: str
@@ -18,8 +17,6 @@ class ExpenseIn(BaseModel):
 
 class ExpenseOut(BaseModel):
     id: int
-    category_id: int | None = None
-    category_name: str | None = None
     detail: str | None = None
     concept: str
     amount: float

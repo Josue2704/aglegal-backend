@@ -8,7 +8,6 @@ class MonthlyMetrics(BaseModel):
     incomes: float
     expenses: float
     balance: float
-    categories_total: int
 
 
 class CashflowTotals(BaseModel):

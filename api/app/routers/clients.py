@@ -119,7 +119,7 @@ def client_statement(client_id: int, current_user: CurrentUser, repo: RepoDep) -
 
     # Incomes linked to client
     incomes = repo.conn.execute(
-        """SELECT id, amount_cents, detail AS description, income_date, category_id
+        """SELECT id, amount_cents, detail AS description, income_date
            FROM incomes WHERE client_id=%s ORDER BY income_date DESC""",
         (client_id,),
     ).fetchall()

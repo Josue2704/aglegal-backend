@@ -23,7 +23,6 @@ def list_expenses(
 @router.post("", response_model=ExpenseOut, status_code=201)
 def create_expense(body: ExpenseIn, current_user: LawyerRequired, repo: RepoDep) -> ExpenseOut:
     expense_id = repo.create_expense(
-        category_id=body.category_id,
         detail=body.detail,
         amount_text=str(body.amount),
         expense_date=body.expense_date,
@@ -43,7 +42,6 @@ def update_expense(expense_id: int, body: ExpenseIn, current_user: LawyerRequire
     from fastapi import HTTPException
     repo.update_expense(
         expense_id,
-        category_id=body.category_id,
         detail=body.detail,
         amount_text=str(body.amount),
         expense_date=body.expense_date,

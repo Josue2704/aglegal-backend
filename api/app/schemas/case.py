@@ -13,7 +13,6 @@ class CaseIn(BaseModel):
     priority: str
     opened_at: str
     notes: str = ""
-    service_product_id: int | None = None
     internal_ref: str = ""
     official_ref: str = ""
     opposing_party: str = ""
@@ -36,7 +35,6 @@ class CaseUpdate(BaseModel):
     opened_at: str
     closed_at: str | None = None
     notes: str = ""
-    service_product_id: int | None = None
     internal_ref: str = ""
     official_ref: str = ""
     opposing_party: str = ""
@@ -63,8 +61,6 @@ class CaseOut(BaseModel):
     opened_at: str
     closed_at: str | None = None
     notes: str | None = None
-    service_product_id: int | None = None
-    product_name: str | None = None
     internal_ref: str | None = None
     official_ref: str | None = None
     opposing_party: str | None = None

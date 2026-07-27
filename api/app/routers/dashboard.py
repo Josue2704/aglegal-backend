@@ -52,7 +52,6 @@ def monthly_kpis(current_user: CurrentUser, repo: RepoDep) -> MonthlyMetrics:
         incomes=incomes,
         expenses=expenses,
         balance=incomes - expenses,
-        categories_total=m["categories_total"],
     )
 
 
@@ -106,7 +105,7 @@ def top_expenses(
     end_date: str | None = None,
     limit: int = 8,
 ) -> list[TopItem]:
-    return [TopItem(name=n, amount=a / 100) for n, a in repo.top_expenses_by_category(start_date=start_date, end_date=end_date, limit=limit)]
+    return [TopItem(name=n, amount=a / 100) for n, a in repo.top_expenses_by_account(start_date=start_date, end_date=end_date, limit=limit)]
 
 
 @router.get("/gross-profit/services", response_model=list[GrossProfitItem])

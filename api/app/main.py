@@ -13,7 +13,6 @@ from .routers import (
     attachments,
     catalogo,
     cases,
-    categories,
     clients,
     comisiones,
     costs,
@@ -67,7 +66,6 @@ app.include_router(sessions.router)
 app.include_router(incomes.router)
 app.include_router(expenses.router)
 app.include_router(costs.router)
-app.include_router(categories.router)
 app.include_router(catalogo.router)
 app.include_router(finanzas.router)
 app.include_router(pipeline.router)
