@@ -3546,7 +3546,7 @@ class Repository:
         codigo = (codigo_propuesto or "").strip().upper()
         if not codigo:
             raise ValueError("Código propuesto requerido")
-        if tipo_registro in ("Subcategoria", "Servicio") and not (categoria_padre or "").strip():
+        if tipo_registro in ("Subcategoria", "Servicio", "Familia") and not (categoria_padre or "").strip():
             raise ValueError("Categoría padre requerida para este tipo de registro")
         if tipo_registro == "Servicio" and not (subcategoria_padre or "").strip():
             raise ValueError("Subcategoría padre requerida para un servicio")
@@ -3589,6 +3589,67 @@ class Repository:
         )
         self.conn.commit()
 
+    def _resolver_categoria_padre(self, codigo: str | None) -> Any:
+        code = (codigo or "").strip()
+        if not code:
+            raise ValueError("Falta la categoría padre de la solicitud")
+        row = self.conn.execute("SELECT * FROM categorias WHERE category_code=%s", (code,)).fetchone()
+        if not row:
+            raise ValueError(f"La categoría padre '{code}' no existe en el Catálogo Maestro — créala primero o corrige el código")
+        return row
+
+    def _resolver_subcategoria_padre(self, category_id: int, codigo: str | None) -> Any:
+        code = (codigo or "").strip()
+        if not code:
+            raise ValueError("Falta la subcategoría padre de la solicitud")
+        row = self.conn.execute(
+            "SELECT * FROM subcategorias WHERE category_id=%s AND subcategory_code=%s", (int(category_id), code)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"La subcategoría padre '{code}' no existe dentro de esa categoría — créala primero o corrige el código")
+        return row
+
+    def _activar_solicitud_en_catalogo(self, solicitud: Any, *, created_at: str) -> tuple[str, str]:
+        """Crea el registro real en el Catálogo Maestro a partir de una solicitud aprobada.
+        Devuelve (nota_de_trazabilidad, codigo_definitivo_real) — para Servicio/Familia el código
+        real lo asigna el sistema y puede diferir del código propuesto por quien solicitó."""
+        tipo = solicitud["tipo_registro"]
+        nombre = solicitud["nombre_propuesto"]
+
+        if tipo == "Categoria":
+            cat_id = self.create_categoria(category_code=solicitud["codigo_definitivo"], nombre=nombre, created_at=created_at)
+            return f"Activada en Catálogo Maestro — Categoría #{cat_id} ({solicitud['codigo_definitivo']})", solicitud["codigo_definitivo"]
+
+        if tipo == "Subcategoria":
+            categoria = self._resolver_categoria_padre(solicitud["categoria_padre"])
+            sub_id = self.create_subcategoria(
+                category_id=int(categoria["id"]), subcategory_code=solicitud["codigo_definitivo"], nombre=nombre, created_at=created_at,
+            )
+            return f"Activada en Catálogo Maestro — Subcategoría #{sub_id} ({solicitud['codigo_definitivo']})", solicitud["codigo_definitivo"]
+
+        if tipo == "Servicio":
+            categoria = self._resolver_categoria_padre(solicitud["categoria_padre"])
+            subcategoria = self._resolver_subcategoria_padre(int(categoria["id"]), solicitud["subcategoria_padre"])
+            serv_id = self.create_servicio(
+                subcategory_id=int(subcategoria["id"]), nombre=nombre, etiquetas=solicitud["etiquetas"] or "",
+                estado="En diseño", created_at=created_at,
+            )
+            servicio = self.conn.execute("SELECT service_code FROM servicios WHERE id=%s", (serv_id,)).fetchone()
+            code_real = str(servicio["service_code"])
+            return (
+                f"Activado en Catálogo Maestro — Servicio #{serv_id} ({code_real}), en estado 'En diseño'. "
+                "Completa tarifa, unidad de cobro y responsable en Catálogo Maestro antes de pasarlo a Activo."
+            ), code_real
+
+        if tipo == "Familia":
+            categoria = self._resolver_categoria_padre(solicitud["categoria_padre"])
+            fam_id = self.create_familia(category_id=int(categoria["id"]), nombre=nombre, created_at=created_at)
+            familia = self.conn.execute("SELECT family_code FROM familias WHERE id=%s", (fam_id,)).fetchone()
+            code_real = str(familia["family_code"])
+            return f"Activada en Catálogo Maestro — Familia #{fam_id} ({code_real})", code_real
+
+        raise ValueError(f"Tipo de registro no soportado para activación automática: {tipo}")
+
     def transition_solicitud(
         self, solicitud_id: int, *, estado: str, resultado_revision_duplicidad: str | None = None,
         aprobador: str | None = None, observaciones: str | None = None, created_at: str,
@@ -3597,17 +3658,19 @@ class Repository:
         if estado not in _SOLICITUD_TRANSICIONES.get(current["estado"], set()):
             raise ValueError(f"No se puede pasar de '{current['estado']}' a '{estado}'")
 
-        fields: dict[str, Any] = {"estado": estado, "updated_at": created_at}
+        fields: dict[str, Any] = {"updated_at": created_at}
         if resultado_revision_duplicidad is not None:
             fields["resultado_revision_duplicidad"] = resultado_revision_duplicidad.strip()
-        if observaciones is not None:
-            fields["observaciones"] = observaciones.strip()
+        obs = observaciones.strip() if observaciones is not None else None
 
         if estado == "Aprobado":
             if not (aprobador or "").strip():
                 raise ValueError("Se requiere indicar el aprobador para aprobar una solicitud")
             codigo_definitivo = current["codigo_propuesto"]
-            if self.conn.execute(
+            # El código propuesto solo se vuelve el código real para Categoría/Subcategoría — para
+            # Servicio/Familia el sistema genera su propio código, así que no tiene sentido validar
+            # unicidad de un texto que ni siquiera va a usarse como código definitivo.
+            if current["tipo_registro"] in ("Categoria", "Subcategoria") and self.conn.execute(
                 "SELECT 1 FROM solicitudes_catalogo WHERE codigo_definitivo = %s AND id <> %s",
                 (codigo_definitivo, int(solicitud_id)),
             ).fetchone():
@@ -3615,6 +3678,20 @@ class Repository:
             fields["codigo_definitivo"] = codigo_definitivo
             fields["aprobador"] = aprobador.strip()
             fields["fecha_aprobacion"] = created_at[:10]
+
+            # Activación automática: al aprobar, se crea de una vez el registro real en el
+            # Catálogo Maestro y la solicitud pasa directo a Activo — sin paso manual aparte.
+            pseudo = dict(current)
+            pseudo["codigo_definitivo"] = codigo_definitivo
+            nota, codigo_real = self._activar_solicitud_en_catalogo(pseudo, created_at=created_at)
+            fields["estado"] = "Activo"
+            fields["codigo_definitivo"] = codigo_real
+            obs = f"{obs}\n{nota}" if obs else nota
+        else:
+            fields["estado"] = estado
+
+        if obs is not None:
+            fields["observaciones"] = obs
 
         set_clause = ", ".join(f"{k}=%s" for k in fields)
         self.conn.execute(
