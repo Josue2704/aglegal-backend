@@ -943,9 +943,9 @@ class Repository:
         where = []
         params: list[Any] = []
         if search:
-            where.append("(cs.title ILIKE %s OR cs.service_area ILIKE %s OR cl.name ILIKE %s OR sp.name ILIKE %s OR sv.service_code ILIKE %s)")
+            where.append("(cs.title ILIKE %s OR cl.name ILIKE %s OR sv.nombre ILIKE %s OR sv.service_code ILIKE %s)")
             like = f"%{search.strip()}%"
-            params.extend([like, like, like, like, like])
+            params.extend([like, like, like, like])
         if status and status != "Todos":
             where.append("cs.status = %s")
             params.append(status)
@@ -1039,7 +1039,6 @@ class Repository:
         self,
         *,
         client_id: int,
-        service_area: str,
         title: str,
         status: str,
         priority: str,
@@ -1076,14 +1075,13 @@ class Repository:
         honorarios_cents = self._to_cents_or_zero(honorarios_contratados_text)
         costos_cents = self._to_cents_or_zero(costos_directos_estimados_text)
         cur = self.conn.execute(
-            "INSERT INTO cases(client_id, service_area, title, status, priority, opened_at, closed_at, notes, created_at, "
+            "INSERT INTO cases(client_id, title, status, priority, opened_at, closed_at, notes, created_at, "
             "internal_ref, official_ref, opposing_party, court_entity, responsible_username, "
             "service_id, honorarios_contratados_cents, costos_directos_estimados_cents, mes_cobro_esperado, "
             "estado_cobro, fecha_cierre_estimada, proxima_accion) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id),
-                service_area.strip(),
                 title.strip(),
                 status,
                 priority,
@@ -1112,7 +1110,6 @@ class Repository:
         self,
         case_id: int,
         *,
-        service_area: str,
         title: str,
         status: str,
         priority: str,
@@ -1154,13 +1151,12 @@ class Repository:
         honorarios_cents = self._to_cents_or_zero(honorarios_contratados_text)
         costos_cents = self._to_cents_or_zero(costos_directos_estimados_text)
         self.conn.execute(
-            "UPDATE cases SET service_area=%s, title=%s, status=%s, priority=%s, opened_at=%s, closed_at=%s, notes=%s, "
+            "UPDATE cases SET title=%s, status=%s, priority=%s, opened_at=%s, closed_at=%s, notes=%s, "
             "internal_ref=%s, official_ref=%s, opposing_party=%s, court_entity=%s, responsible_username=%s, "
             "service_id=%s, honorarios_contratados_cents=%s, costos_directos_estimados_cents=%s, mes_cobro_esperado=%s, "
             "estado_cobro=%s, fecha_cierre_estimada=%s, fecha_cierre_real=%s, proxima_accion=%s "
             "WHERE id=%s",
             (
-                service_area.strip(),
                 title.strip(),
                 status,
                 priority,
@@ -1552,13 +1548,13 @@ class Repository:
         service_filter = " AND i.case_id IS NOT NULL" if where else " WHERE i.case_id IS NOT NULL"
         rows = self.conn.execute(
             f"""
-            SELECT COALESCE(sv.nombre, cs.service_area, '(Sin servicio)') AS name,
+            SELECT COALESCE(sv.nombre, '(Sin servicio)') AS name,
                    COALESCE(SUM(i.amount_cents), 0) AS total
             FROM incomes i
             LEFT JOIN cases cs ON cs.id=i.case_id
             LEFT JOIN servicios sv ON sv.id=cs.service_id
             {where}{service_filter}
-            GROUP BY COALESCE(sv.nombre, cs.service_area, '(Sin servicio)')
+            GROUP BY COALESCE(sv.nombre, '(Sin servicio)')
             HAVING COALESCE(SUM(i.amount_cents), 0) > 0
             ORDER BY total DESC
             LIMIT %s
@@ -1584,25 +1580,25 @@ class Repository:
         cost_where, cost_params = self._date_where("co.cost_date", start_date, end_date)
         income_rows = self.conn.execute(
             f"""
-            SELECT COALESCE(sv.nombre, cs.service_area, '(Sin servicio)') AS name,
+            SELECT COALESCE(sv.nombre, '(Sin servicio)') AS name,
                    COALESCE(SUM(i.amount_cents), 0) AS total
             FROM incomes i
             LEFT JOIN cases cs ON cs.id=i.case_id
             LEFT JOIN servicios sv ON sv.id=cs.service_id
             {income_where}{' AND i.case_id IS NOT NULL' if income_where else ' WHERE i.case_id IS NOT NULL'}
-            GROUP BY COALESCE(sv.nombre, cs.service_area, '(Sin servicio)')
+            GROUP BY COALESCE(sv.nombre, '(Sin servicio)')
             """,
             income_params,
         ).fetchall()
         cost_rows = self.conn.execute(
             f"""
-            SELECT COALESCE(sv.nombre, cs.service_area, '(Sin servicio)') AS name,
+            SELECT COALESCE(sv.nombre, '(Sin servicio)') AS name,
                    COALESCE(SUM(co.amount_cents), 0) AS total
             FROM costs co
             LEFT JOIN cases cs ON cs.id=co.case_id
             LEFT JOIN servicios sv ON sv.id=cs.service_id
             {cost_where}{' AND co.case_id IS NOT NULL' if cost_where else ' WHERE co.case_id IS NOT NULL'}
-            GROUP BY COALESCE(sv.nombre, cs.service_area, '(Sin servicio)')
+            GROUP BY COALESCE(sv.nombre, '(Sin servicio)')
             """,
             cost_params,
         ).fetchall()
@@ -3042,7 +3038,6 @@ class Repository:
 
         case_id = self.create_case(
             client_id=int(current["client_id"]),
-            service_area=servicio["category_nombre"],
             title=f"{servicio['nombre']} — {client_name}",
             status="Abierto",
             priority="Media",

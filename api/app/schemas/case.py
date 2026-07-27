@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict
 
 class CaseIn(BaseModel):
     client_id: int
-    service_area: str
     title: str
     status: str
     priority: str
@@ -28,7 +27,6 @@ class CaseIn(BaseModel):
 
 
 class CaseUpdate(BaseModel):
-    service_area: str
     title: str
     status: str
     priority: str
@@ -54,7 +52,6 @@ class CaseOut(BaseModel):
     id: int
     client_id: int
     client_name: str | None = None
-    service_area: str
     title: str
     status: str
     priority: str

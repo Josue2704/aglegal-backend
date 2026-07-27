@@ -50,7 +50,6 @@ def create_case(body: CaseIn, current_user: CurrentUser, repo: RepoDep) -> CaseO
         raise HTTPException(403, "Sin permiso: expedientes.crear")
     case_id = repo.create_case(
         client_id=body.client_id,
-        service_area=body.service_area,
         title=body.title,
         status=body.status,
         priority=body.priority,
@@ -83,7 +82,6 @@ def update_case(case_id: int, body: CaseUpdate, current_user: CurrentUser, repo:
         raise HTTPException(403, "Sin permiso: expedientes.editar")
     repo.update_case(
         case_id,
-        service_area=body.service_area,
         title=body.title,
         status=body.status,
         priority=body.priority,

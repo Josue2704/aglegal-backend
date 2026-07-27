@@ -884,6 +884,16 @@ def _migrate(conn: PgConnection) -> None:
         _seed_rbac(conn)
         _set_schema_version(conn, 29)
 
+    # v30: cases.service_area (texto libre, lista fija de 8 valores, previa al Catálogo
+    # Maestro) se retira — quedaba desincronizado del service_id real elegido, sin nada
+    # que los mantuviera de acuerdo. La categoría del servicio del catálogo (ya
+    # disponible vía service_id → categoria) pasa a ser la única fuente de "área". Se
+    # quita el NOT NULL para no romper los INSERT que ya no la envían — la columna y
+    # los datos históricos se quedan intactos, solo deja de ser obligatoria y de usarse.
+    if v < 30:
+        conn.execute("ALTER TABLE cases ALTER COLUMN service_area DROP NOT NULL")
+        _set_schema_version(conn, 30)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 
