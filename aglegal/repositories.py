@@ -297,6 +297,18 @@ class Repository:
         return sorted(items, key=lambda item: item["date"] or "", reverse=True)
 
     def delete_client(self, client_id: int) -> None:
+        # oportunidades.client_id is ON DELETE SET NULL, but the table also requires
+        # client_id OR prospecto_nombre to be set (chk_oportunidad_cliente_o_prospecto) —
+        # an oportunidad tied directly to a real client (no prospecto_nombre, the normal
+        # case) violates that the instant the cascade nulls client_id, crashing the
+        # delete with an unhandled CheckViolation. Backfill prospecto_nombre from the
+        # client's own name first so the opportunity's history survives deletion instead.
+        client = self.conn.execute("SELECT name FROM clients WHERE id=%s", (int(client_id),)).fetchone()
+        if client:
+            self.conn.execute(
+                "UPDATE oportunidades SET prospecto_nombre=%s WHERE client_id=%s AND prospecto_nombre IS NULL",
+                (client["name"], int(client_id)),
+            )
         self.conn.execute("DELETE FROM clients WHERE id = %s", (int(client_id),))
         self.conn.commit()
 
