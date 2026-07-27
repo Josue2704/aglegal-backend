@@ -861,6 +861,29 @@ def _migrate(conn: PgConnection) -> None:
         _seed_rbac(conn)
         _set_schema_version(conn, 28)
 
+    # v29: las solicitudes de catálogo ganan referencia a un registro existente
+    # (entity_id, igual de polimórfico que historial_catalogo.entity_id — sin FK porque
+    # apunta a 4 tablas distintas según tipo_registro) más los campos propuestos que le
+    # faltaban a "Cambio" para un Servicio (unidad de cobro, responsable, tarifa, costo,
+    # horas, estado) — sin esto, aprobar un Cambio solo podía renombrar/retaguetear.
+    # Motivo: se retira la creación/edición directa del Catálogo Maestro (Fase 10.2) —
+    # toda alta, cambio o baja pasa ahora por una solicitud, así que el Cambio tiene que
+    # poder editar cualquier campo que antes se editaba directo ahí.
+    if v < 29:
+        conn.executescript("""
+            ALTER TABLE solicitudes_catalogo ADD COLUMN IF NOT EXISTS entity_id INTEGER;
+            ALTER TABLE solicitudes_catalogo ADD COLUMN IF NOT EXISTS unidad_cobro_propuesta TEXT;
+            ALTER TABLE solicitudes_catalogo ADD COLUMN IF NOT EXISTS responsable_sugerido_propuesto TEXT;
+            ALTER TABLE solicitudes_catalogo ADD COLUMN IF NOT EXISTS tarifa_referencia_propuesta_cents INTEGER;
+            ALTER TABLE solicitudes_catalogo ADD COLUMN IF NOT EXISTS costo_referencia_propuesta_cents INTEGER;
+            ALTER TABLE solicitudes_catalogo ADD COLUMN IF NOT EXISTS horas_estandar_propuesta NUMERIC;
+            ALTER TABLE solicitudes_catalogo ADD COLUMN IF NOT EXISTS estado_propuesto TEXT;
+            CREATE INDEX IF NOT EXISTS idx_solicitudes_entity ON solicitudes_catalogo(tipo_registro, entity_id);
+        """)
+        conn.execute("DELETE FROM permissions WHERE module = 'catalogo' AND action IN ('crear', 'editar')")
+        _seed_rbac(conn)
+        _set_schema_version(conn, 29)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 
@@ -896,8 +919,6 @@ ALL_PERMISSIONS: list[tuple[str, str, str]] = [
     ("nominas",       "editar",   "Editar nóminas"),
     ("nominas",       "eliminar", "Eliminar nóminas"),
     ("catalogo",      "ver",      "Ver catálogo maestro"),
-    ("catalogo",      "crear",    "Crear categorías, subcategorías, servicios y familias"),
-    ("catalogo",      "editar",   "Editar categorías, subcategorías, servicios y familias"),
     ("finanzas",      "ver",      "Ver plan de cuentas, personal, gastos fijos y presupuesto"),
     ("finanzas",      "crear",    "Crear cuentas, personal, gastos fijos y metas de presupuesto"),
     ("finanzas",      "editar",   "Editar cuentas, personal, gastos fijos y metas de presupuesto"),
@@ -932,7 +953,7 @@ _ABOGADO_PERMS = {
     "flujo_caja.ver", "flujo_caja.crear", "flujo_caja.editar",
     "facturas.ver", "facturas.crear", "facturas.editar",
     "nominas.ver", "nominas.crear", "nominas.editar",
-    "catalogo.ver", "catalogo.crear", "catalogo.editar",
+    "catalogo.ver",
     "finanzas.ver", "finanzas.crear", "finanzas.editar",
     "pipeline.ver", "pipeline.crear", "pipeline.editar",
     "comisiones.ver", "comisiones.editar",

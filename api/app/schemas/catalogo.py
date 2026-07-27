@@ -2,20 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 
 # --- Categorías
-
-class CategoriaIn(BaseModel):
-    category_code: str = Field(..., min_length=2, max_length=4)
-    nombre: str
-
-
-class CategoriaUpdate(BaseModel):
-    nombre: str
-    estado: str
-
 
 class CategoriaOut(BaseModel):
     id: int
@@ -33,17 +23,6 @@ class CategoriaOut(BaseModel):
 
 
 # --- Subcategorías
-
-class SubcategoriaIn(BaseModel):
-    category_id: int
-    subcategory_code: str = Field(..., min_length=2, max_length=4)
-    nombre: str
-
-
-class SubcategoriaUpdate(BaseModel):
-    nombre: str
-    estado: str
-
 
 class SubcategoriaOut(BaseModel):
     id: int
@@ -65,15 +44,6 @@ class SubcategoriaOut(BaseModel):
 
 # --- Familias
 
-class FamiliaIn(BaseModel):
-    category_id: int
-    nombre: str
-
-
-class FamiliaUpdate(BaseModel):
-    nombre: str
-
-
 class FamiliaOut(BaseModel):
     id: int
     family_code: str
@@ -92,29 +62,6 @@ class FamiliaOut(BaseModel):
 
 
 # --- Servicios
-
-class ServicioIn(BaseModel):
-    subcategory_id: int
-    nombre: str
-    etiquetas: str = ""
-    unidad_cobro: str = "Por definir"
-    responsable_sugerido: str = "Por definir"
-    tarifa_referencia: float | None = None
-    costo_referencia: float | None = None
-    horas_estandar: float = 0
-    estado: str = "Activo"
-
-
-class ServicioUpdate(BaseModel):
-    nombre: str
-    etiquetas: str = ""
-    unidad_cobro: str = "Por definir"
-    responsable_sugerido: str = "Por definir"
-    tarifa_referencia: float | None = None
-    costo_referencia: float | None = None
-    horas_estandar: float = 0
-    estado: str = "Activo"
-
 
 class ServicioOut(BaseModel):
     id: int

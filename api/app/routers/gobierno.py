@@ -30,7 +30,11 @@ def create_solicitud(body: SolicitudIn, current_user: CurrentUser, repo: RepoDep
             tipo_solicitud=body.tipo_solicitud, tipo_registro=body.tipo_registro, nombre_propuesto=body.nombre_propuesto,
             categoria_padre=body.categoria_padre, subcategoria_padre=body.subcategoria_padre, codigo_propuesto=body.codigo_propuesto,
             descripcion=body.descripcion, motivo=body.motivo, etiquetas=body.etiquetas,
-            solicitante=current_user["username"], created_at=now_iso(),
+            solicitante=current_user["username"], created_at=now_iso(), entity_id=body.entity_id,
+            unidad_cobro_propuesta=body.unidad_cobro_propuesta, responsable_sugerido_propuesto=body.responsable_sugerido_propuesto,
+            tarifa_referencia_propuesta_text=str(body.tarifa_referencia_propuesta) if body.tarifa_referencia_propuesta is not None else "",
+            costo_referencia_propuesta_text=str(body.costo_referencia_propuesta) if body.costo_referencia_propuesta is not None else "",
+            horas_estandar_propuesta=body.horas_estandar_propuesta, estado_propuesto=body.estado_propuesto,
         )
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
@@ -44,6 +48,10 @@ def update_solicitud(solicitud_id: int, body: SolicitudUpdate, current_user: Cur
             solicitud_id, nombre_propuesto=body.nombre_propuesto, categoria_padre=body.categoria_padre,
             subcategoria_padre=body.subcategoria_padre, codigo_propuesto=body.codigo_propuesto,
             descripcion=body.descripcion, motivo=body.motivo, etiquetas=body.etiquetas,
+            unidad_cobro_propuesta=body.unidad_cobro_propuesta, responsable_sugerido_propuesto=body.responsable_sugerido_propuesto,
+            tarifa_referencia_propuesta_text=str(body.tarifa_referencia_propuesta) if body.tarifa_referencia_propuesta is not None else "",
+            costo_referencia_propuesta_text=str(body.costo_referencia_propuesta) if body.costo_referencia_propuesta is not None else "",
+            horas_estandar_propuesta=body.horas_estandar_propuesta, estado_propuesto=body.estado_propuesto,
         )
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
@@ -59,7 +67,7 @@ def transicion_solicitud(solicitud_id: int, body: SolicitudTransicion, current_u
     try:
         row = repo.transition_solicitud(
             solicitud_id, estado=body.estado, resultado_revision_duplicidad=body.resultado_revision_duplicidad,
-            aprobador=body.aprobador, observaciones=body.observaciones, created_at=now_iso(),
+            aprobador=body.aprobador, observaciones=body.observaciones, created_at=now_iso(), usuario_id=current_user["id"],
         )
     except ValueError as e:
         raise HTTPException(400, str(e)) from None

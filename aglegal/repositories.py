@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Iterable
 from pathlib import Path
 import os
@@ -1993,10 +1994,14 @@ class Repository:
         row = self.conn.execute(f"SELECT * FROM {table} WHERE id=%s", (entity_id,)).fetchone()
         if not row:
             return
+        # Json() shells out to json.dumps with no Decimal support — columns like
+        # servicios.horas_estandar (NUMERIC) come back from psycopg2 as Decimal, which
+        # json.dumps can't serialize on its own.
+        snapshot = {k: (str(v) if isinstance(v, Decimal) else v) for k, v in dict(row).items()}
         self.conn.execute(
             "INSERT INTO historial_catalogo(tipo_registro, entity_id, version_anterior, usuario_id, fecha_cambio) "
             "VALUES(%s,%s,%s,%s,%s)",
-            (tipo_registro, int(entity_id), Json(dict(row)), usuario_id, fecha),
+            (tipo_registro, int(entity_id), Json(snapshot), usuario_id, fecha),
         )
 
     def historial_catalogo(self, *, tipo_registro: str, entity_id: int) -> list[Any]:
@@ -3367,10 +3372,21 @@ class Repository:
             raise ValueError("Solicitud no encontrada")
         return row
 
+    def _resolver_entidad_por_tipo(self, tipo_registro: str, entity_id: int) -> Any:
+        table = {"Categoria": "categorias", "Subcategoria": "subcategorias", "Servicio": "servicios", "Familia": "familias"}[tipo_registro]
+        row = self.conn.execute(f"SELECT * FROM {table} WHERE id=%s", (int(entity_id),)).fetchone()
+        if not row:
+            raise ValueError(f"El registro #{entity_id} de tipo {tipo_registro} no existe")
+        return row
+
     def create_solicitud(
         self, *, tipo_solicitud: str, tipo_registro: str, nombre_propuesto: str,
-        categoria_padre: str | None, subcategoria_padre: str | None, codigo_propuesto: str,
+        categoria_padre: str | None, subcategoria_padre: str | None, codigo_propuesto: str = "",
         descripcion: str = "", motivo: str = "", etiquetas: str = "", solicitante: str, created_at: str,
+        entity_id: int | None = None,
+        unidad_cobro_propuesta: str | None = None, responsable_sugerido_propuesto: str | None = None,
+        tarifa_referencia_propuesta_text: str = "", costo_referencia_propuesta_text: str = "",
+        horas_estandar_propuesta: float | None = None, estado_propuesto: str | None = None,
     ) -> int:
         if tipo_solicitud not in TIPO_SOLICITUD_VALUES:
             raise ValueError("Tipo de solicitud inválido")
@@ -3379,32 +3395,56 @@ class Repository:
         nombre = (nombre_propuesto or "").strip()
         if not nombre:
             raise ValueError("Nombre propuesto requerido")
-        codigo = (codigo_propuesto or "").strip().upper()
-        if not codigo:
-            raise ValueError("Código propuesto requerido")
-        if tipo_registro in ("Subcategoria", "Servicio", "Familia") and not (categoria_padre or "").strip():
-            raise ValueError("Categoría padre requerida para este tipo de registro")
-        if tipo_registro == "Servicio" and not (subcategoria_padre or "").strip():
-            raise ValueError("Subcategoría padre requerida para un servicio")
+
+        if tipo_solicitud == "Alta":
+            entity_id = None
+            codigo = (codigo_propuesto or "").strip().upper()
+            if not codigo:
+                raise ValueError("Código propuesto requerido")
+            if tipo_registro in ("Subcategoria", "Servicio", "Familia") and not (categoria_padre or "").strip():
+                raise ValueError("Categoría padre requerida para este tipo de registro")
+            if tipo_registro == "Servicio" and not (subcategoria_padre or "").strip():
+                raise ValueError("Subcategoría padre requerida para un servicio")
+        else:
+            # Cambio / Baja: la solicitud apunta a un registro que ya existe — el código
+            # no se reasigna, se toma directo del registro real (nunca del formulario).
+            if tipo_solicitud == "Baja" and tipo_registro == "Familia":
+                raise ValueError("Las familias no tienen estado activo/inactivo — no se puede dar de baja una familia")
+            if entity_id is None:
+                raise ValueError("Selecciona el registro existente al que aplica este Cambio/Baja")
+            entidad = self._resolver_entidad_por_tipo(tipo_registro, entity_id)
+            codigo_col = {"Categoria": "category_code", "Subcategoria": "subcategory_code", "Servicio": "service_code", "Familia": "family_code"}[tipo_registro]
+            codigo = str(entidad[codigo_col])
+
         year = created_at[:4]
         code = self._next_solicitud_code(year)
+        tarifa_cents = self._to_cents_or_zero(tarifa_referencia_propuesta_text) if tarifa_referencia_propuesta_text else None
+        costo_cents = self._to_cents_or_zero(costo_referencia_propuesta_text) if costo_referencia_propuesta_text else None
         cur = self.conn.execute(
             """INSERT INTO solicitudes_catalogo(
                    solicitud_code, fecha_solicitud, tipo_solicitud, tipo_registro, nombre_propuesto,
                    categoria_padre, subcategoria_padre, codigo_propuesto, descripcion, motivo, etiquetas,
-                   solicitante, estado, created_at, updated_at
-               ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'Solicitado',%s,%s)""",
+                   solicitante, estado, created_at, updated_at, entity_id,
+                   unidad_cobro_propuesta, responsable_sugerido_propuesto,
+                   tarifa_referencia_propuesta_cents, costo_referencia_propuesta_cents,
+                   horas_estandar_propuesta, estado_propuesto
+               ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'Solicitado',%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (code, created_at[:10], tipo_solicitud, tipo_registro, nombre,
              (categoria_padre or "").strip() or None, (subcategoria_padre or "").strip() or None, codigo,
              (descripcion or "").strip(), (motivo or "").strip(), (etiquetas or "").strip(),
-             solicitante, created_at, created_at),
+             solicitante, created_at, created_at, entity_id,
+             (unidad_cobro_propuesta or "").strip() or None, (responsable_sugerido_propuesto or "").strip() or None,
+             tarifa_cents, costo_cents, horas_estandar_propuesta, (estado_propuesto or "").strip() or None),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
     def update_solicitud(
         self, solicitud_id: int, *, nombre_propuesto: str, categoria_padre: str | None,
-        subcategoria_padre: str | None, codigo_propuesto: str, descripcion: str = "", motivo: str = "", etiquetas: str = "",
+        subcategoria_padre: str | None, codigo_propuesto: str = "", descripcion: str = "", motivo: str = "", etiquetas: str = "",
+        unidad_cobro_propuesta: str | None = None, responsable_sugerido_propuesto: str | None = None,
+        tarifa_referencia_propuesta_text: str = "", costo_referencia_propuesta_text: str = "",
+        horas_estandar_propuesta: float | None = None, estado_propuesto: str | None = None,
     ) -> None:
         current = self.get_solicitud(solicitud_id)
         if current["estado"] not in _SOLICITUD_EDITABLE_ESTADOS:
@@ -3412,16 +3452,26 @@ class Repository:
         nombre = (nombre_propuesto or "").strip()
         if not nombre:
             raise ValueError("Nombre propuesto requerido")
-        codigo = (codigo_propuesto or "").strip().upper()
-        if not codigo:
-            raise ValueError("Código propuesto requerido")
+        if current["tipo_solicitud"] == "Alta":
+            codigo = (codigo_propuesto or "").strip().upper()
+            if not codigo:
+                raise ValueError("Código propuesto requerido")
+        else:
+            codigo = current["codigo_propuesto"]
+        tarifa_cents = self._to_cents_or_zero(tarifa_referencia_propuesta_text) if tarifa_referencia_propuesta_text else None
+        costo_cents = self._to_cents_or_zero(costo_referencia_propuesta_text) if costo_referencia_propuesta_text else None
         self.conn.execute(
             """UPDATE solicitudes_catalogo SET nombre_propuesto=%s, categoria_padre=%s, subcategoria_padre=%s,
-                   codigo_propuesto=%s, descripcion=%s, motivo=%s, etiquetas=%s, updated_at=%s
+                   codigo_propuesto=%s, descripcion=%s, motivo=%s, etiquetas=%s, updated_at=%s,
+                   unidad_cobro_propuesta=%s, responsable_sugerido_propuesto=%s,
+                   tarifa_referencia_propuesta_cents=%s, costo_referencia_propuesta_cents=%s,
+                   horas_estandar_propuesta=%s, estado_propuesto=%s
                WHERE id=%s""",
             (nombre, (categoria_padre or "").strip() or None, (subcategoria_padre or "").strip() or None,
              codigo, (descripcion or "").strip(), (motivo or "").strip(), (etiquetas or "").strip(),
-             now_iso(), int(solicitud_id)),
+             now_iso(), (unidad_cobro_propuesta or "").strip() or None, (responsable_sugerido_propuesto or "").strip() or None,
+             tarifa_cents, costo_cents, horas_estandar_propuesta, (estado_propuesto or "").strip() or None,
+             int(solicitud_id)),
         )
         self.conn.commit()
 
@@ -3445,8 +3495,8 @@ class Repository:
             raise ValueError(f"La subcategoría padre '{code}' no existe dentro de esa categoría — créala primero o corrige el código")
         return row
 
-    def _activar_solicitud_en_catalogo(self, solicitud: Any, *, created_at: str) -> tuple[str, str]:
-        """Crea el registro real en el Catálogo Maestro a partir de una solicitud aprobada.
+    def _activar_alta_en_catalogo(self, solicitud: Any, *, created_at: str) -> tuple[str, str]:
+        """Crea el registro real en el Catálogo Maestro a partir de una solicitud de Alta aprobada.
         Devuelve (nota_de_trazabilidad, codigo_definitivo_real) — para Servicio/Familia el código
         real lo asigna el sistema y puede diferir del código propuesto por quien solicitó."""
         tipo = solicitud["tipo_registro"]
@@ -3474,7 +3524,7 @@ class Repository:
             code_real = str(servicio["service_code"])
             return (
                 f"Activado en Catálogo Maestro — Servicio #{serv_id} ({code_real}), en estado 'En diseño'. "
-                "Completa tarifa, unidad de cobro y responsable en Catálogo Maestro antes de pasarlo a Activo."
+                "Envía una solicitud de Cambio para completar tarifa, unidad de cobro y responsable antes de pasarlo a Activo."
             ), code_real
 
         if tipo == "Familia":
@@ -3486,9 +3536,89 @@ class Repository:
 
         raise ValueError(f"Tipo de registro no soportado para activación automática: {tipo}")
 
+    def _activar_cambio_en_catalogo(self, solicitud: Any, *, usuario_id: int | None) -> tuple[str, str]:
+        """Aplica una solicitud de Cambio aprobada al registro existente que referencia
+        (solicitud['entity_id']) — nunca crea un registro nuevo. Cualquier campo propuesto
+        que venga vacío conserva el valor que el registro ya tenía."""
+        tipo = solicitud["tipo_registro"]
+        entity_id = int(solicitud["entity_id"])
+        nombre = solicitud["nombre_propuesto"]
+        entidad = self._resolver_entidad_por_tipo(tipo, entity_id)
+
+        if tipo == "Categoria":
+            estado = solicitud["estado_propuesto"] or entidad["estado"]
+            self.update_categoria(entity_id, nombre=nombre, estado=estado, usuario_id=usuario_id)
+            return f"Cambio aplicado — Categoría #{entity_id} ({entidad['category_code']})", str(entidad["category_code"])
+
+        if tipo == "Subcategoria":
+            estado = solicitud["estado_propuesto"] or entidad["estado"]
+            self.update_subcategoria(entity_id, nombre=nombre, estado=estado, usuario_id=usuario_id)
+            return f"Cambio aplicado — Subcategoría #{entity_id} ({entidad['subcategory_code']})", str(entidad["subcategory_code"])
+
+        if tipo == "Servicio":
+            self.update_servicio(
+                entity_id,
+                nombre=nombre,
+                etiquetas=solicitud["etiquetas"] or entidad["etiquetas"] or "",
+                unidad_cobro=solicitud["unidad_cobro_propuesta"] or entidad["unidad_cobro"],
+                responsable_sugerido=solicitud["responsable_sugerido_propuesto"] or entidad["responsable_sugerido"],
+                tarifa_referencia_text=(
+                    str(solicitud["tarifa_referencia_propuesta_cents"] / 100)
+                    if solicitud["tarifa_referencia_propuesta_cents"] is not None
+                    else str((entidad["tarifa_referencia_cents"] or 0) / 100)
+                ),
+                costo_referencia_text=(
+                    str(solicitud["costo_referencia_propuesta_cents"] / 100)
+                    if solicitud["costo_referencia_propuesta_cents"] is not None
+                    else str((entidad["costo_referencia_cents"] or 0) / 100)
+                ),
+                horas_estandar=(
+                    float(solicitud["horas_estandar_propuesta"])
+                    if solicitud["horas_estandar_propuesta"] is not None
+                    else float(entidad["horas_estandar"] or 0)
+                ),
+                estado=solicitud["estado_propuesto"] or entidad["estado"],
+                usuario_id=usuario_id,
+            )
+            return f"Cambio aplicado — Servicio #{entity_id} ({entidad['service_code']})", str(entidad["service_code"])
+
+        if tipo == "Familia":
+            self.update_familia(entity_id, nombre=nombre, usuario_id=usuario_id)
+            return f"Cambio aplicado — Familia #{entity_id} ({entidad['family_code']})", str(entidad["family_code"])
+
+        raise ValueError(f"Tipo de registro no soportado para Cambio: {tipo}")
+
+    def _activar_baja_en_catalogo(self, solicitud: Any, *, usuario_id: int | None) -> tuple[str, str]:
+        """Inactiva el registro existente que la solicitud de Baja referencia. Las familias
+        no tienen estado, así que este tipo de solicitud nunca se acepta para ellas
+        (validado antes, en create_solicitud)."""
+        tipo = solicitud["tipo_registro"]
+        entity_id = int(solicitud["entity_id"])
+        entidad = self._resolver_entidad_por_tipo(tipo, entity_id)
+
+        if tipo == "Categoria":
+            self.update_categoria(entity_id, nombre=str(entidad["nombre"]), estado="Inactivo", usuario_id=usuario_id)
+            return f"Baja aplicada — Categoría #{entity_id} ({entidad['category_code']}) pasó a Inactivo", str(entidad["category_code"])
+
+        if tipo == "Subcategoria":
+            self.update_subcategoria(entity_id, nombre=str(entidad["nombre"]), estado="Inactivo", usuario_id=usuario_id)
+            return f"Baja aplicada — Subcategoría #{entity_id} ({entidad['subcategory_code']}) pasó a Inactivo", str(entidad["subcategory_code"])
+
+        if tipo == "Servicio":
+            self.update_servicio(
+                entity_id, nombre=str(entidad["nombre"]), etiquetas=entidad["etiquetas"] or "",
+                unidad_cobro=entidad["unidad_cobro"], responsable_sugerido=entidad["responsable_sugerido"],
+                tarifa_referencia_text=str((entidad["tarifa_referencia_cents"] or 0) / 100),
+                costo_referencia_text=str((entidad["costo_referencia_cents"] or 0) / 100),
+                horas_estandar=float(entidad["horas_estandar"] or 0), estado="Inactivo", usuario_id=usuario_id,
+            )
+            return f"Baja aplicada — Servicio #{entity_id} ({entidad['service_code']}) pasó a Inactivo", str(entidad["service_code"])
+
+        raise ValueError(f"Tipo de registro no soportado para Baja: {tipo}")
+
     def transition_solicitud(
         self, solicitud_id: int, *, estado: str, resultado_revision_duplicidad: str | None = None,
-        aprobador: str | None = None, observaciones: str | None = None, created_at: str,
+        aprobador: str | None = None, observaciones: str | None = None, created_at: str, usuario_id: int | None = None,
     ) -> Any:
         current = self.get_solicitud(solicitud_id)
         if estado not in _SOLICITUD_TRANSICIONES.get(current["estado"], set()):
@@ -3503,10 +3633,12 @@ class Repository:
             if not (aprobador or "").strip():
                 raise ValueError("Se requiere indicar el aprobador para aprobar una solicitud")
             codigo_definitivo = current["codigo_propuesto"]
-            # El código propuesto solo se vuelve el código real para Categoría/Subcategoría — para
-            # Servicio/Familia el sistema genera su propio código, así que no tiene sentido validar
-            # unicidad de un texto que ni siquiera va a usarse como código definitivo.
-            if current["tipo_registro"] in ("Categoria", "Subcategoria") and self.conn.execute(
+            # El código propuesto solo se vuelve el código real, sujeto a validación de unicidad,
+            # para un Alta de Categoría/Subcategoría — es la única combinación donde se está
+            # asignando un código nuevo de verdad. Para Servicio/Familia el sistema genera su
+            # propio código al crear, y para Cambio/Baja el código ya pertenece al registro
+            # existente desde antes (por eso ya pasó esta misma validación en su propia Alta).
+            if current["tipo_solicitud"] == "Alta" and current["tipo_registro"] in ("Categoria", "Subcategoria") and self.conn.execute(
                 "SELECT 1 FROM solicitudes_catalogo WHERE codigo_definitivo = %s AND id <> %s",
                 (codigo_definitivo, int(solicitud_id)),
             ).fetchone():
@@ -3515,11 +3647,19 @@ class Repository:
             fields["aprobador"] = aprobador.strip()
             fields["fecha_aprobacion"] = created_at[:10]
 
-            # Activación automática: al aprobar, se crea de una vez el registro real en el
-            # Catálogo Maestro y la solicitud pasa directo a Activo — sin paso manual aparte.
-            pseudo = dict(current)
-            pseudo["codigo_definitivo"] = codigo_definitivo
-            nota, codigo_real = self._activar_solicitud_en_catalogo(pseudo, created_at=created_at)
+            # Activación automática: al aprobar, se aplica de una vez el efecto real en el
+            # Catálogo Maestro (crear / editar / inactivar según el tipo) y la solicitud pasa
+            # directo a Activo — sin paso manual aparte.
+            if current["tipo_solicitud"] == "Alta":
+                pseudo = dict(current)
+                pseudo["codigo_definitivo"] = codigo_definitivo
+                nota, codigo_real = self._activar_alta_en_catalogo(pseudo, created_at=created_at)
+            elif current["tipo_solicitud"] == "Cambio":
+                nota, codigo_real = self._activar_cambio_en_catalogo(current, usuario_id=usuario_id)
+            elif current["tipo_solicitud"] == "Baja":
+                nota, codigo_real = self._activar_baja_en_catalogo(current, usuario_id=usuario_id)
+            else:
+                raise ValueError(f"Tipo de solicitud no soportado: {current['tipo_solicitud']}")
             fields["estado"] = "Activo"
             fields["codigo_definitivo"] = codigo_real
             obs = f"{obs}\n{nota}" if obs else nota
