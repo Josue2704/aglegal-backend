@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from ..deps import CurrentUser, RepoDep
+from ..deps import CurrentUser, RepoDep, require_permission
 from ..schemas.dashboard import (
     CashflowTotals,
     GrossProfitItem,
@@ -13,18 +13,21 @@ from ..schemas.dashboard import (
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
+_can_view = require_permission("dashboard", "ver")
+
 
 @router.get("/upcoming-sessions")
 def upcoming_sessions(
     current_user: CurrentUser,
     repo: RepoDep,
     days: int = 7,
+    _: dict = _can_view,
 ) -> list[dict]:
     return [dict(r) for r in repo.upcoming_sessions(days=days)]
 
 
 @router.get("/alerts")
-def alerts(current_user: CurrentUser, repo: RepoDep, stale_days: int = 15) -> dict:
+def alerts(current_user: CurrentUser, repo: RepoDep, stale_days: int = 15, _: dict = _can_view) -> dict:
     return repo.dashboard_alerts(stale_days=stale_days)
 
 
@@ -34,6 +37,7 @@ def global_search(
     current_user: CurrentUser,
     repo: RepoDep,
     limit: int = 8,
+    _: dict = _can_view,
 ) -> dict:
     if not q or len(q.strip()) < 2:
         return {"clients": [], "cases": [], "sessions": []}
@@ -41,7 +45,7 @@ def global_search(
 
 
 @router.get("/kpis", response_model=MonthlyMetrics)
-def monthly_kpis(current_user: CurrentUser, repo: RepoDep) -> MonthlyMetrics:
+def monthly_kpis(current_user: CurrentUser, repo: RepoDep, _: dict = _can_view) -> MonthlyMetrics:
     m = repo.dashboard_metrics_month()
     incomes = m["incomes_cents"] / 100
     expenses = m["expenses_cents"] / 100
@@ -61,6 +65,7 @@ def cashflow(
     repo: RepoDep,
     start_date: str | None = None,
     end_date: str | None = None,
+    _: dict = _can_view,
 ) -> dict:
     total_in, total_ex = repo.cashflow_totals(start_date=start_date, end_date=end_date)
     total_costs = repo.cost_totals(start_date=start_date, end_date=end_date)
@@ -82,6 +87,7 @@ def top_clients(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 8,
+    _: dict = _can_view,
 ) -> list[TopItem]:
     return [TopItem(name=n, amount=a / 100) for n, a in repo.top_clients_by_revenue(start_date=start_date, end_date=end_date, limit=limit)]
 
@@ -93,6 +99,7 @@ def top_services(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 8,
+    _: dict = _can_view,
 ) -> list[TopItem]:
     return [TopItem(name=n, amount=a / 100) for n, a in repo.top_services_by_revenue(start_date=start_date, end_date=end_date, limit=limit)]
 
@@ -104,6 +111,7 @@ def top_expenses(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 8,
+    _: dict = _can_view,
 ) -> list[TopItem]:
     return [TopItem(name=n, amount=a / 100) for n, a in repo.top_expenses_by_account(start_date=start_date, end_date=end_date, limit=limit)]
 
@@ -115,6 +123,7 @@ def gross_profit_services(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 8,
+    _: dict = _can_view,
 ) -> list[GrossProfitItem]:
     rows = repo.top_services_by_gross_profit(start_date=start_date, end_date=end_date, limit=limit)
     return [GrossProfitItem(name=n, revenue=r / 100, cost=c / 100, gross_profit=g / 100) for n, r, c, g in rows]
@@ -126,6 +135,7 @@ def cashflow_by_client(
     repo: RepoDep,
     start_date: str | None = None,
     end_date: str | None = None,
+    _: dict = _can_view,
 ) -> list[dict]:
     return repo.cashflow_by_client(start_date=start_date, end_date=end_date)
 
@@ -137,6 +147,7 @@ def gross_profit_clients(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 8,
+    _: dict = _can_view,
 ) -> list[GrossProfitItem]:
     rows = repo.top_clients_by_gross_profit(start_date=start_date, end_date=end_date, limit=limit)
     return [GrossProfitItem(name=n, revenue=r / 100, cost=c / 100, gross_profit=g / 100) for n, r, c, g in rows]
@@ -148,6 +159,7 @@ def rentabilidad_abogado(
     repo: RepoDep,
     start_date: str | None = None,
     end_date: str | None = None,
+    _: dict = _can_view,
 ) -> list[dict]:
     rows = repo.rentabilidad_por_abogado(start_date=start_date, end_date=end_date)
     return [

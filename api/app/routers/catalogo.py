@@ -28,13 +28,15 @@ router = APIRouter(prefix="/catalogo", tags=["catalogo"])
 # --- Categorías
 
 @router.get("/categorias", response_model=list[CategoriaOut])
-def list_categorias(current_user: CurrentUser, repo: RepoDep, estado: str | None = None) -> list[CategoriaOut]:
+def list_categorias(
+    current_user: CurrentUser, repo: RepoDep, estado: str | None = None, _: dict = require_permission("catalogo", "ver")
+) -> list[CategoriaOut]:
     return [CategoriaOut.from_row(row) for row in repo.list_categorias(estado=estado)]
 
 
 @router.post("/categorias", response_model=CategoriaOut, status_code=201)
 def create_categoria(
-    body: CategoriaIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("categorias", "crear")
+    body: CategoriaIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("catalogo", "crear")
 ) -> CategoriaOut:
     cat_id = repo.create_categoria(category_code=body.category_code, nombre=body.nombre, created_at=now_iso())
     return CategoriaOut.from_row(repo.get_categoria(cat_id))
@@ -46,7 +48,7 @@ def update_categoria(
     body: CategoriaUpdate,
     current_user: CurrentUser,
     repo: RepoDep,
-    _: dict = require_permission("categorias", "editar"),
+    _: dict = require_permission("catalogo", "editar"),
 ) -> CategoriaOut:
     repo.update_categoria(categoria_id, nombre=body.nombre, estado=body.estado, usuario_id=current_user["id"])
     return CategoriaOut.from_row(repo.get_categoria(categoria_id))
@@ -56,14 +58,15 @@ def update_categoria(
 
 @router.get("/subcategorias", response_model=list[SubcategoriaOut])
 def list_subcategorias(
-    current_user: CurrentUser, repo: RepoDep, category_id: int | None = None, estado: str | None = None
+    current_user: CurrentUser, repo: RepoDep, category_id: int | None = None, estado: str | None = None,
+    _: dict = require_permission("catalogo", "ver"),
 ) -> list[SubcategoriaOut]:
     return [SubcategoriaOut.from_row(row) for row in repo.list_subcategorias(category_id=category_id, estado=estado)]
 
 
 @router.post("/subcategorias", response_model=SubcategoriaOut, status_code=201)
 def create_subcategoria(
-    body: SubcategoriaIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("categorias", "crear")
+    body: SubcategoriaIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("catalogo", "crear")
 ) -> SubcategoriaOut:
     sub_id = repo.create_subcategoria(
         category_id=body.category_id,
@@ -80,7 +83,7 @@ def update_subcategoria(
     body: SubcategoriaUpdate,
     current_user: CurrentUser,
     repo: RepoDep,
-    _: dict = require_permission("categorias", "editar"),
+    _: dict = require_permission("catalogo", "editar"),
 ) -> SubcategoriaOut:
     repo.update_subcategoria(subcategoria_id, nombre=body.nombre, estado=body.estado, usuario_id=current_user["id"])
     return SubcategoriaOut.from_row(repo.get_subcategoria(subcategoria_id))
@@ -89,13 +92,13 @@ def update_subcategoria(
 # --- Familias
 
 @router.get("/familias", response_model=list[FamiliaOut])
-def list_familias(current_user: CurrentUser, repo: RepoDep) -> list[FamiliaOut]:
+def list_familias(current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("catalogo", "ver")) -> list[FamiliaOut]:
     return [FamiliaOut.from_row(row) for row in repo.list_familias()]
 
 
 @router.post("/familias", response_model=FamiliaOut, status_code=201)
 def create_familia(
-    body: FamiliaIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("categorias", "crear")
+    body: FamiliaIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("catalogo", "crear")
 ) -> FamiliaOut:
     fam_id = repo.create_familia(category_id=body.category_id, nombre=body.nombre, created_at=now_iso())
     return FamiliaOut.from_row(repo.get_familia(fam_id))
@@ -107,7 +110,7 @@ def update_familia(
     body: FamiliaUpdate,
     current_user: CurrentUser,
     repo: RepoDep,
-    _: dict = require_permission("categorias", "editar"),
+    _: dict = require_permission("catalogo", "editar"),
 ) -> FamiliaOut:
     repo.update_familia(familia_id, nombre=body.nombre, usuario_id=current_user["id"])
     return FamiliaOut.from_row(repo.get_familia(familia_id))
@@ -123,6 +126,7 @@ def list_servicios(
     category_id: int | None = None,
     estado: str | None = None,
     q: str | None = None,
+    _: dict = require_permission("catalogo", "ver"),
 ) -> list[ServicioOut]:
     rows = repo.list_servicios(subcategory_id=subcategory_id, category_id=category_id, estado=estado, q=q)
     return [ServicioOut.from_row(row) for row in rows]
@@ -135,6 +139,7 @@ def servicio_choices(
     q: str | None = None,
     estado: str = "Activo",
     limit: int = Query(25, le=100),
+    _: dict = require_permission("catalogo", "ver"),
 ) -> list[ServicioChoice]:
     """Búsqueda por código o nombre — usada para seleccionar servicio en expedientes."""
     return [ServicioChoice.from_row(row) for row in repo.servicio_choices(q=q, estado=estado, limit=limit)]
@@ -142,7 +147,7 @@ def servicio_choices(
 
 @router.post("/servicios", response_model=ServicioOut, status_code=201)
 def create_servicio(
-    body: ServicioIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("categorias", "crear")
+    body: ServicioIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("catalogo", "crear")
 ) -> ServicioOut:
     svc_id = repo.create_servicio(
         subcategory_id=body.subcategory_id,
@@ -165,7 +170,7 @@ def update_servicio(
     body: ServicioUpdate,
     current_user: CurrentUser,
     repo: RepoDep,
-    _: dict = require_permission("categorias", "editar"),
+    _: dict = require_permission("catalogo", "editar"),
 ) -> ServicioOut:
     repo.update_servicio(
         servicio_id,
@@ -185,5 +190,7 @@ def update_servicio(
 # --- Historial
 
 @router.get("/historial", response_model=list[HistorialEntryOut])
-def historial(current_user: CurrentUser, repo: RepoDep, tipo_registro: str, entity_id: int) -> list[HistorialEntryOut]:
+def historial(
+    current_user: CurrentUser, repo: RepoDep, tipo_registro: str, entity_id: int, _: dict = require_permission("catalogo", "ver")
+) -> list[HistorialEntryOut]:
     return [HistorialEntryOut.from_row(row) for row in repo.historial_catalogo(tipo_registro=tipo_registro, entity_id=entity_id)]

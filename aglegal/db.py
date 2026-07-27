@@ -850,6 +850,17 @@ def _migrate(conn: PgConnection) -> None:
         """)
         _set_schema_version(conn, 27)
 
+    # v28: los módulos nuevos de las Fases 1-10 (Catálogo Maestro, Finanzas, Pipeline,
+    # Comisiones, Gobierno del Catálogo) viajaban sin permisos propios — reutilizaban
+    # "categorias.*" o "expedientes.editar" sin relación real con esos módulos, y todos
+    # sus endpoints de lectura no exigían ningún permiso más allá de estar autenticado.
+    # Se retira el permiso genérico "categorias" (ya sin uso tras el retiro del sistema
+    # legado de categorías/productos) y se crean permisos dedicados por módulo.
+    if v < 28:
+        conn.execute("DELETE FROM permissions WHERE module = 'categorias'")
+        _seed_rbac(conn)
+        _set_schema_version(conn, 28)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 
@@ -884,10 +895,22 @@ ALL_PERMISSIONS: list[tuple[str, str, str]] = [
     ("nominas",       "crear",    "Crear nóminas"),
     ("nominas",       "editar",   "Editar nóminas"),
     ("nominas",       "eliminar", "Eliminar nóminas"),
-    ("categorias",    "ver",      "Ver categorías y servicios"),
-    ("categorias",    "crear",    "Crear categorías y servicios"),
-    ("categorias",    "editar",   "Editar categorías y servicios"),
-    ("categorias",    "eliminar", "Eliminar categorías y servicios"),
+    ("catalogo",      "ver",      "Ver catálogo maestro"),
+    ("catalogo",      "crear",    "Crear categorías, subcategorías, servicios y familias"),
+    ("catalogo",      "editar",   "Editar categorías, subcategorías, servicios y familias"),
+    ("finanzas",      "ver",      "Ver plan de cuentas, personal, gastos fijos y presupuesto"),
+    ("finanzas",      "crear",    "Crear cuentas, personal, gastos fijos y metas de presupuesto"),
+    ("finanzas",      "editar",   "Editar cuentas, personal, gastos fijos y metas de presupuesto"),
+    ("finanzas",      "eliminar", "Eliminar metas de presupuesto"),
+    ("pipeline",      "ver",      "Ver pipeline comercial"),
+    ("pipeline",      "crear",    "Crear oportunidades"),
+    ("pipeline",      "editar",   "Editar y transicionar oportunidades"),
+    ("comisiones",    "ver",      "Ver comisiones"),
+    ("comisiones",    "editar",   "Configurar originadores, reconocer y revertir comisiones"),
+    ("gobierno_catalogo", "ver",      "Ver solicitudes de catálogo"),
+    ("gobierno_catalogo", "crear",    "Crear solicitudes de catálogo"),
+    ("gobierno_catalogo", "editar",   "Editar solicitudes de catálogo"),
+    ("gobierno_catalogo", "aprobar",  "Aprobar, rechazar y activar solicitudes de catálogo"),
     ("usuarios",      "ver",      "Ver usuarios"),
     ("usuarios",      "crear",    "Crear usuarios"),
     ("usuarios",      "editar",   "Editar usuarios"),
@@ -909,7 +932,11 @@ _ABOGADO_PERMS = {
     "flujo_caja.ver", "flujo_caja.crear", "flujo_caja.editar",
     "facturas.ver", "facturas.crear", "facturas.editar",
     "nominas.ver", "nominas.crear", "nominas.editar",
-    "categorias.ver", "categorias.crear", "categorias.editar",
+    "catalogo.ver", "catalogo.crear", "catalogo.editar",
+    "finanzas.ver", "finanzas.crear", "finanzas.editar",
+    "pipeline.ver", "pipeline.crear", "pipeline.editar",
+    "comisiones.ver", "comisiones.editar",
+    "gobierno_catalogo.ver", "gobierno_catalogo.crear", "gobierno_catalogo.editar",
     "usuarios.ver",
     "configuracion.ver",
 }
@@ -921,7 +948,7 @@ _ASISTENTE_PERMS = {
     "tareas.ver", "tareas.crear", "tareas.editar",
     "agenda.ver", "agenda.crear", "agenda.editar",
     "facturas.ver",
-    "categorias.ver",
+    "catalogo.ver",
 }
 
 _VISUALIZADOR_PERMS = {
