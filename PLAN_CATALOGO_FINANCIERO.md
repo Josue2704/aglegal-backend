@@ -247,6 +247,19 @@ Pedido del cliente: "no deberían crearse más servicios ni categorías así no 
 
 **Commits:** backend `6365178`, frontend `0a117d2`. Desplegado y verificado en producción (`/catalogo/categorias` POST ahora devuelve 405, GET sigue en 200; `/solicitudes-catalogo` en 200).
 
+### Post-Fase 10 (5) — Retirado `cases.service_area`, redundante con el servicio del catálogo ✅ Completada
+
+Pregunta del cliente sobre el formulario de "Nuevo expediente": por qué había un "Área de servicio" (lista fija de 8 valores, previa al Catálogo Maestro) *y* un "Servicio del catálogo" (buscador de los 205 servicios reales) — y dónde se elegía el "sub servicio" o "producto". Investigación (agente Explore) confirmó que eran dos campos **completamente independientes**, sin nada que los sincronizara — un expediente podía tener `service_area='Migratorio'` con un `service_id` real de "Derecho Corporativo", sin ningún aviso. El cliente eligió quitar el campo manual y dejar que el "área" salga sola de la categoría del servicio elegido.
+
+- `cases.service_area` deja de enviarse/exigirse en `create_case`/`update_case` — la migración v30 solo quita el `NOT NULL` (columna y datos históricos intactos, coherente con el resto de retiros de esta sesión).
+- Su único uso real (respaldo de agrupación en los reportes "Top servicios" y utilidad bruta por servicio, para expedientes sin `service_id`) se simplificó a un bucket fijo `'(Sin servicio)'`.
+- No faltaba ningún selector de "sub servicio/producto" — elegir el servicio ya trae su categoría/subcategoría/familia por dentro. Lo que faltaba era mostrarlo: el buscador de servicios en `Cases.tsx` ya recibía `category_code`/`subcategory_code` en cada resultado pero no los pintaba. Se agregó ese desglose (buscador y chip de selección).
+- **Bug preexistente encontrado de paso, no introducido por este cambio:** la búsqueda por texto de Expedientes (`list_cases`, filtro `search`) referenciaba `sp.name` (alias de la tabla legada `service_products`) en el `WHERE`, pero el `FROM`/`JOIN` de esa consulta ya no incluye esa tabla desde el retiro del sistema legado (antes en esta misma sesión) — cualquier búsqueda de texto en Expedientes devolvía `500` en producción. Se detectó al tocar la misma consulta para retirar `service_area`; se corrigió reemplazando el filtro por título/cliente/servicio.
+
+**Verificación:** probado por HTTP contra el backend local — creación de expediente sin `service_area` (200), búsqueda de expedientes por texto (200, antes fallaba con `UndefinedTable`), reportes `top-services`/`gross-profit/services` (200). Repetido contra producción después del deploy con los mismos resultados. `npx tsc --noEmit` y `npm run build` limpios. Migración v30 corrida en producción sin pérdida de datos (1 expediente real, intacto). Sin verificación visual en navegador esta sesión.
+
+**Commits:** backend `78cdf04`, frontend `6b53a48`.
+
 ---
 
 ## Cómo trabajamos
