@@ -106,8 +106,8 @@ def client_statement(client_id: int, current_user: CurrentUser, repo: RepoDep) -
 
     # Invoices
     invoices = repo.conn.execute(
-        """SELECT id, invoice_number, issued_at, total_cents, status
-           FROM invoices WHERE client_id=%s ORDER BY issued_at DESC""",
+        """SELECT id, invoice_number, invoice_date AS issued_at, total_cents, status
+           FROM invoices WHERE client_id=%s ORDER BY invoice_date DESC""",
         (client_id,),
     ).fetchall()
 
@@ -119,11 +119,33 @@ def client_statement(client_id: int, current_user: CurrentUser, repo: RepoDep) -
 
     # Incomes linked to client
     incomes = repo.conn.execute(
-        """SELECT id, amount_cents, description, income_date, category_id
+        """SELECT id, amount_cents, detail AS description, income_date, category_id
            FROM incomes WHERE client_id=%s ORDER BY income_date DESC""",
         (client_id,),
     ).fetchall()
     total_received_cents = sum(int(i["amount_cents"] or 0) for i in incomes)
+
+    # Indicadores de cliente (Fase 6): servicios contratados, facturación acumulada,
+    # fecha del último servicio, recurrencia (2+ expedientes distintos).
+    servicios_contratados = repo.conn.execute(
+        "SELECT COUNT(DISTINCT service_id) AS n FROM cases WHERE client_id=%s AND service_id IS NOT NULL",
+        (client_id,),
+    ).fetchone()["n"]
+    ultimo_servicio_row = repo.conn.execute(
+        "SELECT MAX(opened_at) AS fecha FROM cases WHERE client_id=%s",
+        (client_id,),
+    ).fetchone()
+    facturacion_acumulada_row = repo.conn.execute(
+        "SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS total FROM incomes WHERE client_id=%s",
+        (client_id,),
+    ).fetchone()
+    indicadores = {
+        "servicios_contratados": int(servicios_contratados or 0),
+        "facturacion_acumulada_cents": int(facturacion_acumulada_row["total"] or 0),
+        "ultimo_servicio": ultimo_servicio_row["fecha"],
+        "expedientes_totales": len(cases),
+        "cliente_recurrente": len(cases) >= 2,
+    }
 
     return {
         "client": dict(row),
@@ -145,4 +167,5 @@ def client_statement(client_id: int, current_user: CurrentUser, repo: RepoDep) -
             "invoices": [dict(i) for i in invoices],
             "incomes": [dict(i) for i in incomes[:20]],
         },
+        "indicadores": indicadores,
     }

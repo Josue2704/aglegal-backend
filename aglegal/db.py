@@ -542,6 +542,314 @@ def _migrate(conn: PgConnection) -> None:
         conn.commit()
         _set_schema_version(conn, 18)
 
+    # v19: Outlook Calendar tokens (table was referenced by repositories.py but never created)
+    if v < 19:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS outlook_tokens (
+              username TEXT PRIMARY KEY,
+              access_token TEXT NOT NULL,
+              refresh_token TEXT NOT NULL,
+              expiry_at TEXT NOT NULL
+            )
+        """)
+        _set_schema_version(conn, 19)
+
+    # v20: catálogo maestro — categorías, subcategorías, servicios, familias, historial
+    if v < 20:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS categorias (
+              id SERIAL PRIMARY KEY,
+              category_code TEXT NOT NULL UNIQUE,
+              nombre TEXT NOT NULL UNIQUE,
+              estado TEXT NOT NULL DEFAULT 'Activo' CHECK (estado IN ('Activo','Inactivo')),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_categorias_estado ON categorias(estado);
+
+            CREATE TABLE IF NOT EXISTS subcategorias (
+              id SERIAL PRIMARY KEY,
+              subcategory_code TEXT NOT NULL,
+              category_id INTEGER NOT NULL REFERENCES categorias(id) ON DELETE RESTRICT,
+              nombre TEXT NOT NULL,
+              estado TEXT NOT NULL DEFAULT 'Activo' CHECK (estado IN ('Activo','Inactivo')),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(category_id, subcategory_code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_subcategorias_category ON subcategorias(category_id, estado);
+
+            CREATE TABLE IF NOT EXISTS familias (
+              id SERIAL PRIMARY KEY,
+              family_code TEXT NOT NULL UNIQUE,
+              nombre TEXT NOT NULL,
+              category_id INTEGER NOT NULL UNIQUE REFERENCES categorias(id) ON DELETE RESTRICT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS servicios (
+              id SERIAL PRIMARY KEY,
+              service_code TEXT NOT NULL UNIQUE,
+              subcategory_id INTEGER NOT NULL REFERENCES subcategorias(id) ON DELETE RESTRICT,
+              nombre TEXT NOT NULL,
+              etiquetas TEXT,
+              unidad_cobro TEXT NOT NULL DEFAULT 'Por definir'
+                CHECK (unidad_cobro IN ('Precio fijo','Por hora','Por etapa','Mensual','Porcentaje','Por definir')),
+              responsable_sugerido TEXT NOT NULL DEFAULT 'Por definir'
+                CHECK (responsable_sugerido IN ('Socio / Notario','Abogada asociada','Manager','Asistente legal','Equipo mixto','Por definir')),
+              tarifa_referencia_cents INTEGER NOT NULL DEFAULT 0 CHECK (tarifa_referencia_cents >= 0),
+              costo_referencia_cents INTEGER NOT NULL DEFAULT 0 CHECK (costo_referencia_cents >= 0),
+              margen_referencia_cents INTEGER GENERATED ALWAYS AS (tarifa_referencia_cents - costo_referencia_cents) STORED,
+              horas_estandar NUMERIC(6,2) NOT NULL DEFAULT 0 CHECK (horas_estandar >= 0),
+              estado TEXT NOT NULL DEFAULT 'Activo' CHECK (estado IN ('Activo','Inactivo','En diseño')),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(subcategory_id, nombre)
+            );
+            CREATE INDEX IF NOT EXISTS idx_servicios_subcategory ON servicios(subcategory_id, estado);
+            CREATE INDEX IF NOT EXISTS idx_servicios_nombre ON servicios(lower(nombre));
+
+            CREATE TABLE IF NOT EXISTS historial_catalogo (
+              id SERIAL PRIMARY KEY,
+              tipo_registro TEXT NOT NULL CHECK (tipo_registro IN ('Categoria','Subcategoria','Servicio')),
+              entity_id INTEGER NOT NULL,
+              version_anterior JSONB NOT NULL,
+              usuario_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              fecha_cambio TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_historial_catalogo_entity ON historial_catalogo(tipo_registro, entity_id)
+        """)
+        _set_schema_version(conn, 20)
+
+    # v21: plan de cuentas, personal, gastos fijos, supuestos financieros
+    if v < 21:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS plan_cuentas (
+              id SERIAL PRIMARY KEY,
+              account_code TEXT NOT NULL UNIQUE,
+              tipo TEXT NOT NULL CHECK (tipo IN ('Ingreso','Egreso')),
+              grupo TEXT NOT NULL,
+              subgrupo TEXT,
+              nombre TEXT NOT NULL,
+              naturaleza TEXT NOT NULL
+                CHECK (naturaleza IN ('Operativo','Fijo','Variable','Directo','Inversión','Otros','Fijo/Variable')),
+              family_id INTEGER REFERENCES familias(id) ON DELETE SET NULL,
+              category_id INTEGER REFERENCES categorias(id) ON DELETE SET NULL,
+              centro_costo TEXT NOT NULL
+                CHECK (centro_costo IN ('Operación jurídica','Administración','Comercial','Tecnología','Comercial y administración')),
+              afecta_utilidad BOOLEAN NOT NULL DEFAULT TRUE,
+              estado TEXT NOT NULL DEFAULT 'Activo' CHECK (estado IN ('Activo','Inactivo')),
+              regla_de_uso TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_plan_cuentas_tipo ON plan_cuentas(tipo, estado);
+
+            CREATE TABLE IF NOT EXISTS personal (
+              id SERIAL PRIMARY KEY,
+              person_code TEXT NOT NULL UNIQUE,
+              persona TEXT NOT NULL,
+              cargo TEXT,
+              monto_mensual_cents INTEGER NOT NULL DEFAULT 0 CHECK (monto_mensual_cents >= 0),
+              mes_inicio TEXT NOT NULL,
+              mes_fin TEXT,
+              estado TEXT NOT NULL DEFAULT 'Activo' CHECK (estado IN ('Activo','Inactivo')),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS gastos_fijos (
+              id SERIAL PRIMARY KEY,
+              expense_code TEXT NOT NULL UNIQUE,
+              concepto TEXT NOT NULL,
+              tipo TEXT NOT NULL CHECK (tipo IN ('Fijo','Estimado','Meta')),
+              monto_mensual_cents INTEGER NOT NULL DEFAULT 0 CHECK (monto_mensual_cents >= 0),
+              mes_inicio TEXT NOT NULL,
+              mes_fin TEXT,
+              estado TEXT NOT NULL DEFAULT 'Activo' CHECK (estado IN ('Activo','Inactivo')),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS supuestos_financieros (
+              id SERIAL PRIMARY KEY,
+              periodo TEXT NOT NULL UNIQUE,
+              costo_variable_pct NUMERIC(6,4) NOT NULL CHECK (costo_variable_pct >= 0 AND costo_variable_pct < 1),
+              margen_operativo_meta_pct NUMERIC(6,4) NOT NULL CHECK (margen_operativo_meta_pct >= 0 AND margen_operativo_meta_pct < 1),
+              margen_seguridad_pct NUMERIC(6,4) NOT NULL CHECK (margen_seguridad_pct >= 0),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+        """)
+        _set_schema_version(conn, 21)
+
+    # v22: pipeline comercial (oportunidades) — previo al expediente
+    if v < 22:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS oportunidades (
+              id SERIAL PRIMARY KEY,
+              client_id INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+              prospecto_nombre TEXT,
+              prospecto_contacto TEXT,
+              service_id INTEGER REFERENCES servicios(id) ON DELETE SET NULL,
+              canal_captacion TEXT NOT NULL CHECK (canal_captacion IN ('Instagram','Google','LinkedIn','Referido','Otro')),
+              origen_negocio TEXT NOT NULL CHECK (origen_negocio IN ('Andrea','Alfredo','Guadalupe','Referido','Orgánico','Otro')),
+              estado TEXT NOT NULL DEFAULT 'Prospecto' CHECK (estado IN ('Prospecto','Cotizado','Ganado','Perdido')),
+              motivo_perdida TEXT,
+              case_id INTEGER REFERENCES cases(id) ON DELETE SET NULL,
+              fecha_prospecto TEXT NOT NULL,
+              fecha_cotizado TEXT,
+              fecha_cierre TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              CONSTRAINT chk_oportunidad_cliente_o_prospecto CHECK (client_id IS NOT NULL OR prospecto_nombre IS NOT NULL)
+            );
+            CREATE INDEX IF NOT EXISTS idx_oportunidades_estado ON oportunidades(estado);
+        """)
+        if not _column_exists(conn, "cases", "opportunity_id"):
+            conn.execute("ALTER TABLE cases ADD COLUMN opportunity_id INTEGER REFERENCES oportunidades(id) ON DELETE SET NULL")
+        _set_schema_version(conn, 22)
+
+    # v23: expedientes — clasificación por servicio, campos financieros y gestión de tiempos
+    if v < 23:
+        if not _column_exists(conn, "cases", "service_id"):
+            conn.execute("ALTER TABLE cases ADD COLUMN service_id INTEGER REFERENCES servicios(id) ON DELETE SET NULL")
+        if not _column_exists(conn, "cases", "honorarios_contratados_cents"):
+            conn.execute(
+                "ALTER TABLE cases ADD COLUMN honorarios_contratados_cents INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (honorarios_contratados_cents >= 0)"
+            )
+        if not _column_exists(conn, "cases", "costos_directos_estimados_cents"):
+            conn.execute(
+                "ALTER TABLE cases ADD COLUMN costos_directos_estimados_cents INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (costos_directos_estimados_cents >= 0)"
+            )
+        if not _column_exists(conn, "cases", "mes_cobro_esperado"):
+            conn.execute("ALTER TABLE cases ADD COLUMN mes_cobro_esperado TEXT")
+        if not _column_exists(conn, "cases", "estado_cobro"):
+            # Campo NUEVO e independiente de `status` (progreso legal). Este trackea el ciclo de
+            # facturación/cobro que pide el Archivo Maestro, sin tocar el status ya usado por
+            # alertas y badges existentes.
+            conn.execute(
+                "ALTER TABLE cases ADD COLUMN estado_cobro TEXT NOT NULL DEFAULT 'En ejecución' "
+                "CHECK (estado_cobro IN ('En ejecución','Finalizado pendiente de facturar','Facturado pendiente de cobro','Cobrado','Suspendido'))"
+            )
+        if not _column_exists(conn, "cases", "fecha_cierre_estimada"):
+            conn.execute("ALTER TABLE cases ADD COLUMN fecha_cierre_estimada TEXT")
+        if not _column_exists(conn, "cases", "fecha_cierre_real"):
+            conn.execute("ALTER TABLE cases ADD COLUMN fecha_cierre_real TEXT")
+        if not _column_exists(conn, "cases", "proxima_accion"):
+            conn.execute("ALTER TABLE cases ADD COLUMN proxima_accion TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_service ON cases(service_id)")
+        _set_schema_version(conn, 23)
+
+    # v24: movimientos financieros — código de cuenta, código de servicio y desglose
+    # bruto/IVA/reembolsable/neto operativo en incomes/expenses/costs. `amount_cents`
+    # (ya existente) se conserva como el monto bruto — no se renombra para no romper
+    # facturas, dashboard ni el resto del código que ya lo usa.
+    if v < 24:
+        for table in ("incomes", "expenses", "costs"):
+            if not _column_exists(conn, table, "account_id"):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN account_id INTEGER REFERENCES plan_cuentas(id) ON DELETE SET NULL")
+            if not _column_exists(conn, table, "service_id"):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN service_id INTEGER REFERENCES servicios(id) ON DELETE SET NULL")
+            if not _column_exists(conn, table, "monto_iva_cents"):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN monto_iva_cents INTEGER NOT NULL DEFAULT 0 CHECK (monto_iva_cents >= 0)")
+            if not _column_exists(conn, table, "monto_reembolsable_cents"):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN monto_reembolsable_cents INTEGER NOT NULL DEFAULT 0 CHECK (monto_reembolsable_cents >= 0)")
+            if not _column_exists(conn, table, "monto_neto_operativo_cents"):
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN monto_neto_operativo_cents INTEGER "
+                    "GENERATED ALWAYS AS (amount_cents - monto_iva_cents - monto_reembolsable_cents) STORED"
+                )
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_account ON {table}(account_id)")
+        _set_schema_version(conn, 24)
+
+    # v25: presupuesto por familia (meta mensual) para proyección de cierre de mes
+    if v < 25:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS forecast (
+              id SERIAL PRIMARY KEY,
+              family_id INTEGER NOT NULL REFERENCES familias(id) ON DELETE CASCADE,
+              mes TEXT NOT NULL,
+              volumen_meta INTEGER NOT NULL DEFAULT 0 CHECK (volumen_meta >= 0),
+              ticket_objetivo_cents INTEGER NOT NULL DEFAULT 0 CHECK (ticket_objetivo_cents >= 0),
+              ingreso_proyectado_cents INTEGER GENERATED ALWAYS AS (volumen_meta * ticket_objetivo_cents) STORED,
+              margen_directo_objetivo_pct NUMERIC(6,4) NOT NULL DEFAULT 0 CHECK (margen_directo_objetivo_pct >= 0 AND margen_directo_objetivo_pct < 1),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(family_id, mes)
+            );
+            CREATE INDEX IF NOT EXISTS idx_forecast_mes ON forecast(mes);
+        """)
+        _set_schema_version(conn, 25)
+
+    # v26: comisión multi-originador — reparto por expediente + registros de comisión
+    # calculados por cobro individual, acumulados por persona y mes.
+    if v < 26:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS negocio_originadores (
+              id SERIAL PRIMARY KEY,
+              case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+              personal_id INTEGER NOT NULL REFERENCES personal(id) ON DELETE RESTRICT,
+              porcentaje_participacion NUMERIC(5,2) NOT NULL CHECK (porcentaje_participacion > 0 AND porcentaje_participacion <= 100),
+              tipo_origen TEXT NOT NULL CHECK (tipo_origen IN ('Cliente nuevo','Venta cruzada')),
+              created_at TEXT NOT NULL,
+              UNIQUE(case_id, personal_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_negocio_originadores_case ON negocio_originadores(case_id);
+
+            CREATE TABLE IF NOT EXISTS comisiones (
+              id SERIAL PRIMARY KEY,
+              income_id INTEGER NOT NULL REFERENCES incomes(id) ON DELETE CASCADE,
+              case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+              personal_id INTEGER NOT NULL REFERENCES personal(id) ON DELETE RESTRICT,
+              tipo_origen TEXT NOT NULL CHECK (tipo_origen IN ('Cliente nuevo','Venta cruzada')),
+              porcentaje_participacion NUMERIC(5,2) NOT NULL,
+              base_utilidad_directa_cents INTEGER NOT NULL CHECK (base_utilidad_directa_cents >= 0),
+              comision_cents INTEGER NOT NULL,
+              mes_reconocimiento TEXT NOT NULL,
+              ajusta_a_commission_id INTEGER REFERENCES comisiones(id) ON DELETE SET NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_comisiones_persona_mes ON comisiones(personal_id, mes_reconocimiento);
+            CREATE INDEX IF NOT EXISTS idx_comisiones_income ON comisiones(income_id);
+        """)
+        _set_schema_version(conn, 26)
+
+    # v27: gobierno del catálogo — solicitudes de alta/cambio con código propuesto
+    # (tentativo, editable) separado del código definitivo (solo se asigna al aprobar).
+    if v < 27:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS solicitudes_catalogo (
+              id SERIAL PRIMARY KEY,
+              solicitud_code TEXT NOT NULL UNIQUE,
+              fecha_solicitud TEXT NOT NULL,
+              tipo_solicitud TEXT NOT NULL CHECK (tipo_solicitud IN ('Alta','Cambio','Baja')),
+              tipo_registro TEXT NOT NULL CHECK (tipo_registro IN ('Categoria','Subcategoria','Servicio','Familia')),
+              nombre_propuesto TEXT NOT NULL,
+              categoria_padre TEXT,
+              subcategoria_padre TEXT,
+              codigo_propuesto TEXT NOT NULL,
+              codigo_definitivo TEXT,
+              descripcion TEXT,
+              motivo TEXT,
+              etiquetas TEXT,
+              solicitante TEXT NOT NULL,
+              resultado_revision_duplicidad TEXT,
+              aprobador TEXT,
+              fecha_aprobacion TEXT,
+              estado TEXT NOT NULL DEFAULT 'Solicitado'
+                CHECK (estado IN ('Solicitado','En revisión','Aprobado','Rechazado','Activo','Inactivo')),
+              observaciones TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_solicitudes_estado ON solicitudes_catalogo(estado);
+        """)
+        _set_schema_version(conn, 27)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 

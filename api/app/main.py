@@ -11,17 +11,22 @@ from .limiter import limiter
 from .auth.router import router as auth_router
 from .routers import (
     attachments,
+    catalogo,
     cases,
     categories,
     clients,
+    comisiones,
     costs,
     dashboard,
     expenses,
+    finanzas,
+    gobierno,
     google_cal,
     outlook_cal,
     incomes,
     invoices,
     payroll,
+    pipeline,
     reminders,
     roles,
     sessions,
@@ -63,6 +68,11 @@ app.include_router(incomes.router)
 app.include_router(expenses.router)
 app.include_router(costs.router)
 app.include_router(categories.router)
+app.include_router(catalogo.router)
+app.include_router(finanzas.router)
+app.include_router(pipeline.router)
+app.include_router(comisiones.router)
+app.include_router(gobierno.router)
 app.include_router(payroll.router)
 app.include_router(users.router)
 app.include_router(dashboard.router)

@@ -1,0 +1,189 @@
+# Plan de implementación — Catálogo, Finanzas, Presupuesto y Comisión (AG Legal)
+
+Basado en las 20 hojas de `AG Legal Archivo Maestro2026.xlsx` (revisión exhaustiva, no solo `00_PARA_DESARROLLADOR` y `13_Especificacion_Sistema`) más la retroalimentación de aprobación recibida sobre la primera versión de esta propuesta.
+
+Contrastado contra el sistema ya existente:
+- **Backend**: FastAPI + PostgreSQL, sin ORM (`aglegal/db.py` con `SCHEMA_SQL` + migraciones incrementales por `schema_version`, actualmente v19 — ver Fase 0). Rutas en `api/app/routers/`.
+- **Frontend**: Vite + React + TS + Tailwind, TanStack Query, en `PROYECTOAGLEGALFRONT/src`.
+
+> **Historial de revisiones de este documento:** v1 cubría solo las hojas 00/13/12/18. v2 (esta) incorpora la lectura completa de las 20 hojas — que corrigió una decisión ya "acordada" (familia ≠ subcategoría) — más los 7 puntos de retroalimentación del revisor. Ver "Registro de cambios" al final.
+
+## Estado de avance (actualizado en cada corte de sesión)
+
+| Fase | Estado | `schema_version` | Módulo frontend |
+|---|---|---|---|
+| 0 — Fix `outlook_tokens` | ✅ Completada | v19 | — |
+| 1 — Catálogo maestro | ✅ Completada | v20 | `/catalogo` |
+| 2 — Plan de cuentas, personal, gastos fijos | ✅ Completada | v21 | `/finanzas` |
+| 3 — Pipeline comercial | ✅ Completada | v22 | `/pipeline` |
+| 4 — Expedientes | ✅ Completada | v23 | `/cases` (extendido) |
+| 5 — Movimientos financieros (incomes/expenses/costs) | ✅ Completada | v24 | `/cashflow` (extendido) |
+| 6 — Clientes (indicadores) | ✅ Completada | v24 (sin migración) | `/clients` (extendido) |
+| 7 — Presupuesto y proyección | ✅ Completada | v25 | `/finanzas` (pestaña "Presupuesto") |
+| 8 — Comisión multi-originador | ✅ Completada | v26 | `/comisiones` (nuevo) + `/cases` (extendido) |
+| 9 — Realidad, cumplimiento y Dashboard | ✅ Completada | v26 (sin migración) | `/` (reorganizado en 3 pestañas) |
+| 10 — Gobierno del catálogo | ✅ Completada | v27 | `/gobierno-catalogo` (nuevo) |
+
+**Las 10 fases del plan están completas.** No queda ningún punto pendiente de los 8 bloques originales del cliente ni de los 7 puntos de retroalimentación del revisor — ver el detalle fase por fase abajo. Si aparece trabajo nuevo, es una iteración/mejora sobre lo ya construido, no una fase pendiente.
+
+**Cómo verificar que el estado de arriba sigue siendo cierto:** `SELECT value FROM meta WHERE key='schema_version'` en la base local debe devolver `27`. Si es distinto, alguien corrió una migración fuera de esta conversación — confiar en la base, no en esta tabla.
+
+**Reglas que se mantuvieron en las 4 fases construidas** (para no repetir el patrón cada vez que se retome):
+- Todo código (`category_code`, `service_code`, `account_code`, `person_code`, `expense_code`, `family_code`) es **inmutable por diseño de API** — el campo simplemente no existe en los endpoints de edición, no hay lógica condicional que lo permita "a veces".
+- Cada tabla nueva sembrada con datos reales se llena leyendo el Excel directamente en `scripts/seed_*.py` (nunca datos transcritos a mano) y es idempotente (marca en `meta`).
+- Todo lo construido se verificó en 3 capas antes de darlo por hecho: smoke test de repositorio → smoke test HTTP → verificación visual en Chrome real vía `puppeteer-core` apuntando al Chrome ya instalado (sin descargar navegador nuevo). Los datos de prueba siempre se limpian al terminar.
+- `npx tsc --noEmit` y `npm run build` limpios antes de cerrar cualquier fase de frontend.
+
+### Correcciones descubiertas *durante* la construcción (no estaban en el plan v2)
+
+- **Categorías reales = 16, no 20.** Dije "20" varias veces en la propuesta original (incluido el PDF) — el conteo real de `01_Categorias` es 16 (13 con familia asignada, `FAM`/`REL`/`CTR` sin familia todavía). No afecta el diseño, solo la cifra que había comunicado mal.
+- **`estado_cobro` es un campo nuevo, no un reemplazo de `cases.status`.** El plan original (Fase 4) no distinguía esto. Antes de tocar `cases` mapeé dónde se usa `status` hoy (alertas de "expediente sin movimiento", 5 copias de badges en el frontend, la app de escritorio descontinuada) y decidí agregar `estado_cobro` como campo independiente con el enum del Excel (En ejecución → Finalizado pendiente de facturar → Facturado pendiente de cobro → Cobrado → Suspendido), dejando `status` (Abierto/En trámite/En pausa/Cerrado) intacto para el progreso legal. Cero blast radius sobre lo existente.
+- **`cases.opportunity_id` y `cases.service_id` se adelantaron a la Fase 3** (no a la 4 como decía el plan original) porque "Ganado crea el expediente automáticamente" no se puede cumplir sin ellos. La Fase 4 terminó de completar el resto de columnas financieras de `cases`.
+- **`amount_cents` no se renombró a "monto_bruto".** En vez de renombrar la columna existente de `incomes`/`expenses`/`costs` (usada por facturas, dashboard y código legado), se mantuvo `amount_cents` como el monto bruto y se agregaron `monto_iva_cents`/`monto_reembolsable_cents` (capturados) + `monto_neto_operativo_cents` (columna `GENERATED ALWAYS AS (amount_cents - monto_iva_cents - monto_reembolsable_cents) STORED`, no se puede desincronizar). Cero blast radius sobre facturas/dashboard existentes.
+- **`service_id` se agregó a las tres tablas (`incomes`/`expenses`/`costs`) a nivel de esquema por consistencia, pero solo se expone en la API/UI para `incomes` y `costs`.** Los gastos generales (alquiler, nómina, papelería) no llevan servicio según el propio Excel ("código servicio = No aplica" en sus ejemplos de gasto) — la columna queda ahí para el futuro pero no se le pidió al usuario que la llene en `ExpensesTab`.
+- **`plan_cuentas` valida el tipo contra el movimiento.** No se puede registrar un ingreso contra una cuenta `Egreso` ni viceversa (`_validate_movement_account` en el repositorio) — evita que el desglose bruto/IVA/reembolsable termine sumado a la cuenta equivocada.
+- **`cases.saldo_pendiente` pasó de sumar `incomes.amount_cents` (bruto) a `incomes.monto_neto_operativo_cents` (neto).** Un cobro con IVA/reembolsable ya no infla el saldo pendiente del expediente con dinero que no es honorario real. Se agregó también `costos_directos_reales_cents` (suma de `costs.monto_neto_operativo_cents` del expediente) junto al estimado que ya existía.
+- **Dos bugs preexistentes encontrados y corregidos de paso en la Fase 6** (no introducidos por este plan, ya rompían `/clients/{id}/statement` en producción antes de esta sesión): la consulta de facturas usaba una columna `issued_at` que nunca existió en `invoices` (la real es `invoice_date`) y la de ingresos usaba `description` en vez de `detail`. Ambas hacían que el endpoint devolviera 500 siempre — se corrigieron con alias (`invoice_date AS issued_at`, `detail AS description`) para no tocar el contrato que ya consumía el frontend.
+- **Probabilidad de cobro por `estado_cobro` [por defecto — el Excel no la define].** Necesaria para ponderar la cartera pendiente (Fase 7) pero no viene en ninguna hoja. Usé: En ejecución 40%, Finalizado pendiente de facturar 70%, Facturado pendiente de cobro 90%, Cobrado 100%, Suspendido 5%. Vive como constante (`PROBABILIDAD_COBRO_POR_ESTADO` en `repositories.py`) — fácil de ajustar si el cliente da cifras reales más adelante.
+- **Fase 7 se integró como pestaña nueva ("Presupuesto") dentro de `/finanzas`, no como página nueva independiente.** El plan original decía "nuevo" módulo; en la práctica encaja mejor junto a Plan de Cuentas/Personal/Gastos Fijos/Punto de Equilibrio porque comparten el mismo dominio (planeación financiera) y el mismo selector de mes — evita fragmentar la navegación sin perder nada de la funcionalidad pedida.
+- **`tipo_origen` se redujo a 2 valores, no 3 [corrige el plan original].** La v1 de este documento proponía "Cliente nuevo/Venta cruzada/Cliente existente"; `12_Reglas_Comision` solo define reglas reales para dos (COM-001/002/003 tiered 10/12/15% para cliente nuevo, COM-004 plano 5% para venta cruzada). No hay una tercera regla que aplicar a "Cliente existente", así que se dejó fuera — agregar un tercer valor sin una regla de cálculo asociada solo generaría un estado inválido.
+- **Costo directo atribuido a cada cobro [por defecto — el Excel no lo especifica a nivel de cobro individual].** La utilidad directa de UN cobro (`income`) se calcula como `monto_neto_operativo_del_cobro × ratio_margen_directo_del_expediente`, donde el ratio = `1 − (costos_directos_reales_del_expediente / honorarios_contratados_del_expediente)`. Se eligió esta regla (en vez de ir restando costos cobro por cobro en orden de llegada) porque no depende del orden de los pagos y es más fácil de auditar: cada cobro del mismo expediente lleva el mismo % de margen.
+- **Probabilidad de cobro ya existía de la Fase 7** (`PROBABILIDAD_COBRO_POR_ESTADO`) — no se tocó para Fase 8, son conceptos independientes (una pondera cartera pendiente, la otra calcula comisión sobre lo ya cobrado).
+- **"Expedientes sin movimiento" ya existía parcialmente antes de la Fase 9** (alerta `stale_cases`, basada en última sesión registrada) — se reutilizó y solo se le agregó un umbral configurable (`stale_days`, por defecto 15, antes estaba fijo en 30) en vez de reconstruir la definición desde cero.
+- **Costo directo atribuido a cada cobro, para "utilidad directa por abogado" [mismo criterio que la Fase 8]:** se reutilizó exactamente el mismo enfoque que ya se había decidido para comisiones (ratio de margen directo del expediente aplicado proporcionalmente), esta vez usando `monto_neto_operativo_cents` directo de `incomes`/`costs` agrupado por `cases.responsible_username` en vez de por persona — consistencia entre ambas fases en vez de dos reglas distintas para el mismo concepto.
+- **"Días de cobro" (tu punto 1, segunda mitad) no se implementó en esta fase [alcance limitado].** "Días promedio de atención" ya se cubre con `tiempos_atencion()` (Fase 4). El promedio de días entre apertura y cobro efectivo no tiene todavía una fuente de datos limpia (un expediente puede cobrarse en varios pagos parciales) y se dejó fuera para no construir una métrica ambigua a la carrera — queda como pendiente explícito, no como olvido.
+- **`cumplimiento_por_familia()` es nuevo (no estaba en el plan original de la Fase 9)** — compara la meta de presupuesto de la Fase 7 (`forecast`) contra lo realmente cobrado ese mes por familia, replicando la hoja `15_Cumplimiento_Metas` del Excel. Se agregó porque el punto "cumplimiento de volumen por familia" del plan operativo no tenía todavía ninguna fuente de datos construida.
+- **Fase 10 no crea automáticamente la categoría/subcategoría/servicio/familia real al aprobar una solicitud.** `18_Procedimiento_Catalogo` separa "Aprobación" (paso 5, decisión formal) de "Activación" (paso 6, "crear el registro maestro y habilitarlo para uso" — responsable distinto: administrador del sistema, no administrador del catálogo). Se respetó esa separación: aprobar una solicitud asigna el código definitivo y la deja en estado `Aprobado`; crear el registro real en `/catalogo` sigue siendo un paso manual del administrador, y marcar la solicitud como `Activo` es una confirmación separada de que ya se hizo. Automatizarlo habría requerido que el formulario de solicitud capturara todos los campos de un servicio completo (tarifa, unidad de cobro, responsable sugerido, etc.), que la Fase 1 ya resuelve mejor.
+- **`tipo_registro` de la solicitud no incluye validación cruzada contra el catálogo real en el momento de crear la solicitud** — el código propuesto es una sugerencia de texto libre (como en la hoja de Excel), no se valida unicidad contra `categorias`/`subcategorias`/`servicios`/`familias` hasta el paso de Aprobación, que sí valida que el código definitivo no choque con otra solicitud ya aprobada. Coincide con el paso 4 del procedimiento ("Validar unicidad global") ocurriendo antes de la aprobación, no en la solicitud inicial.
+
+## Decisiones y valores por defecto (todo lo que antes eran huecos)
+
+Marcado **[confirmado]** lo que viene explícito del Excel o de tu retroalimentación; **[por defecto — avisa si no]** lo que yo propongo y voy a construir así salvo que me corrijas; **[abierto]** lo único que de verdad necesito que me contestes antes de tocar código de comisiones.
+
+1. **Familia ≠ subcategoría [confirmado, corrige la v1].** Es una entidad propia con código `FAM-01`…`FAM-13`, hoy mapeada 1 a 1 con 13 de las 20 categorías (`04_Plan_Cuentas`). Es la que se usa en presupuesto, plan de cuentas y cumplimiento — no la subcategoría.
+2. **Reparto de gastos fijos entre familias [por defecto].** Proporcional al peso de cada familia en la meta de ingresos del mes (cuadra con los números de `15_Cumplimiento_Metas`: $102.5 de $2,255 a FAM-01 = 140/3080).
+3. **Estados del expediente [por defecto, resuelto por tu punto 4].** Con el pipeline comercial nuevo (ver Fase 3), "Cotizado" y "Aceptado" salen del expediente y viven en la oportunidad. El expediente solo existe desde que el negocio está **ganado**, así que usa la lista operativa de `11_Listas`: Pendiente de cotización → En ejecución → Finalizado pendiente de facturar → Facturado pendiente de cobro → Cobrado → Suspendido.
+4. **Estado "En diseño" en servicios [por defecto].** Servicio en borrador, existe en el catálogo pero no aparece como opción al crear expedientes hasta pasar a Activo.
+5. **"Responsable" = persona, no rol [confirmado por tu punto 2].** Tu pedido de "rentabilidad por abogado" solo es posible si Responsable es una persona concreta, no un rol genérico como "Socio/Notario". Uso el `responsible_username` que ya existe en `cases` (ligado a `users`). El campo "Responsable" de rol en el catálogo de servicios (`03_Catalogo_Servicios`) queda como **sugerencia por defecto** al crear el expediente, no como el dato que alimenta reportes.
+6. **`personal` (PER-XXX) es un catálogo de costos, no de asignación.** Alimenta gastos fijos (salarios) y comisión; quien atiende el expediente sigue siendo `responsible_username` de `users`. Si quieres que coincidan 1 a 1 (que cada usuario del sistema tenga también su código PER-XXX), lo agrego como columna opcional de enlace.
+7. **Origen del negocio ≠ canal de captación [confirmado por tu punto 4].** Son dos cosas distintas que antes tenía mezcladas:
+   - `origen_negocio` (Andrea/Alfredo/Guadalupe/Referido/Orgánico/Otro): **quién** generó el negocio — es la base de la comisión.
+   - `canal_captacion` (nuevo, en la oportunidad): **por dónde** llegó el cliente — Instagram/Google/LinkedIn/Referido/Otro — es para medir ROI de marketing, no paga comisión.
+8. **Comisión con varios originadores [confirmado — se construye desde ahora].** El motor no se limita a un originador único; ver diseño en Fase 8.
+
+## Registro de cambios frente a la v1 que ya viste
+
+- **Corregido:** familia (no subcategoría) es la unidad del presupuesto.
+- **Agregado — catálogos que faltaban por completo:** `familias`, `personal`, `gastos_fijos`, supuestos financieros globales (costo variable %, margen operativo meta %, margen de seguridad %).
+- **Agregado — campos que faltaban en tablas ya planeadas:** `servicios.unidad_cobro/responsable_sugerido/horas_estandar/margen_referencia`; `plan_cuentas.subgrupo/naturaleza/centro_costo/afecta_utilidad/familia_relacionada`; `cases.proxima_accion`; `solicitudes_catalogo.codigo_propuesto` separado de `codigo_definitivo`.
+- **Agregado — tu retroalimentación de esta ronda:** fechas de cierre y duración en expedientes; pipeline comercial completo (nuevo módulo, antes del expediente); indicadores de cliente; dashboard reorganizado en comercial/operativo/financiero + rentabilidad por abogado; proyección de cierre de mes; alertas automáticas; escenarios de comisión (parciales, ajustes, dos personas).
+- **Nota aparte (no bloquea nada):** el histórico operado marzo–julio (`04_Registro_Operaciones`) usa códigos de servicio distintos a los del catálogo vigente (ej. `AGL-NOT-INM-001` vs el actual `AGL-NOT-EST-001`) — va a necesitar un mapeo manual antes de migrarse, no es un problema del sistema nuevo.
+
+---
+
+## Fases
+
+### Fase 0 — Ya hecho ✅
+Migración `v19`: se creó la tabla `outlook_tokens` que el código ya usaba pero no existía en el esquema.
+
+### Fase 1 — Catálogo maestro (categorías, subcategorías, servicios, familias) ✅ Completada
+**Archivos:** `aglegal/db.py` (migración v20), `aglegal/repositories.py` (sección "Catálogo maestro"), `api/app/routers/catalogo.py`, `api/app/schemas/catalogo.py`, `scripts/seed_catalogo.py`, frontend `src/pages/Catalogo.tsx` + `src/api/catalogo.ts`.
+**Sembrado:** 16 categorías, 79 subcategorías, 13 familias, 205 servicios — leídos directo del Excel.
+**Objetivo:** jerarquía completa con códigos permanentes, incluida la familia que faltaba.
+- `categorias` (`category_id`, `category_code`, nombre, estado, timestamps).
+- `subcategorias` (`subcategory_id`, `subcategory_code`, `category_id`, nombre, estado).
+- `servicios` (`service_id`, `service_code` `AGL-CAT-SUB-000`, `subcategory_id`, nombre, etiquetas, **`unidad_cobro`** [Precio fijo/Por hora/Por etapa/Mensual/Porcentaje], **`responsable_sugerido`** [rol, ej. "Socio/Notario"], tarifa referencia, costo referencia, **`horas_estandar`**, **`margen_referencia`** [calculado = tarifa−costo], estado [Activo/Inactivo/**En diseño**]).
+- **`familias`** (nuevo) (`family_id`, `family_code` `FAM-01`…, nombre, `category_id` relacionada).
+- `historial_catalogo` (versión anterior en JSON, usuario, fecha) para categoría/subcategoría/servicio.
+- Migrar datos existentes de `categories`(kind='service') + `service_products`.
+- **Criterio de aceptación:** creo categoría → subcategoría → servicio con código autogenerado; el servicio "En diseño" no aparece al crear expedientes; margen de referencia se recalcula solo.
+
+### Fase 2 — Plan de cuentas, personal y gastos fijos ✅ Completada
+**Archivos:** `aglegal/db.py` (migración v21), `aglegal/repositories.py` (plan de cuentas/personal/gastos fijos/supuestos/punto de equilibrio), `api/app/routers/finanzas.py`, `api/app/schemas/finanzas.py`, `scripts/seed_finanzas.py`, frontend `src/pages/Finanzas.tsx` + `src/api/finanzas.ts`.
+**Sembrado:** 36 cuentas, 3 personas, 5 gastos fijos, supuestos 2026 (10%/20%/15%). Punto de equilibrio de agosto verificado exacto contra el Excel: $2,505.56 / $2,881.39 / $3,221.43.
+**Objetivo:** todo movimiento de dinero tiene cuenta, y los costos fijos dejan de ser una sola cifra manual.
+- `plan_cuentas` (`account_code` `ING-XXX-000`/`EGR-XXX-000`, tipo, grupo, **`subgrupo`**, **`naturaleza`** [Operativo/Fijo/Variable/Directo/**Inversión**/Otros — reemplaza el booleano `es_fijo` de la v1], `familia_relacionada`, `categoria_relacionada`, **`centro_costo`**, **`afecta_utilidad`** [booleano — ej. compra de equipo no cuenta como gasto operativo], estado, **`regla_de_uso`**).
+- **`personal`** (nuevo) (`PER-XXX`, persona, cargo, monto mensual, mes inicio/fin) — alimenta gastos fijos, no la asignación de expedientes.
+- **`gastos_fijos`** (nuevo) (`GF-XXX`, concepto, tipo [Fijo/Estimado/Meta], monto mensual, vigencia).
+- **`supuestos_financieros`** (nuevo, uno por período) (costo variable %, margen operativo meta %, margen de seguridad %) — de aquí sale el punto de equilibrio calculado: `gastos_fijos / (1 - %costo_variable)`.
+- **Criterio de aceptación:** una compra de equipo con cuenta `afecta_utilidad = No` no reduce la utilidad operativa del dashboard; el punto de equilibrio se recalcula solo si cambian los supuestos.
+
+### Fase 3 — Pipeline comercial (nuevo, tu punto 4) ✅ Completada
+**Archivos:** `aglegal/db.py` (migración v22: tabla `oportunidades` + `cases.opportunity_id`), `aglegal/repositories.py` (máquina de estados `transition_oportunidad`), `api/app/routers/pipeline.py`, `api/app/schemas/pipeline.py`, frontend `src/pages/Pipeline.tsx` (tablero por columnas) + `src/api/pipeline.ts`.
+**Nota de alcance:** el expediente que se autogenera al marcar "Ganado" usa por ahora solo los campos que `cases` ya tenía en ese momento (cliente, área, título) — se enriqueció con el resto de campos en la Fase 4.
+**Objetivo:** dar seguimiento a un negocio antes de que exista expediente.
+- `oportunidades` (`opportunity_id`, cliente o prospecto libre si aún no es cliente, servicio tentativo, `canal_captacion` [Instagram/Google/LinkedIn/Referido/Otro], `origen_negocio` [para comisión], estado [Prospecto → Cotizado → Ganado/Perdido], `motivo_perdida`, fecha de cada transición).
+- Al pasar a "Ganado" se crea automáticamente el expediente, heredando cliente, servicio y origen.
+- Alimenta directamente el KPI de conversión comercial (Ganados/Cotizados) que antes tenía que inferir del estado del expediente.
+- **Criterio de aceptación:** un prospecto marcado "Perdido" pide motivo y no genera expediente; uno "Ganado" crea el expediente sin recapturar datos.
+
+### Fase 4 — Expedientes ✅ Completada
+**Archivos:** `aglegal/db.py` (migración v23), `aglegal/repositories.py` (`create_case`/`update_case` extendidos, `tiempos_atencion`), `api/app/routers/cases.py`, `api/app/schemas/case.py`, frontend `src/pages/Cases.tsx` (extendido) + `src/api/cases.ts`.
+**Decisión de esta fase:** `estado_cobro` es un campo **nuevo**, no reemplaza `status` — ver "Correcciones descubiertas" arriba para el porqué.
+**Objetivo:** clasificación automática + campos financieros + gestión de tiempos (tu punto 1).
+- `service_id` (autocompleta categoría/subcategoría/familia), `honorarios_contratados`, `costos_directos_estimados`, `mes_cobro_esperado`, `saldo_pendiente` (calculado), `opportunity_id` (de dónde vino), originadores vía `negocio_originadores` (ver Fase 8 — reemplaza el `origen_negocio` de valor único).
+- **Nuevo (tu punto 1):** `fecha_cierre_estimada`, `fecha_cierre_real`, `dias_duracion` (calculado: cierre real − apertura, o hoy − apertura si sigue abierto).
+- **Nuevo:** `proxima_accion` (texto libre, ya existe en `05_Cartera_Proyectos` del Excel y no lo tenía contemplado).
+- **Criterio de aceptación:** al cerrar un expediente se captura fecha real y el sistema calcula días de duración sin intervención manual; puedo filtrar tiempos de atención por tipo de servicio. — **cumplido y verificado** (endpoint `GET /cases/tiempos-atencion`).
+
+### Fase 5 — Movimientos financieros (extender incomes/expenses/costs) ✅ Completada
+**Archivos:** `aglegal/db.py` (migración v24), `aglegal/repositories.py` (`_validate_movement_account`, `_INCOME_SELECT`/`_EXPENSE_SELECT`/`_COST_SELECT` con joins a `plan_cuentas`/`servicios`, `create_income`/`update_income`/`create_expense`/`update_expense`/`create_cost`/`update_cost` extendidos, `list_cases` actualizado), `api/app/schemas/{income,expense,cost}.py`, `api/app/routers/{incomes,expenses,costs}.py`, frontend `src/pages/Cashflow.tsx` (`CuentaSelect`, `ServicioPicker`, `NetoPreview` compartidos entre las 3 tabs) + `src/types/index.ts`.
+Se extendieron las tres tablas existentes (sin renombrar `amount_cents`) con `account_id` (obligatorio en UI, FK a `plan_cuentas`), `service_id` (solo en incomes/costs), `monto_iva_cents`, `monto_reembolsable_cents` y `monto_neto_operativo_cents` (columna generada).
+- **Criterio de aceptación:** un cobro contra un expediente reduce su saldo pendiente y alimenta utilidad directa real automáticamente. — **cumplido y verificado**: `cases.saldo_pendiente` ahora resta el neto operativo, no el bruto; probado end-to-end en navegador (gasto de ₡100,000 con IVA ₡13,000 + reembolsable ₡5,000 → neto ₡82,000 calculado por Postgres y mostrado correctamente en la tabla).
+- **Verificado:** `npx tsc --noEmit` y `npm run build` limpios; smoke test de repositorio (validación de tipo de cuenta, IVA+reembolsable > bruto rechazado); smoke test HTTP; verificación visual de las 3 tabs (Ingresos/Gastos/Costos Directos) con Chrome real vía `puppeteer-core`, incluyendo un alta real de principio a fin con limpieza posterior del dato de prueba.
+
+### Fase 6 — Clientes (nuevo, tu punto 3) ✅ Completada
+**Archivos:** `api/app/routers/clients.py` (endpoint `GET /clients/{id}/statement`, ya existente, extendido con el bloque `indicadores`), frontend `src/pages/Clients.tsx` (`StatementDialog`, sección nueva de 4 tarjetas antes del resumen financiero).
+**Objetivo:** indicadores de valor de cliente sin duplicar datos.
+- No se agregaron columnas a `clients` — se calculan al vuelo con 3 consultas agregadas sobre `cases` + `incomes` dentro del mismo endpoint que ya arma el estado de cuenta: `servicios_contratados` (`COUNT(DISTINCT service_id)` en `cases`), `facturacion_acumulada_cents` (`SUM(monto_neto_operativo_cents)` en `incomes`, no el bruto — consistente con la Fase 5), `ultimo_servicio` (`MAX(opened_at)` en `cases`), `cliente_recurrente` (`expedientes_totales >= 2`).
+- Se reutilizó el diálogo "Estado de cuenta" que ya existía (`StatementDialog`) en vez de crear una vista nueva — ya traía sesiones, expedientes y facturas del cliente, así que los 4 indicadores quedaron como una sección adicional en el mismo lugar donde el usuario ya buscaba esta información.
+- **Criterio de aceptación:** la ficha de un cliente muestra sus 4 indicadores actualizados sin necesidad de recalcular nada manualmente. — **cumplido y verificado**: probado con un cliente sintético (2 expedientes con servicios distintos + 1 ingreso con IVA) y confirmado end-to-end en navegador que los 4 valores calculados coinciden exactamente con los datos de prueba.
+
+### Fase 7 — Presupuesto y proyección ✅ Completada
+**Archivos:** `aglegal/db.py` (migración v25: tabla `forecast`), `aglegal/repositories.py` (`PROBABILIDAD_COBRO_POR_ESTADO`, CRUD de `forecast`, `cartera_pendiente_ponderada`, `proyeccion_cierre_mes`), `api/app/schemas/finanzas.py` (`ForecastIn/Update/Out`, `CarteraPonderadaOut`, `ProyeccionCierreMesOut`), `api/app/routers/finanzas.py` (endpoints `/finanzas/forecast`, `/finanzas/cartera-ponderada`, `/finanzas/proyeccion-cierre-mes`), `scripts/seed_forecast.py`, frontend `src/pages/Finanzas.tsx` (pestaña "Presupuesto": `ForecastDialog` + `PresupuestoTab`).
+**Sembrado:** 36 filas de presupuesto (6 familias × 6 meses jul-dic 2026) leídas de `08_Presupuesto_Jul_Dic`. Meta de agosto verificada exacta contra el Excel: $4,280.00.
+**Objetivo:** metas por familia + proyección de cierre de mes (tu punto 5).
+- `forecast` (`family_id`, `mes`, `volumen_meta`, `ticket_objetivo_cents`, `ingreso_proyectado_cents` [columna generada = volumen × ticket], `margen_directo_objetivo_pct`), único por familia+mes.
+- Cartera pendiente y ponderada (saldo pendiente × probabilidad según `estado_cobro`) vía `cartera_pendiente_ponderada()`.
+- **Nuevo (tu punto 5):** KPI "proyección de cierre de mes" = ingresos ya cobrados en el mes en curso + cartera ponderada con `mes_cobro_esperado` = mes actual, comparado contra la meta del mes.
+- **Criterio de aceptación:** a mitad de mes el dashboard muestra cuánto llevo cobrado y cuánto proyecto cerrar, no solo la meta original. — **cumplido y verificado**: probado con un cliente sintético (2 expedientes con distinto `estado_cobro` + 1 cobro directo) y confirmado end-to-end en navegador que cobrado/cartera ponderada/proyección/cumplimiento coinciden exactamente con el cálculo manual, y que crear una meta nueva desde el formulario persiste y recalcula el ingreso proyectado correctamente.
+
+### Fase 8 — Comisión (multi-originador desde el inicio) ✅ Completada
+**Archivos:** `aglegal/db.py` (migración v26: tablas `negocio_originadores` y `comisiones`), `aglegal/repositories.py` (`_formula_comision_tramos`, `_comision_marginal`, `set_negocio_originadores`, `reconocer_comision_income`, `revertir_comision`, `resumen_comisiones_mes`), `api/app/schemas/comisiones.py`, `api/app/routers/comisiones.py` (`/comisiones/originadores/{case_id}`, `/comisiones`, `/comisiones/resumen`, `/comisiones/reconocer`, `/comisiones/{id}/revertir`), `api/app/routers/incomes.py` (auto-reconocimiento al registrar un ingreso con `case_id`), frontend `src/pages/Cases.tsx` (`OriginadoresEditor` embebido en el diálogo de edición) + `src/pages/Comisiones.tsx` (nuevo, resumen por persona + detalle + reversión) + `src/api/comisiones.ts`.
+**Reglas reales usadas (`12_Reglas_Comision`), verificadas exactas contra los 4 ejemplos del Excel:** tramos mensuales acumulados por persona sobre utilidad directa cobrada — $0–$1,000 → 10%, $1,000.01–$2,500 → 12%, >$2,500 → 15% (tipo "Cliente nuevo"); 5% plano sin tramos (tipo "Venta cruzada").
+**Objetivo:** motor de cálculo con los escenarios especiales de tu punto 7, incluyendo reparto entre varios originadores.
+- `negocio_originadores` (`case_id`, `personal_id` [FK a `personal`, el catálogo de la Fase 2 — ahí ya estaba Andrea Escobar como PER-003], `porcentaje_participacion`, `tipo_origen`). Reemplaza el `origen_negocio` de valor único: un expediente puede tener 1 o varios originadores con su % de participación.
+- `comisiones` (`income_id` — el cobro que la dispara —, `case_id`, `personal_id`, `tipo_origen`, `porcentaje_participacion`, `base_utilidad_directa_cents`, `comision_cents`, `mes_reconocimiento`, `ajusta_a_commission_id`). Los tramos se acumulan **por persona y por mes** consultando la suma de `base_utilidad_directa_cents` ya reconocida ese mes — cada originador tiene su propio acumulado, independiente del expediente.
+- **Pagos parciales:** cubierto por diseño y verificado — un cobro dispara `reconocer_comision_income()` automáticamente al crear el `income` (si tiene `case_id` y el expediente tiene originadores configurados); es idempotente (no duplica si ya se reconoció). Probado con 2 cobros del mismo expediente en el mismo mes: el segundo cobro se calculó correctamente como diferencia marginal contra el acumulado del primero.
+- **Ajustes posteriores:** `revertir_comision()` crea un movimiento nuevo con `comision_cents` negativo y `ajusta_a_commission_id` apuntando al original, reconocido en el **mes en curso** (no en el mes original) — consistente con la regla del Excel. Verificado: revertir una comisión de agosto no altera el resumen de agosto, aparece como ajuste negativo en julio.
+- **Validación:** `set_negocio_originadores()` rechaza guardar si los `porcentaje_participacion` no suman 100% (± 0.01), con mensaje claro devuelto como 400 en la API.
+- **Criterio de aceptación:** un expediente con Andrea 70% / Alfredo 30% genera, al cobrarse, dos registros de comisión con la base repartida en esa proporción, cada uno evaluado contra el acumulado mensual de esa persona. — **cumplido y verificado end-to-end**: 2 cobros de $2,000 y $1,000 con Andrea 70%/Alfredo 30% (tipo "Cliente nuevo") produjeron comisiones de $148.00+$84.00=$232.00 (Andrea) y $60.00+$30.00=$90.00 (Alfredo), coincidiendo al centavo con el cálculo manual de la fórmula de tramos marginales; visto correctamente en `/comisiones` y en el editor de originadores dentro de `/cases`.
+- **Bug encontrado y corregido de paso:** el diálogo de edición de expediente en `Cases.tsx` no tenía `max-h-[90vh] overflow-y-auto` — al agregar la sección de originadores el formulario superó la altura del viewport y quedó parcialmente inaccesible (contenido recortado por el `position: fixed` del diálogo, sin scroll). Corregido con el mismo patrón ya usado en otros diálogos del proyecto.
+
+### Fase 9 — Realidad, cumplimiento y Dashboard ✅ Completada
+**Archivos:** `aglegal/repositories.py` (`dashboard_alerts` extendido con `overdue_billing` y `budget_deviation`, `rentabilidad_por_abogado`, `cumplimiento_por_familia`), `api/app/routers/dashboard.py` (`GET /dashboard/alerts?stale_days=`, `GET /dashboard/rentabilidad-abogado`), `api/app/routers/finanzas.py` (`GET /finanzas/cumplimiento-familia`), frontend `src/pages/Dashboard.tsx` (reescrito completo, 3 pestañas), `src/hooks/useAlerts.ts` + `src/components/NotificationBell.tsx` (2 secciones nuevas), `src/api/dashboard.ts` + `src/api/finanzas.ts` extendidos.
+**Objetivo:** separar comercial/operativo/financiero (tu punto 2) + rentabilidad por abogado + alertas (tu punto 6).
+- **Comercial:** KPIs de pipeline (prospectos/cotizados/ganados/perdidos/conversión, reutilizando `conversion_comercial()` de la Fase 3), origen de negocio y canal de captación (agrupados en el frontend desde la lista de oportunidades ya existente — sin endpoint nuevo).
+- **Operativo:** casos por estado, servicios más frecuentes + días promedio de atención (reutilizando `tiempos_atencion()` de la Fase 4), cumplimiento de volumen por familia (nuevo, ver abajo), agenda de próximos 7 días.
+- **Financiero:** ingresos cobrados/proyectados (Fase 7), utilidad y margen operativo, punto de equilibrio (Fase 2), cartera pendiente/ponderada (Fase 7), comisiones del mes (Fase 8), utilidad bruta por servicio/cliente (ya existía), rentabilidad por abogado (nuevo), top clientes/servicios (ya existía).
+- **Nuevo (tu punto 2):** `rentabilidad_por_abogado()` agrupa `incomes`/`costs` por `cases.responsible_username` usando `monto_neto_operativo_cents` (consistente con el resto del sistema desde la Fase 5).
+- **Nuevo (tu punto 6) — alertas automáticas**, extendiendo `dashboard_alerts()` (ya existía con `overdue_tasks`/`stale_cases`):
+  - `stale_cases` ganó un umbral configurable `stale_days` (por defecto 15, antes fijo en 30).
+  - `overdue_billing` (nuevo): expedientes con `mes_cobro_esperado` ya pasado y saldo pendiente > 0.
+  - `budget_deviation` (nuevo): si la proyección de cierre de mes (Fase 7) cae por debajo del 85% de la meta, aparece como alerta — no solo se muestra pasivo en el dashboard, sino que empuja notificación vía `NotificationBell`.
+- **Criterio de aceptación:** el dashboard tiene 3 secciones claramente separadas; puedo ver qué abogado generó más utilidad directa el mes pasado; me llega una alerta si un expediente lleva 15 días sin movimiento. — **cumplido y verificado end-to-end**: probado con datos sintéticos abarcando las 3 pestañas (oportunidades con distinto origen/canal, expedientes en distintos estados con abogado responsable, comisión reconocida) — cada número en pantalla (rentabilidad $600.00/100%, comisiones $60.00, cumplimiento por familia 0%/red, alerta de cobro vencido $900.00) coincidió exacto con el cálculo esperado.
+- **Bug de proceso encontrado durante la verificación (no de código):** un proceso `uvicorn` de una prueba anterior había quedado corriendo en el puerto 8000 sin reiniciarse, por lo que las pruebas HTTP del nuevo endpoint `/finanzas/cumplimiento-familia` devolvían 404 aunque el código ya estaba correcto — se detectó comparando `openapi.json` contra el código fuente, no era un bug real. Lección para las siguientes fases: verificar el PID real del proceso en el puerto antes de asumir que un 404/comportamiento inesperado es un bug de código.
+
+### Fase 10 — Gobierno del catálogo ✅ Completada
+**Archivos:** `aglegal/db.py` (migración v27: tabla `solicitudes_catalogo`), `aglegal/repositories.py` (`TIPO_SOLICITUD_VALUES`, `TIPO_REGISTRO_VALUES`, `SOLICITUD_ESTADOS`, `_SOLICITUD_TRANSICIONES`, `create_solicitud`, `update_solicitud`, `transition_solicitud`, `_next_solicitud_code`), `api/app/schemas/gobierno.py`, `api/app/routers/gobierno.py` (`/solicitudes-catalogo`), frontend `src/pages/Gobierno.tsx` (nuevo) + `src/api/gobierno.ts`.
+Con dos precisiones del `19_Control_Altas_Cambios` (columnas reales de la hoja, replicadas 1:1) y la máquina de estados del `18_Procedimiento_Catalogo`:
+- `solicitudes_catalogo` distingue `codigo_propuesto` (tentativo, editable) de `codigo_definitivo` (`NULL` hasta aprobar, permanente después).
+- Incluye `categoria_padre` / `subcategoria_padre` explícitos según el nivel solicitado (obligatorios para Subcategoría/Servicio, validado en `create_solicitud`).
+- Máquina de estados fiel al procedimiento: `Solicitado → En revisión → Aprobado/Rechazado`, `Rechazado → Solicitado` (reabrir sin crear histórico — la misma fila se edita), `Aprobado → Activo → Inactivo`. Aprobar sin indicar aprobador se rechaza con error claro; una vez `Aprobado`, la solicitud queda inmutable (ni siquiera el código propuesto se puede tocar).
+- **Criterio de aceptación:** un código propuesto puede rechazarse y cambiar sin que eso cree histórico; el código definitivo solo existe después de aprobar. — **cumplido y verificado end-to-end**: probado el ciclo completo (crear → revisión → rechazar → reabrir → editar código propuesto → volver a aprobar) confirmando que sigue siendo la misma fila (`id` sin cambiar, sin duplicados en la tabla) y que `codigo_definitivo` permanece `NULL` hasta el momento exacto de la aprobación; visto también en el navegador con el flujo completo de una solicitud aprobada hasta `Activo`.
+
+---
+
+## Cómo trabajamos
+
+Seguimos fase por fase, cada una probada en 3 capas (repositorio → HTTP → navegador real) antes de pasar a la siguiente. Ya no hay preguntas abiertas — todo tiene una decisión o un valor por defecto razonable (avísame si algún valor por defecto no te acomoda). **Las 10 fases están completas y verificadas** (ver "Estado de avance" arriba). El sistema cubre los 8 bloques del mensaje original del cliente y los 7 puntos de retroalimentación del revisor.

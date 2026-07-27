@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from aglegal.db import now_iso
 
 from ..deps import CurrentUser, LawyerRequired, RepoDep
-from ..schemas.case import CaseAttachmentOut, CaseIn, CaseOut, CaseTaskDone, CaseTaskIn, CaseTaskNotesUpdate, CaseTaskOut, CaseUpdate, GlobalCaseTaskOut
+from ..schemas.case import CaseAttachmentOut, CaseIn, CaseOut, CaseTaskDone, CaseTaskIn, CaseTaskNotesUpdate, CaseTaskOut, CaseUpdate, GlobalCaseTaskOut, TiempoAtencionOut
 
 router = APIRouter(prefix="/cases", tags=["cases"])
 
@@ -16,9 +16,27 @@ def list_cases(
     repo: RepoDep,
     search: str | None = None,
     status: str | None = None,
+    estado_cobro: str | None = None,
     client_id: int | None = None,
+    category_id: int | None = None,
+    subcategory_id: int | None = None,
+    service_id: int | None = None,
 ) -> list[CaseOut]:
-    return [CaseOut.from_row(row) for row in repo.list_cases(search=search, status=status, client_id=client_id)]
+    return [
+        CaseOut.from_row(row)
+        for row in repo.list_cases(
+            search=search, status=status, estado_cobro=estado_cobro, client_id=client_id,
+            category_id=category_id, subcategory_id=subcategory_id, service_id=service_id,
+        )
+    ]
+
+
+@router.get("/tiempos-atencion", response_model=list[TiempoAtencionOut])
+def tiempos_atencion(
+    current_user: CurrentUser, repo: RepoDep, category_id: int | None = None, subcategory_id: int | None = None, service_id: int | None = None,
+) -> list[TiempoAtencionOut]:
+    """Días promedio de atención por servicio — para filtrar tiempos por tipo de servicio."""
+    return [TiempoAtencionOut.from_row(row) for row in repo.tiempos_atencion(category_id=category_id, subcategory_id=subcategory_id, service_id=service_id)]
 
 
 @router.get("/choices")
@@ -45,6 +63,13 @@ def create_case(body: CaseIn, current_user: CurrentUser, repo: RepoDep) -> CaseO
         court_entity=body.court_entity,
         responsible_username=body.responsible_username,
         created_at=now_iso(),
+        service_id=body.service_id,
+        honorarios_contratados_text=str(body.honorarios_contratados) if body.honorarios_contratados is not None else "",
+        costos_directos_estimados_text=str(body.costos_directos_estimados) if body.costos_directos_estimados is not None else "",
+        mes_cobro_esperado=body.mes_cobro_esperado,
+        estado_cobro=body.estado_cobro,
+        fecha_cierre_estimada=body.fecha_cierre_estimada,
+        proxima_accion=body.proxima_accion,
     )
     rows = repo.list_cases()
     row = next((r for r in rows if r["id"] == case_id), None)
@@ -72,6 +97,14 @@ def update_case(case_id: int, body: CaseUpdate, current_user: CurrentUser, repo:
         opposing_party=body.opposing_party,
         court_entity=body.court_entity,
         responsible_username=body.responsible_username,
+        service_id=body.service_id,
+        honorarios_contratados_text=str(body.honorarios_contratados) if body.honorarios_contratados is not None else "",
+        costos_directos_estimados_text=str(body.costos_directos_estimados) if body.costos_directos_estimados is not None else "",
+        mes_cobro_esperado=body.mes_cobro_esperado,
+        estado_cobro=body.estado_cobro,
+        fecha_cierre_estimada=body.fecha_cierre_estimada,
+        fecha_cierre_real=body.fecha_cierre_real,
+        proxima_accion=body.proxima_accion,
     )
     rows = repo.list_cases()
     row = next((r for r in rows if r["id"] == case_id), None)

@@ -59,6 +59,7 @@ def get_current_user(
         permissions = {str(r["perm"]) for r in perm_rows}
 
     return {
+        "id": int(row["id"]),
         "username": str(row["username"]),
         "role": role_name,
         "role_id": row["role_id"],

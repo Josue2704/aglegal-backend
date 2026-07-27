@@ -29,6 +29,9 @@ def create_expense(body: ExpenseIn, current_user: LawyerRequired, repo: RepoDep)
         expense_date=body.expense_date,
         notes=body.notes,
         created_at=now_iso(),
+        account_id=body.account_id,
+        monto_iva_text=str(body.monto_iva) if body.monto_iva is not None else "",
+        monto_reembolsable_text=str(body.monto_reembolsable) if body.monto_reembolsable is not None else "",
     )
     rows = repo.list_expenses_range(start_date=None, end_date=None)
     row = next((r for r in rows if r["id"] == expense_id), None)
@@ -45,6 +48,9 @@ def update_expense(expense_id: int, body: ExpenseIn, current_user: LawyerRequire
         amount_text=str(body.amount),
         expense_date=body.expense_date,
         notes=body.notes,
+        account_id=body.account_id,
+        monto_iva_text=str(body.monto_iva) if body.monto_iva is not None else "",
+        monto_reembolsable_text=str(body.monto_reembolsable) if body.monto_reembolsable is not None else "",
     )
     row = repo.get_expense(expense_id)
     if not row:

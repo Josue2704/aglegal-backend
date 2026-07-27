@@ -24,8 +24,8 @@ def upcoming_sessions(
 
 
 @router.get("/alerts")
-def alerts(current_user: CurrentUser, repo: RepoDep) -> dict:
-    return repo.dashboard_alerts()
+def alerts(current_user: CurrentUser, repo: RepoDep, stale_days: int = 15) -> dict:
+    return repo.dashboard_alerts(stale_days=stale_days)
 
 
 @router.get("/search")
@@ -141,3 +141,23 @@ def gross_profit_clients(
 ) -> list[GrossProfitItem]:
     rows = repo.top_clients_by_gross_profit(start_date=start_date, end_date=end_date, limit=limit)
     return [GrossProfitItem(name=n, revenue=r / 100, cost=c / 100, gross_profit=g / 100) for n, r, c, g in rows]
+
+
+@router.get("/rentabilidad-abogado")
+def rentabilidad_abogado(
+    current_user: CurrentUser,
+    repo: RepoDep,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict]:
+    rows = repo.rentabilidad_por_abogado(start_date=start_date, end_date=end_date)
+    return [
+        {
+            "responsable": r["responsable"],
+            "ingresos": r["ingresos_cents"] / 100,
+            "costos": r["costos_cents"] / 100,
+            "utilidad_directa": r["utilidad_directa_cents"] / 100,
+            "margen_pct": r["margen_pct"],
+        }
+        for r in rows
+    ]

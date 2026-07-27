@@ -42,6 +42,10 @@ def create_cost(body: CostIn, current_user: LawyerRequired, repo: RepoDep) -> Co
         cost_date=body.cost_date,
         notes=body.notes,
         created_at=now_iso(),
+        account_id=body.account_id,
+        service_id=body.service_id,
+        monto_iva_text=str(body.monto_iva) if body.monto_iva is not None else "",
+        monto_reembolsable_text=str(body.monto_reembolsable) if body.monto_reembolsable is not None else "",
     )
     rows = repo.list_costs_range(start_date=None, end_date=None)
     row = next((r for r in rows if r["id"] == cost_id), None)
@@ -60,6 +64,10 @@ def update_cost(cost_id: int, body: CostIn, current_user: LawyerRequired, repo: 
         amount_text=str(body.amount),
         cost_date=body.cost_date,
         notes=body.notes,
+        account_id=body.account_id,
+        service_id=body.service_id,
+        monto_iva_text=str(body.monto_iva) if body.monto_iva is not None else "",
+        monto_reembolsable_text=str(body.monto_reembolsable) if body.monto_reembolsable is not None else "",
     )
     row = repo.get_cost(cost_id)
     if not row:
