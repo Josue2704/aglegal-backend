@@ -260,6 +260,26 @@ Pregunta del cliente sobre el formulario de "Nuevo expediente": por qué había 
 
 **Commits:** backend `78cdf04`, frontend `6b53a48`.
 
+### Post-Fase 10 (6) — Los buscadores de servicio muestran todo de entrada ✅ Completada
+
+Pedido del cliente: los buscadores de "Servicio del catálogo" (Expedientes, Flujo de Caja, Gobierno del Catálogo) no mostraban nada hasta escribir algo — había que ya saber parte del código o nombre para que apareciera cualquier resultado. Se cambiaron los tres a traer la lista completa de servicios activos una sola vez (con react-query, cacheada) y filtrar en el cliente mientras se escribe, igual al patrón ya usado en el buscador de Gobierno del Catálogo. Abrir el campo ahora navega los 205 servicios de una vez; escribir simplemente acota. Se quitó también el límite artificial de resultados mostrados (antes 8-30) — la lista es desplazable.
+
+**Commit:** frontend `c20270f`.
+
+### Post-Fase 10 (7) — Validación completa del frontend para uso normal ✅ Completada
+
+Pedido del cliente: "valida que todo funcione en el front para que un usuario normal lo pueda usar". Sin navegador disponible esta sesión, la validación se hizo en dos capas: (1) un agente de auditoría estática leyó cada página, cada cliente de API contra las rutas reales del backend, y las cadenas de permiso del Sidebar/`App.tsx` contra el catálogo real de permisos; (2) un recorrido funcional completo por HTTP contra producción, creando un usuario de prueba con rol Abogado real y ejecutando el flujo íntegro de cada módulo (Clientes, Expedientes, Agenda, Tareas, Flujo de Caja, Facturas, Nóminas, Pipeline con conversión a expediente, Comisiones, Catálogo Maestro/Gobierno del Catálogo con Alta+Cambio+Baja, Dashboard, Reportes, Finanzas), verificando además la separación de permisos entre Abogado y Administrador donde aplica (aprobar solicitudes, eliminar registros financieros).
+
+Se encontraron y corrigieron 3 bugs reales, ninguno introducido en esta sesión — los tres preexistentes, expuestos por los cambios recientes o encontrados de paso al usar el sistema de verdad:
+
+1. **`Reports.tsx` mostraba $0.00 en todo.** Leía la respuesta cruda de `/incomes`/`/expenses` esperando `amount_cents`/`description`, campos que no existen en la respuesta real (`IncomeOut`/`ExpenseOut` devuelven `amount` en dólares y `detail`/`concept`). Ya se había detectado y documentado como "fuera de alcance" en un retiro anterior de esta sesión; ahora se corrigió de verdad, usando los clientes tipados `incomesApi`/`expensesApi`.
+2. **Los enlaces de "Usuarios", "Roles" y "Configuración" en el menú lateral eran enlaces muertos para roles no-administradores con esos permisos.** `Sidebar.tsx` los mostraba a cualquier rol con `usuarios.ver`/`roles.ver`/`configuracion.ver` (el rol Abogado por defecto los tiene desde antes de esta sesión), pero `App.tsx` protege esas 3 rutas con `AdminRoute`, que solo revisa `is_admin` e ignora el arreglo de permisos — un Abogado real veía el enlace y lo único que pasaba al hacer clic era rebotar a "/". Se agregó una bandera `adminOnly` al Sidebar para que esas 3 rutas solo se muestren a administradores de verdad, coincidiendo con lo que la ruta en realidad exige.
+3. **`DELETE /clients/{id}` reventaba con 500 si el cliente tenía una oportunidad comercial asociada.** `oportunidades.client_id` es `ON DELETE SET NULL`, pero la tabla también exige `client_id` o `prospecto_nombre` (`chk_oportunidad_cliente_o_prospecto`) — una oportunidad creada directo contra un cliente real (el caso normal, sin `prospecto_nombre`) viola esa restricción en el instante en que la cascada intenta poner `client_id` en `NULL`. Encontrado al limpiar los datos de prueba de esta misma validación. Corregido rellenando `prospecto_nombre` con el nombre del cliente antes de borrar, para que la oportunidad conserve su historial en vez de tronar.
+
+**Verificación:** los tres bugs se reprodujeron primero (local o en producción) y se confirmó cada corrección en vivo después del deploy — `DELETE /clients/{id}` con una oportunidad vinculada ahora devuelve `204`; `/incomes` confirmado devolviendo `amount` real que Reports.tsx ahora lee correctamente; el bundle desplegado confirmado con la bandera `adminOnly` presente. El recorrido completo por HTTP (25+ operaciones: crear cliente, expediente con servicio del catálogo, sesión, tarea, ingreso/gasto/costo con cuenta contable, factura, nómina con auto-emparejamiento a cuenta real, oportunidad→expediente automático, comisión reconocida, solicitud de catálogo Alta→Cambio→Baja con separación de permisos Abogado/Administrador) pasó sin errores inesperados. Todos los datos de prueba (cliente, expediente, movimientos, factura, nómina, oportunidad, comisión, solicitudes, usuario de prueba) se eliminaron de producción al terminar — el conteo de clientes/expedientes/categorías quedó igual que antes de empezar. `npx tsc --noEmit` y `npm run build` limpios. **Sin verificación visual en navegador** — la herramienta de automatización no está disponible esta sesión; toda la validación fue estática (lectura de código) + funcional (HTTP), no visual.
+
+**Commits:** backend `acb6856`, frontend `350d9eb`.
+
 ---
 
 ## Cómo trabajamos
