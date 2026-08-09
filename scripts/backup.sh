@@ -20,9 +20,14 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${BACKUP_DIR}/db" "${BACKUP_DIR}/attachments"
 
 # --- Base de datos ---
-set -a
-source "${APP_DIR}/.env"
-set +a
+# No se hace `source .env` completo: ese archivo lo escribe/lee python-dotenv, que
+# tolera valores sin comillas (ej. FIRM_NAME=AG Legal) que bash no puede parsear como
+# script y revientan con "syntax error". Se extrae solo la línea que hace falta.
+DATABASE_URL="$(grep -m1 '^DATABASE_URL=' "${APP_DIR}/.env" | cut -d= -f2-)"
+if [ -z "${DATABASE_URL}" ]; then
+  echo "DATABASE_URL no encontrada en ${APP_DIR}/.env" >&2
+  exit 1
+fi
 
 pg_dump "${DATABASE_URL}" | gzip > "${BACKUP_DIR}/db/aglegal_${STAMP}.sql.gz"
 
