@@ -27,7 +27,9 @@ def list_oportunidades(
 
 @router.get("/conversion", response_model=ConversionComercialOut)
 def conversion_comercial(current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("pipeline", "ver")) -> ConversionComercialOut:
-    return ConversionComercialOut(**repo.conversion_comercial())
+    data = repo.conversion_comercial()
+    data["valor_pipeline"] = data.pop("valor_pipeline_cents", 0) / 100
+    return ConversionComercialOut(**data)
 
 
 @router.post("", response_model=OportunidadOut, status_code=201)
@@ -35,6 +37,7 @@ def create_oportunidad(body: OportunidadIn, current_user: CurrentUser, repo: Rep
     op_id = repo.create_oportunidad(
         client_id=body.client_id, prospecto_nombre=body.prospecto_nombre, prospecto_contacto=body.prospecto_contacto,
         service_id=body.service_id, canal_captacion=body.canal_captacion, origen_negocio=body.origen_negocio,
+        honorarios_estimados_text=str(body.honorarios_estimados) if body.honorarios_estimados is not None else "",
         created_at=now_iso(),
     )
     return OportunidadOut.from_row(repo.get_oportunidad(op_id))
@@ -45,6 +48,7 @@ def update_oportunidad(oportunidad_id: int, body: OportunidadUpdate, current_use
     repo.update_oportunidad(
         oportunidad_id, client_id=body.client_id, prospecto_nombre=body.prospecto_nombre, prospecto_contacto=body.prospecto_contacto,
         service_id=body.service_id, canal_captacion=body.canal_captacion, origen_negocio=body.origen_negocio,
+        honorarios_estimados_text=str(body.honorarios_estimados) if body.honorarios_estimados is not None else "",
     )
     return OportunidadOut.from_row(repo.get_oportunidad(oportunidad_id))
 

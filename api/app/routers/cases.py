@@ -4,8 +4,11 @@ from fastapi import APIRouter, HTTPException
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, LawyerRequired, RepoDep
-from ..schemas.case import CaseAttachmentOut, CaseIn, CaseOut, CaseTaskDone, CaseTaskIn, CaseTaskNotesUpdate, CaseTaskOut, CaseUpdate, GlobalCaseTaskOut, TiempoAtencionOut
+from ..deps import AdminRequired, CurrentUser, LawyerRequired, RepoDep
+from ..schemas.case import (
+    CaseAttachmentOut, CaseIn, CaseOut, CaseTaskCriticoUpdate, CaseTaskDone, CaseTaskIn, CaseTaskNotesUpdate,
+    CaseTaskOut, CaseTimeEntryIn, CaseTimeEntryOut, CaseUpdate, ConflictoInteresOut, GlobalCaseTaskOut, TiempoAtencionOut,
+)
 
 router = APIRouter(prefix="/cases", tags=["cases"])
 
@@ -21,14 +24,23 @@ def list_cases(
     category_id: int | None = None,
     subcategory_id: int | None = None,
     service_id: int | None = None,
+    archived: bool = False,
 ) -> list[CaseOut]:
     return [
         CaseOut.from_row(row)
         for row in repo.list_cases(
             search=search, status=status, estado_cobro=estado_cobro, client_id=client_id,
             category_id=category_id, subcategory_id=subcategory_id, service_id=service_id,
+            archived=archived,
         )
     ]
+
+
+@router.get("/conflicto-interes", response_model=ConflictoInteresOut)
+def conflicto_interes(nombre: str, current_user: CurrentUser, repo: RepoDep) -> ConflictoInteresOut:
+    """Cruza un nombre de contraparte propuesto contra clientes y contrapartes de otros
+    expedientes activos — no bloquea nada, solo avisa antes de aceptar el caso."""
+    return ConflictoInteresOut(**repo.check_conflicto_interes(nombre))
 
 
 @router.get("/tiempos-atencion", response_model=list[TiempoAtencionOut])
@@ -110,7 +122,25 @@ def update_case(case_id: int, body: CaseUpdate, current_user: CurrentUser, repo:
 
 
 @router.delete("/{case_id}", status_code=204)
-def delete_case(case_id: int, current_user: LawyerRequired, repo: RepoDep):
+def archive_case(case_id: int, current_user: LawyerRequired, repo: RepoDep):
+    """Antes borraba el expediente sin posibilidad de recuperarlo. Ahora lo archiva
+    (papelera) — el purgado permanente vive aparte, en /{case_id}/purge."""
+    repo.archive_case(case_id, archived_at=now_iso())
+
+
+@router.post("/{case_id}/restore", response_model=CaseOut)
+def restore_case(case_id: int, current_user: LawyerRequired, repo: RepoDep) -> CaseOut:
+    repo.restore_case(case_id)
+    rows = repo.list_cases(archived=False)
+    row = next((r for r in rows if r["id"] == case_id), None)
+    if not row:
+        raise HTTPException(404, "Caso no encontrado")
+    return CaseOut.from_row(row)
+
+
+@router.delete("/{case_id}/purge", status_code=204)
+def purge_case(case_id: int, current_user: AdminRequired, repo: RepoDep):
+    """Borrado real y permanente — solo desde la papelera, solo administrador."""
     repo.delete_case(case_id)
 
 
@@ -142,9 +172,19 @@ def create_task(case_id: int, body: CaseTaskIn, current_user: CurrentUser, repo:
         due_date=body.due_date,
         notes=body.notes,
         responsible_username=body.responsible_username,
+        es_critico=body.es_critico,
         created_at=now_iso(),
     )
     row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
+    return CaseTaskOut.from_row(row)
+
+
+@router.patch("/tasks/{task_id}/critico", response_model=CaseTaskOut)
+def set_task_critico(task_id: int, body: CaseTaskCriticoUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
+    repo.set_case_task_critico(task_id, body.es_critico)
+    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Tarea no encontrada")
     return CaseTaskOut.from_row(row)
 
 
@@ -183,3 +223,32 @@ def list_case_sessions(case_id: int, current_user: CurrentUser, repo: RepoDep) -
 @router.get("/{case_id}/all-attachments", response_model=list[CaseAttachmentOut])
 def list_case_all_attachments(case_id: int, current_user: CurrentUser, repo: RepoDep) -> list[CaseAttachmentOut]:
     return [CaseAttachmentOut(**dict(row)) for row in repo.list_case_all_attachments(case_id)]
+
+
+# --- Registro de horas (servicios cobrados "Por hora") ---
+
+@router.get("/{case_id}/time-entries", response_model=list[CaseTimeEntryOut])
+def list_time_entries(case_id: int, current_user: CurrentUser, repo: RepoDep) -> list[CaseTimeEntryOut]:
+    return [CaseTimeEntryOut.from_row(r) for r in repo.list_case_time_entries(case_id)]
+
+
+@router.post("/{case_id}/time-entries", response_model=CaseTimeEntryOut, status_code=201)
+def create_time_entry(case_id: int, body: CaseTimeEntryIn, current_user: CurrentUser, repo: RepoDep) -> CaseTimeEntryOut:
+    if not current_user["is_admin"] and "expedientes.editar" not in current_user["permissions"]:
+        raise HTTPException(403, "Sin permiso: expedientes.editar")
+    entry_id = repo.create_case_time_entry(
+        case_id=case_id,
+        username=body.username or current_user["username"],
+        work_date=body.work_date,
+        hours=body.hours,
+        description=body.description,
+        billable=body.billable,
+        created_at=now_iso(),
+    )
+    row = repo.conn.execute("SELECT * FROM case_time_entries WHERE id=%s", (entry_id,)).fetchone()
+    return CaseTimeEntryOut.from_row(row)
+
+
+@router.delete("/time-entries/{entry_id}", status_code=204)
+def delete_time_entry(entry_id: int, current_user: LawyerRequired, repo: RepoDep):
+    repo.delete_case_time_entry(entry_id)

@@ -15,6 +15,7 @@ from ..schemas.invoice import (
     UnbilledItems,
     UnbilledSession,
     UnbilledTask,
+    UnbilledTimeEntry,
 )
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
@@ -84,7 +85,18 @@ def unbilled_items(
         )
         for r in data["costs"]
     ]
-    return UnbilledItems(sessions=sessions, tasks=tasks, costs=costs)
+    time_entries = [
+        UnbilledTimeEntry(
+            id=r["id"],
+            work_date=r["work_date"],
+            hours=float(r["hours"]),
+            description=r.get("description"),
+            case_title=r.get("case_title"),
+            case_id=r.get("case_id"),
+        )
+        for r in data.get("time_entries", [])
+    ]
+    return UnbilledItems(sessions=sessions, tasks=tasks, costs=costs, time_entries=time_entries)
 
 
 @router.get("/{invoice_id}", response_model=InvoiceOut)

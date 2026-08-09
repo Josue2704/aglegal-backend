@@ -12,6 +12,7 @@ class OportunidadIn(BaseModel):
     service_id: int | None = None
     canal_captacion: str
     origen_negocio: str
+    honorarios_estimados: float | None = None
 
 
 class OportunidadUpdate(BaseModel):
@@ -21,6 +22,7 @@ class OportunidadUpdate(BaseModel):
     service_id: int | None = None
     canal_captacion: str
     origen_negocio: str
+    honorarios_estimados: float | None = None
 
 
 class OportunidadTransicion(BaseModel):
@@ -43,6 +45,7 @@ class OportunidadOut(BaseModel):
     motivo_perdida: str | None
     case_id: int | None
     case_internal_ref: str | None = None
+    honorarios_estimados: float | None = None
     fecha_prospecto: str
     fecha_cotizado: str | None
     fecha_cierre: str | None
@@ -53,7 +56,10 @@ class OportunidadOut(BaseModel):
 
     @classmethod
     def from_row(cls, row: Any) -> OportunidadOut:
-        return cls(**dict(row))
+        d = dict(row)
+        cents = d.pop("honorarios_estimados_cents", None)
+        d["honorarios_estimados"] = (cents / 100) if cents is not None else None
+        return cls(**{k: v for k, v in d.items() if k in cls.model_fields})
 
 
 class OportunidadTransicionOut(BaseModel):
@@ -68,3 +74,4 @@ class ConversionComercialOut(BaseModel):
     ganados: int
     perdidos: int
     conversion_pct: float | None
+    valor_pipeline: float = 0

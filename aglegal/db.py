@@ -894,6 +894,37 @@ def _migrate(conn: PgConnection) -> None:
         conn.execute("ALTER TABLE cases ALTER COLUMN service_area DROP NOT NULL")
         _set_schema_version(conn, 30)
 
+    # v31: hallazgos de la auditoría "rol de abogado" (AUDITORIA_USO_ABOGADO.md) —
+    # papelera para clientes/expedientes (borrado real era irreversible), plazos
+    # legales críticos distinguibles de un pendiente cualquiera, registro de horas
+    # trabajadas para servicios cobrados "Por hora", valor monetario del pipeline
+    # comercial, y enlace de Nóminas al catálogo de Personal ya existente.
+    if v < 31:
+        conn.executescript("""
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+            ALTER TABLE clients ADD COLUMN IF NOT EXISTS archived_at TEXT;
+            ALTER TABLE cases ADD COLUMN IF NOT EXISTS archived_at TEXT;
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS es_critico INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE oportunidades ADD COLUMN IF NOT EXISTS honorarios_estimados_cents INTEGER;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS personal_id INTEGER;
+            CREATE TABLE IF NOT EXISTS case_time_entries (
+              id SERIAL PRIMARY KEY,
+              case_id INTEGER NOT NULL,
+              username TEXT NOT NULL,
+              work_date TEXT NOT NULL,
+              hours NUMERIC(6,2) NOT NULL,
+              description TEXT,
+              billable INTEGER NOT NULL DEFAULT 1,
+              invoice_id INTEGER,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_case_time_entries_case ON case_time_entries(case_id);
+            CREATE INDEX IF NOT EXISTS idx_clients_archived ON clients(archived_at);
+            CREATE INDEX IF NOT EXISTS idx_cases_archived ON cases(archived_at);
+        """)
+        _set_schema_version(conn, 31)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 

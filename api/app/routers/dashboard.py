@@ -40,7 +40,7 @@ def global_search(
     _: dict = _can_view,
 ) -> dict:
     if not q or len(q.strip()) < 2:
-        return {"clients": [], "cases": [], "sessions": []}
+        return {"clients": [], "cases": [], "sessions": [], "invoices": [], "tasks": [], "oportunidades": []}
     return repo.global_search(q.strip(), limit=limit)
 
 

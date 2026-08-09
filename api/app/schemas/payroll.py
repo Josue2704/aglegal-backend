@@ -6,12 +6,13 @@ from pydantic import BaseModel, ConfigDict
 
 
 class PayrollIn(BaseModel):
-    employee_name: str
+    employee_name: str = ""
     role: str = ""
     period: str
     amount: float
     payment_date: str
     notes: str = ""
+    personal_id: int | None = None
 
 
 class PayrollOut(BaseModel):
@@ -23,6 +24,7 @@ class PayrollOut(BaseModel):
     payment_date: str
     notes: str | None = None
     expense_id: int | None = None
+    personal_id: int | None = None
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)

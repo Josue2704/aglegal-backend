@@ -87,6 +87,7 @@ class CaseOut(BaseModel):
     dias_duracion: int | None = None
     proxima_accion: str | None = None
     opportunity_id: int | None = None
+    archived_at: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -131,6 +132,7 @@ class GlobalCaseTaskOut(BaseModel):
     notes: str | None = None
     completed_notes: str | None = None
     responsible_username: str | None = None
+    es_critico: bool = False
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -139,6 +141,7 @@ class GlobalCaseTaskOut(BaseModel):
     def from_row(cls, row: Any) -> "GlobalCaseTaskOut":
         d = dict(row)
         d["done"] = bool(d.get("done", 0))
+        d["es_critico"] = bool(d.get("es_critico", 0))
         return cls(**d)
 
 
@@ -161,6 +164,7 @@ class CaseTaskIn(BaseModel):
     due_date: str | None = None
     notes: str | None = None
     responsible_username: str = ""
+    es_critico: bool = False
 
 
 class CaseTaskDone(BaseModel):
@@ -173,6 +177,10 @@ class CaseTaskNotesUpdate(BaseModel):
     completed_notes: str | None = None
 
 
+class CaseTaskCriticoUpdate(BaseModel):
+    es_critico: bool
+
+
 class CaseTaskOut(BaseModel):
     id: int
     case_id: int
@@ -182,6 +190,7 @@ class CaseTaskOut(BaseModel):
     notes: str | None = None
     completed_notes: str | None = None
     responsible_username: str | None = None
+    es_critico: bool = False
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -190,4 +199,39 @@ class CaseTaskOut(BaseModel):
     def from_row(cls, row: Any) -> CaseTaskOut:
         d = dict(row)
         d["done"] = bool(d.get("done", 0))
+        d["es_critico"] = bool(d.get("es_critico", 0))
         return cls(**d)
+
+
+class CaseTimeEntryIn(BaseModel):
+    work_date: str
+    hours: float
+    description: str | None = None
+    billable: bool = True
+    username: str | None = None  # si no se manda, el backend usa el usuario actual
+
+
+class CaseTimeEntryOut(BaseModel):
+    id: int
+    case_id: int
+    username: str
+    work_date: str
+    hours: float
+    description: str | None = None
+    billable: bool = True
+    invoice_id: int | None = None
+    created_at: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @classmethod
+    def from_row(cls, row: Any) -> "CaseTimeEntryOut":
+        d = dict(row)
+        d["billable"] = bool(d.get("billable", 1))
+        d["hours"] = float(d["hours"])
+        return cls(**d)
+
+
+class ConflictoInteresOut(BaseModel):
+    clientes: list[dict]
+    casos: list[dict]

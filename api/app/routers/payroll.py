@@ -24,6 +24,7 @@ def create_payroll(body: PayrollIn, current_user: CurrentUser, repo: RepoDep, _:
         amount_text=str(body.amount),
         payment_date=body.payment_date,
         notes=body.notes,
+        personal_id=body.personal_id,
         created_at=now_iso(),
     )
     rows = repo.list_payrolls()

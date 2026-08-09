@@ -447,6 +447,71 @@ def send_reminder_email(
         log.warning("Error enviando recordatorio: %s", e)
 
 
+def _build_tasks_digest_html(*, user_name: str, firm_name: str, tasks: list[dict]) -> str:
+    rows = ""
+    for t in tasks:
+        critico = bool(t.get("es_critico"))
+        badge = (
+            '<span style="background:#7f1d1d;color:#fca5a5;font-size:11px;font-weight:700;'
+            'padding:2px 8px;border-radius:10px;margin-left:8px">PLAZO CRÍTICO</span>'
+            if critico else ""
+        )
+        due = t.get("due_date") or ""
+        rows += f"""
+        <tr>
+          <td style="padding:12px 16px;border-bottom:1px solid #1e2a3a">
+            <p style="margin:0;color:#e8edf2;font-size:14px;font-weight:600">{t.get('title','')}{badge}</p>
+            <p style="margin:4px 0 0;color:#8fa3b8;font-size:12px">{t.get('case_title','')} · vence {due}</p>
+          </td>
+        </tr>"""
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><title>Tareas pendientes</title></head>
+<body style="margin:0;padding:0;background:#0d1117;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0d1117;padding:32px 16px">
+<tr><td align="center">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:560px">
+  <tr><td style="background:linear-gradient(135deg,#0f1f35 0%,#162840 100%);border-radius:12px 12px 0 0;padding:32px 40px 24px;text-align:center;border-bottom:2px solid #c9a84c">
+    <h1 style="margin:0;color:#e8edf2;font-size:22px;font-weight:300">Tareas pendientes y vencidas</h1>
+    <p style="margin:8px 0 0;color:#8fa3b8;font-size:13px">{firm_name}</p>
+  </td></tr>
+  <tr><td style="background:#111827;padding:28px 40px">
+    <p style="margin:0 0 20px;color:#a8b8cc;font-size:14px">Hola {user_name}, estas son tus tareas vencidas o con plazo crítico próximo a vencer:</p>
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#0d1117;border-radius:10px;overflow:hidden;border:1px solid #1e2a3a">
+      {rows}
+    </table>
+  </td></tr>
+  <tr><td style="background:#0a0f1a;border-radius:0 0 12px 12px;padding:18px 40px;text-align:center;border-top:1px solid #1e2a3a">
+    <p style="margin:0;color:#4a5a6a;font-size:12px">Recordatorio automático diario · AG Legal</p>
+  </td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>"""
+
+
+def send_task_digest_email(
+    *, user_name: str, user_email: str, firm_name: str, tasks: list[dict],
+    resend_api_key: str, resend_from: str,
+) -> None:
+    """Un correo diario por abogado con sus tareas vencidas / con plazo crítico próximo —
+    antes solo existían recordatorios para sesiones con el cliente, nada empujaba hacia
+    afuera un plazo procesal que se está por vencer."""
+    try:
+        import resend as resend_lib
+        resend_lib.api_key = resend_api_key
+        html = _build_tasks_digest_html(user_name=user_name, firm_name=firm_name, tasks=tasks)
+        n_criticas = sum(1 for t in tasks if t.get("es_critico"))
+        subject = f"{n_criticas} plazo(s) crítico(s) y {len(tasks) - n_criticas} tarea(s) vencida(s) — {firm_name}" if n_criticas else f"{len(tasks)} tarea(s) vencida(s) — {firm_name}"
+        params: resend_lib.Emails.SendParams = {
+            "from": resend_from, "to": [user_email], "subject": subject, "html": html,
+        }
+        resend_lib.Emails.send(params)
+        log.info("Digest de tareas enviado a %s (%d tareas)", user_email, len(tasks))
+    except Exception as e:
+        log.warning("Error enviando digest de tareas: %s", e)
+
+
 def send_session_cancel_email(
     *,
     session_row: Any,

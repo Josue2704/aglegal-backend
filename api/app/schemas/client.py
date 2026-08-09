@@ -28,6 +28,7 @@ class ClientOut(BaseModel):
     created_at: str
     session_count: int = 0
     case_count: int = 0
+    archived_at: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

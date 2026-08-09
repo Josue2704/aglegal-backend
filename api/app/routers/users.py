@@ -28,6 +28,7 @@ def create_user(body: UserCreate, current_user: AdminRequired, repo: RepoDep) ->
         username=body.username,
         password=body.password,
         full_name=body.full_name,
+        email=body.email,
         role=body.role,
         active=body.active,
         created_at=now_iso(),
@@ -35,7 +36,7 @@ def create_user(body: UserCreate, current_user: AdminRequired, repo: RepoDep) ->
     if body.role_id is not None:
         repo.assign_user_role(user_id, body.role_id)
     row = repo.conn.execute(
-        """SELECT u.id, u.username, u.full_name, u.role_id, u.active, u.created_at,
+        """SELECT u.id, u.username, u.full_name, u.email, u.role_id, u.active, u.created_at,
                   r.name AS role_name
            FROM users u LEFT JOIN roles r ON r.id = u.role_id WHERE u.id=%s""",
         (user_id,),
@@ -45,11 +46,11 @@ def create_user(body: UserCreate, current_user: AdminRequired, repo: RepoDep) ->
 
 @router.put("/{user_id}", response_model=UserOut)
 def update_user(user_id: int, body: UserUpdate, current_user: AdminRequired, repo: RepoDep) -> UserOut:
-    repo.update_user(user_id, full_name=body.full_name, role=body.role, active=body.active)
+    repo.update_user(user_id, full_name=body.full_name, role=body.role, active=body.active, email=body.email)
     if body.role_id is not None:
         repo.assign_user_role(user_id, body.role_id)
     row = repo.conn.execute(
-        """SELECT u.id, u.username, u.full_name, u.role_id, u.active, u.created_at,
+        """SELECT u.id, u.username, u.full_name, u.email, u.role_id, u.active, u.created_at,
                   r.name AS role_name
            FROM users u LEFT JOIN roles r ON r.id = u.role_id WHERE u.id=%s""",
         (user_id,),

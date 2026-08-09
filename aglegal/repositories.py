@@ -148,7 +148,7 @@ class Repository:
     def list_users(self) -> list[Any]:
         return list(
             self.conn.execute(
-                "SELECT id, username, full_name, role, active, created_at FROM users ORDER BY username ASC"
+                "SELECT id, username, full_name, email, role, active, created_at FROM users ORDER BY username ASC"
             ).fetchall()
         )
 
@@ -158,6 +158,7 @@ class Repository:
         username: str,
         password: str,
         full_name: str = "",
+        email: str = "",
         role: str = "Usuario",
         active: bool = True,
         created_at: str,
@@ -168,16 +169,16 @@ class Repository:
         if not password:
             raise ValueError("Contraseña requerida")
         cur = self.conn.execute(
-            "INSERT INTO users(username, password_hash, full_name, role, active, created_at) VALUES(%s,%s,%s,%s,%s,%s)",
-            (username_clean, hash_password(password), (full_name or "").strip(), role, 1 if active else 0, created_at),
+            "INSERT INTO users(username, password_hash, full_name, email, role, active, created_at) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+            (username_clean, hash_password(password), (full_name or "").strip(), (email or "").strip() or None, role, 1 if active else 0, created_at),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def update_user(self, user_id: int, *, full_name: str, role: str, active: bool) -> None:
+    def update_user(self, user_id: int, *, full_name: str, role: str, active: bool, email: str = "") -> None:
         self.conn.execute(
-            "UPDATE users SET full_name=%s, role=%s, active=%s WHERE id=%s",
-            ((full_name or "").strip(), role, 1 if active else 0, int(user_id)),
+            "UPDATE users SET full_name=%s, role=%s, active=%s, email=%s WHERE id=%s",
+            ((full_name or "").strip(), role, 1 if active else 0, (email or "").strip() or None, int(user_id)),
         )
         self.conn.commit()
 
@@ -199,7 +200,7 @@ class Repository:
         self.conn.commit()
 
     # --- Clients
-    def list_clients(self, search: str | None = None) -> list[Any]:
+    def list_clients(self, search: str | None = None, *, archived: bool = False) -> list[Any]:
         base = (
             "SELECT c.*, "
             "COUNT(DISTINCT s.id) AS session_count, "
@@ -208,14 +209,17 @@ class Repository:
             "LEFT JOIN sessions s ON s.client_id = c.id "
             "LEFT JOIN cases cs ON cs.client_id = c.id "
         )
+        archived_cond = "c.archived_at IS NOT NULL" if archived else "c.archived_at IS NULL"
         if search:
             like = f"%{search.strip()}%"
             return list(self.conn.execute(
-                base + "WHERE c.name ILIKE %s OR c.phone ILIKE %s OR c.email ILIKE %s "
+                base + f"WHERE {archived_cond} AND (c.name ILIKE %s OR c.phone ILIKE %s OR c.email ILIKE %s) "
                 "GROUP BY c.id ORDER BY c.id DESC",
                 (like, like, like),
             ).fetchall())
-        return list(self.conn.execute(base + "GROUP BY c.id ORDER BY c.id DESC").fetchall())
+        return list(self.conn.execute(
+            base + f"WHERE {archived_cond} GROUP BY c.id ORDER BY c.id DESC"
+        ).fetchall())
 
     def list_case_all_attachments(self, case_id: int) -> list[Any]:
         """Return attachments for the case itself plus attachments from its sessions."""
@@ -296,7 +300,16 @@ class Repository:
             items.append({"date": row["income_date"], "type": "Ingreso", "detail": row["detail"] or row["concept"], "status": f"$ {amount}"})
         return sorted(items, key=lambda item: item["date"] or "", reverse=True)
 
+    def archive_client(self, client_id: int, *, archived_at: str) -> None:
+        self.conn.execute("UPDATE clients SET archived_at=%s WHERE id=%s", (archived_at, int(client_id)))
+        self.conn.commit()
+
+    def restore_client(self, client_id: int) -> None:
+        self.conn.execute("UPDATE clients SET archived_at=NULL WHERE id=%s", (int(client_id),))
+        self.conn.commit()
+
     def delete_client(self, client_id: int) -> None:
+        """Permanent purge — only reachable from the archived (papelera) view."""
         # oportunidades.client_id is ON DELETE SET NULL, but the table also requires
         # client_id OR prospecto_nombre to be set (chk_oportunidad_cliente_o_prospecto) —
         # an oportunidad tied directly to a real client (no prospecto_nombre, the normal
@@ -826,15 +839,26 @@ class Repository:
     def create_payroll(
         self,
         *,
-        employee_name: str,
-        role: str,
+        employee_name: str = "",
+        role: str = "",
         period: str,
         amount_text: str,
         payment_date: str,
         notes: str,
         created_at: str,
+        personal_id: int | None = None,
     ) -> int:
-        employee = (employee_name or "").strip()
+        # Preferir el catálogo de Personal (PER-XXX, ya usado por gastos fijos y comisiones)
+        # en vez de texto libre — un solo lugar con el nombre correcto de cada colaborador,
+        # sin depender de que alguien lo escriba igual en dos pantallas distintas.
+        if personal_id is not None:
+            persona = self.conn.execute("SELECT persona, cargo FROM personal WHERE id=%s", (int(personal_id),)).fetchone()
+            if not persona:
+                raise ValueError("Persona del catálogo no encontrada")
+            employee = str(persona["persona"])
+            role = str(persona["cargo"] or role or "")
+        else:
+            employee = (employee_name or "").strip()
         if not employee:
             raise ValueError("Empleado requerido")
         if not period.strip() or not payment_date.strip():
@@ -858,8 +882,10 @@ class Repository:
         )
         amount_cents = _to_cents(amount_text)
         cur = self.conn.execute(
-            "INSERT INTO payrolls(employee_name, role, period, amount_cents, payment_date, notes, expense_id, created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
-            (employee, (role or "").strip(), period.strip(), amount_cents, payment_date.strip(), (notes or "").strip(), expense_id, created_at),
+            "INSERT INTO payrolls(employee_name, role, period, amount_cents, payment_date, notes, expense_id, personal_id, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (employee, (role or "").strip(), period.strip(), amount_cents, payment_date.strip(), (notes or "").strip(),
+             expense_id, personal_id, created_at),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -951,8 +977,9 @@ class Repository:
         category_id: int | None = None,
         subcategory_id: int | None = None,
         service_id: int | None = None,
+        archived: bool = False,
     ) -> list[Any]:
-        where = []
+        where = ["cs.archived_at IS NOT NULL"] if archived else ["cs.archived_at IS NULL"]
         params: list[Any] = []
         if search:
             where.append("(cs.title ILIKE %s OR cl.name ILIKE %s OR sv.nombre ILIKE %s OR sv.service_code ILIKE %s)")
@@ -1193,9 +1220,40 @@ class Repository:
         )
         self.conn.commit()
 
+    def archive_case(self, case_id: int, *, archived_at: str) -> None:
+        self.conn.execute("UPDATE cases SET archived_at=%s WHERE id=%s", (archived_at, int(case_id)))
+        self.conn.commit()
+
+    def restore_case(self, case_id: int) -> None:
+        self.conn.execute("UPDATE cases SET archived_at=NULL WHERE id=%s", (int(case_id),))
+        self.conn.commit()
+
     def delete_case(self, case_id: int) -> None:
+        """Permanent purge — only reachable from the archived (papelera) view."""
         self.conn.execute("DELETE FROM cases WHERE id=%s", (int(case_id),))
         self.conn.commit()
+
+    def check_conflicto_interes(self, nombre: str) -> dict:
+        """Cruza un nombre de contraparte propuesto contra la base de clientes y contra
+        las contrapartes de otros expedientes activos (no archivados). No bloquea nada —
+        solo da al abogado la información para decidir si hay un conflicto de interés
+        antes de aceptar el caso, como exige la ética profesional de cualquier colegio."""
+        term = (nombre or "").strip()
+        if len(term) < 3:
+            return {"clientes": [], "casos": []}
+        like = f"%{term}%"
+        clientes = self.conn.execute(
+            "SELECT id, name, client_type FROM clients WHERE archived_at IS NULL AND name ILIKE %s ORDER BY name LIMIT 10",
+            (like,),
+        ).fetchall()
+        casos = self.conn.execute(
+            "SELECT cs.id, cs.title, cs.opposing_party, cl.name AS client_name "
+            "FROM cases cs JOIN clients cl ON cl.id = cs.client_id "
+            "WHERE cs.archived_at IS NULL AND cs.opposing_party ILIKE %s "
+            "ORDER BY cs.id DESC LIMIT 10",
+            (like,),
+        ).fetchall()
+        return {"clientes": [dict(r) for r in clientes], "casos": [dict(r) for r in casos]}
 
     def case_choices(self, *, client_id: int | None = None) -> list[tuple[int, str]]:
         if client_id:
@@ -1242,7 +1300,7 @@ class Repository:
                 f"JOIN cases cs ON cs.id = ct.case_id "
                 f"LEFT JOIN clients cl ON cl.id = cs.client_id "
                 f"{where} "
-                f"ORDER BY ct.done ASC, ct.due_date ASC NULLS LAST, ct.id DESC",
+                f"ORDER BY ct.done ASC, ct.es_critico DESC, ct.due_date ASC NULLS LAST, ct.id DESC",
                 params,
             ).fetchall()
         )
@@ -1256,23 +1314,32 @@ class Repository:
         created_at: str,
         notes: str | None = None,
         responsible_username: str | None = None,
+        es_critico: bool = False,
     ) -> int:
         t = (title or "").strip()
         if not t:
             raise ValueError("Título requerido")
         cur = self.conn.execute(
-            "INSERT INTO case_tasks(case_id, title, done, due_date, notes, responsible_username, created_at) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO case_tasks(case_id, title, done, due_date, notes, responsible_username, es_critico, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(case_id), t, 0,
                 (due_date or "").strip() or None,
                 (notes or "").strip() or None,
                 (responsible_username or "").strip() or None,
+                1 if es_critico else 0,
                 created_at,
             ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def set_case_task_critico(self, task_id: int, es_critico: bool) -> None:
+        self.conn.execute(
+            "UPDATE case_tasks SET es_critico=%s WHERE id=%s",
+            (1 if es_critico else 0, int(task_id)),
+        )
+        self.conn.commit()
 
     def set_case_task_done(self, task_id: int, done: bool, completed_notes: str | None = None) -> None:
         self.conn.execute(
@@ -1290,6 +1357,51 @@ class Repository:
 
     def delete_case_task(self, task_id: int) -> None:
         self.conn.execute("DELETE FROM case_tasks WHERE id=%s", (int(task_id),))
+        self.conn.commit()
+
+    # --- Registro de horas (servicios cobrados "Por hora" — servicios.unidad_cobro ya
+    # traía esa opción desde la Fase 1, pero no existía dónde anotar las horas reales).
+    def list_case_time_entries(self, case_id: int) -> list[Any]:
+        return list(self.conn.execute(
+            "SELECT * FROM case_time_entries WHERE case_id=%s ORDER BY work_date DESC, id DESC",
+            (int(case_id),),
+        ).fetchall())
+
+    def unbilled_time_entries(self, client_id: int) -> list[Any]:
+        return list(self.conn.execute(
+            """SELECT te.* FROM case_time_entries te
+               JOIN cases ca ON ca.id = te.case_id
+               WHERE ca.client_id=%s AND te.billable=1 AND te.invoice_id IS NULL
+               ORDER BY te.work_date DESC""",
+            (int(client_id),),
+        ).fetchall())
+
+    def create_case_time_entry(
+        self, *, case_id: int, username: str, work_date: str, hours: float,
+        description: str | None = None, billable: bool = True, created_at: str,
+    ) -> int:
+        if hours <= 0:
+            raise ValueError("Las horas deben ser mayores a 0")
+        cur = self.conn.execute(
+            "INSERT INTO case_time_entries(case_id, username, work_date, hours, description, billable, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s)",
+            (int(case_id), username, work_date, float(hours), (description or "").strip() or None,
+             1 if billable else 0, created_at),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def delete_case_time_entry(self, entry_id: int) -> None:
+        self.conn.execute("DELETE FROM case_time_entries WHERE id=%s", (int(entry_id),))
+        self.conn.commit()
+
+    def mark_time_entries_invoiced(self, entry_ids: list[int], invoice_id: int) -> None:
+        if not entry_ids:
+            return
+        self.conn.execute(
+            "UPDATE case_time_entries SET invoice_id=%s WHERE id = ANY(%s)",
+            (int(invoice_id), [int(i) for i in entry_ids]),
+        )
         self.conn.commit()
 
     # --- Dashboard helpers
@@ -1313,15 +1425,30 @@ class Repository:
     def dashboard_alerts(self, *, stale_days: int = 15) -> dict:
         today = date.today().isoformat()
         overdue_rows = self.conn.execute(
+            """SELECT ct.id, ct.title, ct.due_date, ct.case_id, ct.es_critico,
+                      ca.title AS case_title, cl.name AS client_name
+               FROM case_tasks ct
+               JOIN cases ca ON ca.id = ct.case_id
+               LEFT JOIN clients cl ON cl.id = ca.client_id
+               WHERE ct.done = 0 AND ct.due_date IS NOT NULL AND ct.due_date < %s AND ca.archived_at IS NULL
+               ORDER BY ct.es_critico DESC, ct.due_date ASC
+               LIMIT 20""",
+            (today,),
+        ).fetchall()
+        # Plazos legales críticos: separados de "overdue_tasks" a propósito — una tarea
+        # marcada es_critico (prescripción, término procesal, etc.) no debe verse igual
+        # que un pendiente cualquiera. Incluye vencidas y las que vencen en los próximos
+        # 3 días, para que la alerta llegue antes de que ya sea tarde.
+        critical_rows = self.conn.execute(
             """SELECT ct.id, ct.title, ct.due_date, ct.case_id,
                       ca.title AS case_title, cl.name AS client_name
                FROM case_tasks ct
                JOIN cases ca ON ca.id = ct.case_id
                LEFT JOIN clients cl ON cl.id = ca.client_id
-               WHERE ct.done = 0 AND ct.due_date IS NOT NULL AND ct.due_date < %s
+               WHERE ct.done = 0 AND ct.es_critico = 1 AND ca.archived_at IS NULL
+                 AND ct.due_date IS NOT NULL AND ct.due_date <= (CURRENT_DATE + INTERVAL '3 day')::text
                ORDER BY ct.due_date ASC
                LIMIT 20""",
-            (today,),
         ).fetchall()
         stale_rows = self.conn.execute(
             """SELECT ca.id, ca.title, ca.status, cl.name AS client_name,
@@ -1329,7 +1456,7 @@ class Repository:
                FROM cases ca
                LEFT JOIN clients cl ON cl.id = ca.client_id
                LEFT JOIN sessions s ON s.case_id = ca.id
-               WHERE ca.status NOT IN ('Cerrado')
+               WHERE ca.status NOT IN ('Cerrado') AND ca.archived_at IS NULL
                GROUP BY ca.id, ca.title, ca.status, cl.name
                HAVING MAX(s.session_date::date) < (CURRENT_DATE - (%s * INTERVAL '1 day'))
                    OR MAX(s.session_date) IS NULL
@@ -1348,6 +1475,7 @@ class Repository:
                        )) AS saldo_pendiente_cents
                 FROM cases cs LEFT JOIN clients cl ON cl.id = cs.client_id
                 WHERE cs.mes_cobro_esperado IS NOT NULL AND cs.mes_cobro_esperado < %s AND cs.estado_cobro <> 'Cobrado'
+                  AND cs.archived_at IS NULL
             )
             SELECT * FROM saldos WHERE saldo_pendiente_cents > 0 ORDER BY mes_cobro_esperado ASC LIMIT 20
             """,
@@ -1364,6 +1492,7 @@ class Repository:
 
         return {
             "overdue_tasks": [dict(r) for r in overdue_rows],
+            "critical_tasks": [dict(r) for r in critical_rows],
             "stale_cases": [dict(r) for r in stale_rows],
             "overdue_billing": [dict(r) for r in overdue_billing_rows],
             "budget_deviation": desviacion_presupuesto,
@@ -1372,13 +1501,14 @@ class Repository:
     def global_search(self, q: str, *, limit: int = 8) -> dict:
         like = f"%{q}%"
         clients = self.conn.execute(
-            "SELECT id, name, client_type FROM clients WHERE name ILIKE %s ORDER BY name LIMIT %s",
+            "SELECT id, name, client_type FROM clients WHERE archived_at IS NULL AND name ILIKE %s ORDER BY name LIMIT %s",
             (like, limit),
         ).fetchall()
         cases = self.conn.execute(
             """SELECT ca.id, ca.title, ca.status, cl.name AS client_name
                FROM cases ca LEFT JOIN clients cl ON cl.id = ca.client_id
-               WHERE ca.title ILIKE %s OR ca.internal_ref ILIKE %s OR ca.official_ref ILIKE %s
+               WHERE ca.archived_at IS NULL
+                 AND (ca.title ILIKE %s OR ca.internal_ref ILIKE %s OR ca.official_ref ILIKE %s)
                ORDER BY ca.id DESC LIMIT %s""",
             (like, like, like, limit),
         ).fetchall()
@@ -1389,10 +1519,34 @@ class Repository:
                ORDER BY s.session_date DESC LIMIT %s""",
             (like, like, like, limit),
         ).fetchall()
+        invoices = self.conn.execute(
+            """SELECT i.id, i.invoice_number, i.status, i.total_cents, cl.name AS client_name
+               FROM invoices i LEFT JOIN clients cl ON cl.id = i.client_id
+               WHERE i.invoice_number ILIKE %s OR cl.name ILIKE %s
+               ORDER BY i.invoice_date DESC LIMIT %s""",
+            (like, like, limit),
+        ).fetchall()
+        tasks = self.conn.execute(
+            """SELECT ct.id, ct.title, ct.done, ct.due_date, ct.case_id, ca.title AS case_title
+               FROM case_tasks ct JOIN cases ca ON ca.id = ct.case_id
+               WHERE ca.archived_at IS NULL AND (ct.title ILIKE %s OR ca.title ILIKE %s)
+               ORDER BY ct.done ASC, ct.id DESC LIMIT %s""",
+            (like, like, limit),
+        ).fetchall()
+        oportunidades = self.conn.execute(
+            """SELECT o.id, o.estado, o.prospecto_nombre, cl.name AS client_name
+               FROM oportunidades o LEFT JOIN clients cl ON cl.id = o.client_id
+               WHERE cl.name ILIKE %s OR o.prospecto_nombre ILIKE %s
+               ORDER BY o.id DESC LIMIT %s""",
+            (like, like, limit),
+        ).fetchall()
         return {
             "clients": [dict(r) for r in clients],
             "cases": [dict(r) for r in cases],
             "sessions": [dict(r) for r in sessions],
+            "invoices": [dict(r) for r in invoices],
+            "tasks": [dict(r) for r in tasks],
+            "oportunidades": [dict(r) for r in oportunidades],
         }
 
     # --- Dashboard
@@ -1871,8 +2025,27 @@ class Repository:
                 (invoice_id, it["description"], float(it.get("quantity", 1)),
                  price_cents, it.get("entity_type"), it.get("entity_id"), created_at),
             )
+        self._mark_billed_entities(invoice_id, items)
         self.conn.commit()
         return invoice_id
+
+    # Partidas "no facturadas" (sesiones, tareas, horas) se marcan con el invoice_id de
+    # la factura que las incluyó — sin esto, la misma partida seguía apareciendo como
+    # pendiente en cada factura nueva y se podía cobrar dos veces. No existía antes de
+    # esta ronda: `create_invoice`/`update_invoice` guardaban entity_type/entity_id en
+    # invoice_items pero nunca actualizaban la tabla de origen.
+    def _mark_billed_entities(self, invoice_id: int, items: list[dict]) -> None:
+        by_type: dict[str, list[int]] = {}
+        for it in items:
+            et, eid = it.get("entity_type"), it.get("entity_id")
+            if et and eid:
+                by_type.setdefault(et, []).append(int(eid))
+        if by_type.get("session"):
+            self.conn.execute("UPDATE sessions SET invoice_id=%s WHERE id = ANY(%s)", (invoice_id, by_type["session"]))
+        if by_type.get("case_task"):
+            self.conn.execute("UPDATE case_tasks SET invoice_id=%s WHERE id = ANY(%s)", (invoice_id, by_type["case_task"]))
+        if by_type.get("time_entry"):
+            self.conn.execute("UPDATE case_time_entries SET invoice_id=%s WHERE id = ANY(%s)", (invoice_id, by_type["time_entry"]))
 
     def update_invoice(
         self,
@@ -1911,6 +2084,7 @@ class Repository:
                 (invoice_id, it["description"], float(it.get("quantity", 1)),
                  price_cents, it.get("entity_type"), it.get("entity_id"), created_at),
             )
+        self._mark_billed_entities(invoice_id, items)
         self.conn.commit()
 
     def update_invoice_status(self, invoice_id: int, status: str) -> None:
@@ -1969,7 +2143,15 @@ class Repository:
                WHERE client_id=%s ORDER BY cost_date DESC""",
             (client_id,),
         ).fetchall()
-        return {"sessions": sessions, "tasks": tasks, "costs": costs}
+        time_entries = self.conn.execute(
+            """SELECT te.id, te.work_date, te.hours, te.description, ca.title AS case_title, ca.id AS case_id
+               FROM case_time_entries te
+               JOIN cases ca ON ca.id = te.case_id
+               WHERE ca.client_id=%s AND te.billable=1 AND te.invoice_id IS NULL
+               ORDER BY te.work_date DESC""",
+            (client_id,),
+        ).fetchall()
+        return {"sessions": sessions, "tasks": tasks, "costs": costs, "time_entries": time_entries}
 
     # --- Helpers for UI
     def client_choices(self) -> list[tuple[int, str]]:
@@ -2957,6 +3139,7 @@ class Repository:
     def create_oportunidad(
         self, *, client_id: int | None = None, prospecto_nombre: str = "", prospecto_contacto: str = "",
         service_id: int | None = None, canal_captacion: str, origen_negocio: str, created_at: str,
+        honorarios_estimados_text: str = "",
     ) -> int:
         nombre = (prospecto_nombre or "").strip()
         if not client_id and not nombre:
@@ -2970,11 +3153,13 @@ class Repository:
         if service_id is not None:
             self.get_servicio(service_id)
         fecha = created_at[:10]
+        honorarios_cents = self._to_cents_or_zero(honorarios_estimados_text) or None
         cur = self.conn.execute(
             """INSERT INTO oportunidades(client_id, prospecto_nombre, prospecto_contacto, service_id, canal_captacion,
-                 origen_negocio, estado, fecha_prospecto, created_at, updated_at)
-               VALUES(%s,%s,%s,%s,%s,%s,'Prospecto',%s,%s,%s)""",
-            (client_id, nombre or None, (prospecto_contacto or "").strip() or None, service_id, canal_captacion, origen_negocio, fecha, created_at, created_at),
+                 origen_negocio, estado, honorarios_estimados_cents, fecha_prospecto, created_at, updated_at)
+               VALUES(%s,%s,%s,%s,%s,%s,'Prospecto',%s,%s,%s,%s)""",
+            (client_id, nombre or None, (prospecto_contacto or "").strip() or None, service_id, canal_captacion,
+             origen_negocio, honorarios_cents, fecha, created_at, created_at),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -2982,6 +3167,7 @@ class Repository:
     def update_oportunidad(
         self, oportunidad_id: int, *, client_id: int | None = None, prospecto_nombre: str = "", prospecto_contacto: str = "",
         service_id: int | None = None, canal_captacion: str, origen_negocio: str,
+        honorarios_estimados_text: str = "",
     ) -> None:
         current = self.get_oportunidad(oportunidad_id)
         if current["estado"] in ("Ganado", "Perdido"):
@@ -2998,10 +3184,12 @@ class Repository:
         if service_id is not None:
             self.get_servicio(service_id)
         fecha = now_iso()
+        honorarios_cents = self._to_cents_or_zero(honorarios_estimados_text) or None
         self.conn.execute(
             """UPDATE oportunidades SET client_id=%s, prospecto_nombre=%s, prospecto_contacto=%s, service_id=%s,
-                 canal_captacion=%s, origen_negocio=%s, updated_at=%s WHERE id=%s""",
-            (client_id, nombre or None, (prospecto_contacto or "").strip() or None, service_id, canal_captacion, origen_negocio, fecha, int(oportunidad_id)),
+                 canal_captacion=%s, origen_negocio=%s, honorarios_estimados_cents=%s, updated_at=%s WHERE id=%s""",
+            (client_id, nombre or None, (prospecto_contacto or "").strip() or None, service_id, canal_captacion,
+             origen_negocio, honorarios_cents, fecha, int(oportunidad_id)),
         )
         self.conn.commit()
 
@@ -3073,7 +3261,8 @@ class Repository:
                  COUNT(*) FILTER (WHERE fecha_cotizado IS NOT NULL) AS cotizados,
                  COUNT(*) FILTER (WHERE estado = 'Ganado') AS ganados,
                  COUNT(*) FILTER (WHERE estado = 'Perdido') AS perdidos,
-                 COUNT(*) FILTER (WHERE estado = 'Prospecto') AS prospectos
+                 COUNT(*) FILTER (WHERE estado = 'Prospecto') AS prospectos,
+                 COALESCE(SUM(honorarios_estimados_cents) FILTER (WHERE estado IN ('Prospecto','Cotizado')), 0) AS valor_pipeline_cents
                FROM oportunidades"""
         ).fetchone()
         cotizados = int(row["cotizados"])
@@ -3084,6 +3273,7 @@ class Repository:
             "ganados": ganados,
             "perdidos": int(row["perdidos"]),
             "conversion_pct": round(ganados / cotizados, 4) if cotizados else None,
+            "valor_pipeline_cents": int(row["valor_pipeline_cents"]),
         }
 
     # ── Comisión multi-originador (Fase 8) ───────────────────────────────────

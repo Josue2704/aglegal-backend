@@ -149,7 +149,17 @@ class UnbilledCost(BaseModel):
     cost_date: str
 
 
+class UnbilledTimeEntry(BaseModel):
+    id: int
+    work_date: str
+    hours: float
+    description: str | None
+    case_title: str | None
+    case_id: int | None
+
+
 class UnbilledItems(BaseModel):
     sessions: list[UnbilledSession]
     tasks: list[UnbilledTask]
     costs: list[UnbilledCost]
+    time_entries: list[UnbilledTimeEntry] = []

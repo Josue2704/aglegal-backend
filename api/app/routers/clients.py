@@ -4,15 +4,15 @@ from fastapi import APIRouter, HTTPException
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, LawyerRequired, RepoDep
+from ..deps import AdminRequired, CurrentUser, LawyerRequired, RepoDep
 from ..schemas.client import ClientIn, ClientOut, HistoryItem
 
 router = APIRouter(prefix="/clients", tags=["clients"])
 
 
 @router.get("", response_model=list[ClientOut])
-def list_clients(current_user: CurrentUser, repo: RepoDep, search: str | None = None) -> list[ClientOut]:
-    return [ClientOut(**dict(row)) for row in repo.list_clients(search=search)]
+def list_clients(current_user: CurrentUser, repo: RepoDep, search: str | None = None, archived: bool = False) -> list[ClientOut]:
+    return [ClientOut(**dict(row)) for row in repo.list_clients(search=search, archived=archived)]
 
 
 @router.get("/choices")
@@ -63,7 +63,25 @@ def update_client(client_id: int, body: ClientIn, current_user: CurrentUser, rep
 
 
 @router.delete("/{client_id}", status_code=204)
-def delete_client(client_id: int, current_user: LawyerRequired, repo: RepoDep):
+def archive_client(client_id: int, current_user: LawyerRequired, repo: RepoDep):
+    """Antes borraba el cliente sin posibilidad de recuperarlo. Ahora lo archiva
+    (papelera) — el registro y su historial se conservan, solo desaparece de las
+    vistas activas. El purgado permanente vive aparte, en /{client_id}/purge."""
+    repo.archive_client(client_id, archived_at=now_iso())
+
+
+@router.post("/{client_id}/restore", response_model=ClientOut)
+def restore_client(client_id: int, current_user: LawyerRequired, repo: RepoDep) -> ClientOut:
+    repo.restore_client(client_id)
+    row = repo.conn.execute("SELECT * FROM clients WHERE id=%s", (client_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Cliente no encontrado")
+    return ClientOut(**dict(row))
+
+
+@router.delete("/{client_id}/purge", status_code=204)
+def purge_client(client_id: int, current_user: AdminRequired, repo: RepoDep):
+    """Borrado real y permanente — solo desde la papelera, solo administrador."""
     repo.delete_client(client_id)
 
 
