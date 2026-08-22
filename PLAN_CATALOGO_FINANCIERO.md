@@ -280,6 +280,51 @@ Se encontraron y corrigieron 3 bugs reales, ninguno introducido en esta sesión 
 
 **Commits:** backend `acb6856`, frontend `350d9eb`.
 
+### Post-Fase 10 (8) — Auditoría "rol de abogado": papelera, conflicto de interés, plazos críticos, horas, backup ✅ Completada
+
+Pedido del cliente: "tomemos el rol de un abogado que usa el sistema" y arreglemos los hallazgos de una auditoría dedicada (`AUDITORIA_USO_ABOGADO.md`) que revisó el sistema específicamente desde la perspectiva de uso diario de un abogado litigante/notarial, no del lado financiero/administrativo ya cubierto por las fases anteriores.
+
+Se corrigieron los 10 puntos de prioridad alta y media de esa auditoría — detalle completo, con antes/después de cada uno, en `AUDITORIA_USO_ABOGADO.md`. Resumen:
+- **Backup automático diario** (no existía ninguno) — `scripts/backup.sh` + `aglegal-backup.timer`, `pg_dump` + adjuntos, rotación de 14 días.
+- **Papelera para clientes y expedientes** — el borrado ahora archiva (`archived_at`), con restaurar y purga permanente solo para administrador.
+- **Verificación de conflicto de interés** — cruza la contraparte de un expediente nuevo contra clientes y contrapartes de otros expedientes activos.
+- **Plazos legales críticos** — `case_tasks.es_critico`, con alerta propia en el Dashboard separada de los pendientes normales.
+- **Registro de horas trabajadas**, conectado al generador de facturas para servicios cobrados "Por hora".
+- **Valor monetario del pipeline** (`honorarios_estimados` en oportunidades).
+- **Nóminas enlazadas al catálogo de Personal** en vez de texto libre.
+- **Búsqueda global ampliada** a facturas, tareas y oportunidades.
+- **Crear tarea sin entrar al expediente** desde la vista global de Tareas.
+- **Recordatorio diario por correo de tareas vencidas/críticas**, requiere `users.email` (campo nuevo).
+
+**Bug preexistente encontrado y corregido de paso (no introducido por esta ronda):** `create_invoice`/`update_invoice` guardaban `entity_type`/`entity_id` en `invoice_items` pero nunca marcaban la sesión/tarea de origen como facturada (`invoice_id` nunca se actualizaba) — la misma partida podía facturarse dos veces sin que el sistema lo detectara. Corregido con `_mark_billed_entities`, aplicado también al nuevo registro de horas.
+
+**Migración v31** (aditiva, sin pérdida de datos): `users.email`, `clients.archived_at`, `cases.archived_at`, `case_tasks.es_critico`, `oportunidades.honorarios_estimados_cents`, `payrolls.personal_id`, tabla nueva `case_time_entries`.
+
+**Deliberadamente fuera de esta ronda:** los 6 puntos de prioridad baja de la auditoría (portal de cliente, 2FA, paginación, versionado de documentos/firma electrónica, soporte offline) — cada uno es una iniciativa propia con decisiones de producto pendientes (proveedor de 2FA, alcance del portal, etc.), no un ajuste que quepa junto a los diez de arriba. Quedan documentados en `AUDITORIA_USO_ABOGADO.md` para retomarlos cuando se decida su alcance.
+
+**Verificación:** recorrido completo por HTTP contra producción como abogado real (crear cliente → expediente → tarea crítica → horas → factura con esas horas → archivar/restaurar cliente y expediente → oportunidad con honorarios estimados → nómina vía Personal → búsqueda global → usuario con correo), 25 verificaciones en verde, datos de prueba limpiados y conteos confirmados de vuelta a la línea base. `npx tsc --noEmit` y `npm run build` limpios. Timer de backup instalado, habilitado y probado con una corrida manual real (dump de 22 KB + tar de adjuntos de 4.8 MB generados correctamente). Sin verificación visual en navegador (misma limitación de toda la sesión).
+
+**Commits:** backend `d336b29` + `757beab` (fix del script de backup, no sourceaba bien el `.env`). Frontend `0d7747d`.
+
+### Post-Fase 10 (9) — Auditoría de responsive/mobile + bug real en Punto de Equilibrio ✅ Completada
+
+Pedido del cliente: "analiza el sistema completo en busca de bugs, en especial en el frontend y responsive". Auditoría estática (lectura directa + un agente Explore para el barrido mecánico de patrones Tailwind) sobre las 18 páginas y los componentes compartidos.
+
+**Encontrado y corregido — responsive:**
+- **16 de 22 tablas de la app no tenían `overflow-x-auto`** (Flujo de Caja x3, Finanzas x4, Catálogo x2, Dashboard x2, Comisiones x2, Gobierno del Catálogo, Usuarios, Nóminas). En Gobierno del Catálogo y Facturas el contenedor padre además tenía `overflow-hidden`, así que no solo se desbordaba — los datos quedaban **inaccesibles**, cortados sin forma de llegar a ellos. Las 16 quedaron envueltas.
+- **El editor de líneas de "Nueva Factura" no envolvía sus campos** (cantidad/precio/subtotal/borrar) — en teléfono esa fila se salía del diálogo y rompía la creación de facturas, el hallazgo de mayor severidad de esta ronda por tratarse de un flujo central. Ahora envuelve como grupo cuando no cabe.
+- Freno global `overflow-x: hidden` en `body` — cualquier elemento que se desborde de aquí en adelante se recorta, no arrastra la página entera de lado.
+- 6 cabeceras de página sin `flex-wrap` (Expedientes, Nóminas, Facturas, Clientes, Roles, Usuarios); el diálogo de nueva sesión con una cuadrícula de 3 columnas donde solo el campo Fecha se adaptaba a móvil; tarjetas de estadísticas de Tareas sin variante móvil.
+- La Agenda ahora arranca en vista "Lista" (no "Mes") cuando el ancho de pantalla es menor a 768px al cargar — la cuadrícula de Mes/Semana queda con columnas de ~50px en un teléfono, prácticamente ilegible; el usuario sigue pudiendo cambiar de vista manualmente.
+
+**Encontrado y corregido — bug real, no solo responsive:** `calcular_punto_equilibrio()` siempre usaba los supuestos financieros más recientes por orden alfabético de período (`ORDER BY periodo DESC LIMIT 1`), **sin importar qué mes se estuviera calculando**. Con un solo período en producción no se nota, pero el día que exista un segundo período (ej. se crean los supuestos de 2027 y se sigue consultando un mes de 2026), el cálculo habría usado los supuestos equivocados sin ningún aviso. Corregido para que `get_supuestos_activos` prefiera el período exacto del mes solicitado y solo caiga al más reciente si no existe uno para ese año — mismo criterio replicado en el frontend (`PuntoEquilibrioTab`), que además ahora avisa visiblemente cuando está mostrando supuestos de un año distinto al seleccionado.
+
+**Documentado pero fuera de esta ronda, a propósito:** dos limitaciones de la Agenda que tocan una funcionalidad compleja ya en uso (arrastrar-para-reagendar) y que no se pueden verificar sin navegador real — (1) la vista "Semana" sigue con columnas de ancho fijo en píxeles, apretada en teléfono aunque ya no es la vista por defecto ahí; (2) arrastrar una sesión para reagendarla usa drag-and-drop nativo de HTML5, que los navegadores móviles no disparan sin una librería aparte — el respaldo (editar la sesión a mano) ya funciona. Rediseñarlas bien requiere una decisión de alcance, no un parche a ciegas.
+
+**Verificación:** `npx tsc --noEmit` y `npm run build` limpios en cada ronda de cambios. Sin verificación visual en navegador (misma limitación de toda la sesión) — la validación de los fixes de layout fue por lectura de código y por conteo programático de patrones (ej. confirmar que las 22 tablas de la app quedaran cubiertas), no por captura de pantalla.
+
+**Commits:** frontend `8b47519`. Backend: fix de `get_supuestos_activos` pendiente de commit/despliegue en este mismo corte.
+
 ---
 
 ## Cómo trabajamos

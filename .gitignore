@@ -25,6 +25,7 @@ backups/
 .env.*
 !.env.production.example
 CREDENTIALS.md
+DEPLOY.md
 secrets.json
 google_tokens.json
 
@@ -37,6 +38,7 @@ attachments/
 .idea/
 *.suo
 *.user
+.claude/
 
 # OS
 .DS_Store

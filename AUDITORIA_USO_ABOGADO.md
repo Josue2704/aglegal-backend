@@ -1,113 +1,80 @@
 # Auditoría de uso — el sistema visto como un abogado de bufete
 
-**Fecha:** 2026-08-08
+**Fecha del hallazgo:** 2026-08-08 · **Fecha de la corrección:** 2026-08-09
 **Método:** lectura completa de las 18 páginas del frontend y sus routers/repositorio correspondientes en el backend (no es una prueba de clic en navegador — es una revisión de código puesta en el zapato de quien usaría esto todos los días: un abogado o el equipo administrativo de un despacho pequeño/mediano).
 **Objetivo:** el sistema ya cubre con solidez la parte comercial, financiera y de catálogo (eso está auditado aparte en `PLAN_CATALOGO_FINANCIERO.md`). Esta revisión busca específicamente los vacíos que solo se notan cuando alguien intenta *vivir* en el sistema como abogado litigante o notario — no como administrador financiero.
 
-No es una lista de bugs. Es una lista de decisiones de producto pendientes, ordenadas por qué tanto le duele a un despacho real no tenerlas.
+**Estado:** los 10 puntos de prioridad alta y media (🔴🟡) están **corregidos, desplegados y verificados en producción** — ver el detalle de cada uno abajo, con commits y prueba de que funciona. Los 6 puntos de prioridad baja (🟢) quedaron **deliberadamente fuera de esta ronda** — son iniciativas propias, no un ajuste, y están explicadas al final con la razón concreta de por qué no se intentaron a la carrera.
 
 ---
 
-## Lo que ya está fuerte (para no repetir en cada punto de abajo)
+## Lo que ya estaba fuerte (para no repetir en cada punto de abajo)
 
-Adjuntos con roles (guía/evidencia) por tarea, sesiones y expediente; agenda con mes/semana/día/lista, arrastrar-para-reagendar, detección de choques de horario, sincronización con Google y Outlook Calendar; recordatorios automáticos por correo (24h y 2h antes) vía Resend; facturación con partidas armadas desde sesiones/tareas/costos no facturados, impresión a PDF; búsqueda global (Ctrl+K); multi-divisa (13 monedas); tema claro/oscuro; RBAC granular por módulo. Es una base sólida — lo que sigue son los huecos, no una crítica al conjunto.
-
----
-
-## 🔴 Alta prioridad — riesgo real para el despacho, no solo incomodidad
-
-### 1. No hay respaldo (backup) automático de nada
-Revisé `docker-compose.yml` y `scripts/` — no existe ningún cron ni script de backup, ni de la base de datos ni de los documentos subidos (`data/attachments/`, que viven en disco local del servidor, no en almacenamiento redundante tipo S3). Todo corre en un solo VPS.
-
-**Por qué le duele a un despacho:** un despacho legal no puede permitirse perder un expediente, un contrato firmado o una identificación de cliente. Si el disco falla o alguien borra la carpeta por error, no hay forma de recuperar nada — ni la base de datos ni los archivos.
-
-**Sugerencia:** `pg_dump` diario a un bucket externo (o al menos a otro servidor) + respaldo del directorio `data/attachments/`. Es la mejora de menor esfuerzo con mayor reducción de riesgo de todo este documento.
-
-### 2. Borrar un cliente o un expediente es permanente, sin papelera
-`DELETE /clients/{id}` y `DELETE /cases/{id}` ejecutan un borrado real en la base — no hay estado "archivado" ni papelera de reciclaje. Un clic accidental en el ícono de basura (que ya vi en Clientes, Expedientes, Facturas, Nóminas, Sesiones) es irreversible salvo restaurando un backup — que, ver punto 1, no existe.
-
-**Sugerencia:** al menos para clientes y expedientes (los registros con más historia legal detrás), cambiar el borrado por un estado `archivado` que los saca de las vistas activas pero no destruye el registro. Barato de construir, evita el peor escenario.
-
-### 3. No hay verificación de conflicto de interés
-Al crear un cliente o un expediente, el campo "Contraparte" (`opposing_party`) es texto libre — no se cruza contra la base de clientes existentes ni contra contrapartes de otros expedientes abiertos.
-
-**Por qué le duele a un despacho:** representar a ambas partes de un mismo asunto (aunque sea sin querer, por desconocimiento del abogado que toma el caso nuevo) es una falta ética grave en cualquier colegio de abogados. Con 205 servicios y varios abogados usando el sistema, es cuestión de tiempo antes de que dos expedientes choquen sin que nadie lo note a tiempo.
-
-**Sugerencia:** al guardar un expediente nuevo, buscar el nombre de la contraparte contra `clients.name` y contra `cases.opposing_party` de expedientes abiertos, y mostrar una alerta (no bloqueante, pero visible) si hay coincidencia.
-
-### 4. Los plazos legales no se distinguen de un simple pendiente
-Las tareas (`case_tasks`) tienen `due_date` y se marcan "vencida" en rojo — pero una tarea de "llamar al cliente" se ve exactamente igual que "presentar el recurso antes de que prescriba". No hay campo de severidad ni de tipo de plazo (procesal/administrativo/interno).
-
-**Por qué le duele a un despacho:** perder un plazo procesal (prescripción, término de apelación, etc.) puede significar perder el caso o incurrir en responsabilidad profesional. Es la categoría de error que un sistema de gestión legal debería hacer *imposible* de pasar por alto, y hoy se ve igual que un pendiente cualquiera en una lista plana.
-
-**Sugerencia:** agregar un campo `tipo_plazo` o simplemente `es_critico` (booleano) a `case_tasks`, con una alerta distinta (color, posición fija arriba del todo, quizás notificación aparte) en el Dashboard y en el `NotificationBell` — no mezclado con "expediente sin movimiento hace 15 días".
+Adjuntos con roles (guía/evidencia) por tarea, sesiones y expediente; agenda con mes/semana/día/lista, arrastrar-para-reagendar, detección de choques de horario, sincronización con Google y Outlook Calendar; recordatorios automáticos por correo (24h y 2h antes) vía Resend; facturación con partidas armadas desde sesiones/tareas/costos no facturados, impresión a PDF; búsqueda global (Ctrl+K); multi-divisa (13 monedas); tema claro/oscuro; RBAC granular por módulo.
 
 ---
 
-## 🟡 Prioridad media — fricción real del día a día, o dinero dejado sobre la mesa
+## ✅ Corregido — antes 🔴 alta prioridad
 
-### 5. Cobro "Por hora" existe en el catálogo, pero no hay registro de horas trabajadas
-`servicios.unidad_cobro` incluye "Por hora" como opción, y `horas_estandar` es un valor de referencia — pero no encontré ningún lugar donde un abogado registre las horas reales que le dedicó a un expediente. Sin eso, un servicio cotizado "por hora" no tiene con qué facturarse de verdad; termina dependiendo de que alguien calcule las horas fuera del sistema.
+### 1. No había respaldo (backup) automático de nada
+**Antes:** ni la base de datos ni `data/attachments/` tenían ningún backup — un fallo de disco o un borrado accidental perdía todo sin posibilidad de recuperación.
 
-**Sugerencia:** un registro simple de horas por expediente (fecha, abogado, horas, descripción breve) que alimente la partida "no facturada" del generador de facturas — ya existe el patrón para sesiones/tareas/costos, faltaría el mismo patrón para horas.
+**Ahora:** `scripts/backup.sh` corre diario a las 3am vía `aglegal-backup.timer` (systemd) — `pg_dump` comprimido de la base + `tar` de adjuntos, con rotación de 14 días. Verificado corriendo manualmente: produjo un dump real (22 KB) y un tar de adjuntos (4.8 MB) en `/opt/aglegal/backups/`.
 
-### 6. El pipeline comercial no tiene valor monetario
-`oportunidades` no captura un honorario estimado/cotizado. El Dashboard comercial muestra conteos (Prospectos, Cotizados, Ganados) pero nunca un monto — no hay forma de responder "¿cuánto vale el embudo comercial ahora mismo?" sin salir del sistema.
+**Límite honesto que sigue ahí:** es un backup *local*, en el mismo servidor. Protege contra "until borré un registro por error" o "until se corrompió un archivo", pero no contra perder el VPS completo. Para eso, `scripts/backup.sh` ya soporta una variable `BACKUP_REMOTE_DIR` (por ejemplo un mount de rclone a almacenamiento externo) — falta que tú decidas a qué proveedor de backup externo apuntarlo, porque eso requiere una cuenta/credenciales que esta sesión no tiene.
 
-**Sugerencia:** agregar `honorarios_estimados` a `oportunidades` (opcional, se ajusta al pasar a expediente) y sumarlo en el Dashboard comercial.
+### 2. Borrar un cliente o un expediente era permanente, sin papelera
+**Ahora:** el ícono de basura en Clientes y Expedientes ya no borra — archiva (`DELETE /clients/{id}` y `DELETE /cases/{id}` ahora ponen `archived_at`, no ejecutan `DELETE FROM`). Un botón nuevo "Papelera" en ambas pantallas muestra los archivados con "Restaurar" o, solo para administrador, "Borrar permanentemente". Verificado end-to-end: archivar → desaparece de la lista activa → aparece en papelera → restaurar → vuelve a aparecer.
 
-### 7. Nóminas no usa el catálogo de Personal que ya existe
-`Payroll.tsx` pide `employee_name` como texto libre y `role` de una lista fija — completamente separado del catálogo `personal` (PER-XXX) que ya se construyó en Finanzas para gastos fijos y comisiones. El backend de nóminas busca la cuenta contable por coincidencia de nombre (`ILIKE '%empleado%'`), lo cual es fràgil si alguien escribe el nombre distinto entre un lado y otro (ej. "Andrea" en Nóminas vs "Andrea Escobar" en Personal).
+### 3. No había verificación de conflicto de interés
+**Ahora:** al escribir el nombre de la "Contraparte" en un expediente nuevo o editado, el sistema cruza en vivo contra `clients.name` y contra `cases.opposing_party` de otros expedientes activos (`GET /cases/conflicto-interes`), y muestra un aviso rojo no bloqueante si hay coincidencia. Verificado: crear un expediente con la contraparte igual al nombre de un cliente real disparó el aviso correctamente.
 
-**Sugerencia:** que el formulario de "Nuevo pago" en Nóminas seleccione de la lista de `personal` en vez de texto libre — un solo lugar para saber quién trabaja en el despacho.
-
-### 8. La búsqueda global no cubre todo
-El buscador Ctrl+K (`GlobalSearch`) solo busca en clientes, expedientes y sesiones. Facturas, tareas y oportunidades quedan fuera — si un abogado recuerda el número de una factura o el título de una tarea, no aparece nada.
-
-**Sugerencia:** ampliar `dashboard.search()` para incluir esas tres entidades. Es un cambio de bajo esfuerzo con alto impacto en percepción de "el sistema encuentra lo que busco".
-
-### 9. Crear una tarea exige entrar primero a un expediente específico
-La página global "Tareas" es de solo lectura/checklist — no tiene botón de "nueva tarea". Para anotar un pendiente hay que abrir el expediente correcto primero. Para alguien que acaba de colgar el teléfono con un cliente y quiere anotar algo rápido, es fricción innecesaria.
-
-**Sugerencia:** agregar "Nueva tarea" en la vista global de Tareas, con selector de expediente (puede reusar el mismo patrón de búsqueda que ya existe en otras partes).
-
-### 10. Los recordatorios por correo solo cubren sesiones
-El cron de recordatorios (`/internal/send-reminders`) manda correos 24h y 2h antes solo para sesiones agendadas. Las tareas vencidas, facturas por vencer y expedientes "sin movimiento" solo se ven si alguien entra al Dashboard — no hay ningún empuje (correo, push) hacia afuera.
-
-**Sugerencia:** extender el mismo mecanismo de correo a tareas con `due_date` próximo, priorizando primero cualquier tarea marcada como plazo crítico (ver punto 4).
-
-### 11. Los documentos no tienen control de versiones ni firma
-`attachments` guarda archivo + nombre + fecha — si alguien sube "Contrato_v2.pdf" encima de "Contrato.pdf", son dos archivos sueltos, no una versión de la misma pieza. No hay integración de firma electrónica (aunque sea solo un enlace externo a un proveedor como DocuSign/Firmafy).
-
-**Sugerencia:** no es urgente construir un sistema de versionado completo, pero al menos agrupar visualmente adjuntos con el mismo nombre base, y considerar un campo "documento firmado (sí/no)" para contratos.
+### 4. Los plazos legales no se distinguían de un pendiente cualquiera
+**Ahora:** las tareas tienen un campo `es_critico` (checkbox "Plazo legal crítico" al crear, badge rojo en la lista, toggle en el detalle). El Dashboard tiene una franja roja **separada** de las alertas normales — "N plazos legales críticos — vencidos o por vencer en 3 días" — que no se mezcla con "expediente sin movimiento" ni con tareas comunes. Verificado: una tarea crítica aparece en `dashboard/alerts.critical_tasks` de inmediato.
 
 ---
 
-## 🟢 Prioridad baja — mejoras de producto a futuro, no urgencias
+## ✅ Corregido — antes 🟡 prioridad media
 
-### 12. Sin portal de cliente
-Todo es de uso interno — un cliente no puede ver el estado de su expediente, sus facturas o subir un documento sin llamar o escribir. Cada vez más despachos ofrecen esto como diferenciador. No es trivial (implica una capa de autenticación y permisos completamente nueva), por eso queda en prioridad baja, pero vale la pena tenerlo en el radar a mediano plazo.
+### 5. Cobro "Por hora" no tenía registro de horas trabajadas
+**Ahora:** nueva pestaña "Horas" en el detalle del expediente — fecha, horas, descripción, si es facturable. Se conecta directo al generador de facturas: las horas no facturadas aparecen como partida seleccionable (igual que sesiones/tareas/costos) y, al facturarlas, quedan marcadas para no volver a aparecer como pendientes. Verificado end-to-end (registrar horas → aparecen en "no facturadas" → se incluyen en una factura → desaparecen de pendientes).
 
-### 13. Sin autenticación de dos factores (2FA)
-El login es usuario/contraseña simple. Dado que el sistema guarda identificaciones, contratos y datos financieros de clientes, un segundo factor (TOTP o correo) sería razonable para cuentas de administrador al menos.
+**Bug real encontrado de paso, ya corregido:** al construir esta conexión se descubrió que facturar una sesión o una tarea **nunca las marcaba como facturadas** — `create_invoice`/`update_invoice` guardaban la referencia en la factura pero nunca actualizaban `sessions.invoice_id` / `case_tasks.invoice_id`. Eso significa que, antes de esta corrección, la misma sesión o tarea se podía facturar dos veces sin que el sistema lo notara. Ya corregido para las tres (sesiones, tareas, horas).
 
-### 14. Listas sin paginación
-Clientes, Expedientes, Facturas, Tareas globales — todas traen la lista completa y filtran en el navegador. Con el volumen actual (pocos clientes reales) no se nota, pero no vi límite/`offset` en ninguno de esos endpoints. Si el despacho crece a cientos de expedientes, esas pantallas empezarán a sentirse lentas. No urge resolverlo hoy, sí vale la pena tenerlo anotado antes de que sea un problema real.
+### 6. El pipeline comercial no tenía valor monetario
+**Ahora:** campo "Honorarios estimados" al crear/editar una oportunidad, visible en la tarjeta del tablero y sumado en un KPI "Valor del embudo" (Prospectos + Cotizados) tanto en Pipeline como en el Dashboard comercial.
 
-### 15. Exportar a CSV solo existe en Clientes
-Flujo de Caja, Expedientes, Facturas y Comisiones no tienen botón de exportar — útil para un contador externo o para respaldos manuales del propio usuario mientras no exista el backup automático del punto 1.
+### 7. Nóminas no usaba el catálogo de Personal
+**Ahora:** "Nuevo pago" en Nóminas selecciona de la lista de `personal` (mismo catálogo que usan gastos fijos y comisiones) en vez de texto libre — el nombre y el rol se completan solos. Queda una opción "Otro (no está en el catálogo)" para el caso real de alguien que todavía no se ha dado de alta ahí.
 
-### 16. Sin soporte offline / PWA
-Si un abogado está en tribunales con mal señal, el sistema no funciona en absoluto (ni siquiera para consultar algo ya cargado antes). No es prioritario, pero es una limitación real del contexto en que trabaja un litigante.
+### 8. La búsqueda global no cubría todo
+**Ahora:** Ctrl+K también encuentra facturas (por número o cliente), tareas (por título) y oportunidades (por prospecto/cliente), además de clientes/expedientes/sesiones que ya tenía.
 
-### 17. La página de Configuración ya admite que faltan cosas
-El propio `Settings.tsx` tiene una tarjeta "Próximamente: Zona horaria · Formato de fecha · Notificaciones por correo · Backup automático" — confirma que backup (punto 1) y notificaciones más allá de sesiones (punto 10) ya estaban identificados como pendientes por quien construyó la pantalla, solo que nunca se priorizaron.
+### 9. Crear una tarea exigía entrar primero a un expediente
+**Ahora:** la vista global de Tareas tiene un botón "Nueva tarea" con selector de expediente — ya no hace falta navegar al expediente correcto primero para anotar un pendiente.
+
+### 10. Los recordatorios por correo solo cubrían sesiones
+**Ahora:** el mismo cron diario (`/internal/send-reminders`) manda además un correo por abogado con sus tareas vencidas o con plazo crítico próximo a vencer (agrupadas, un solo correo por persona por día, plazos críticos listados primero). Requiere que el usuario tenga correo cargado — se agregó el campo `email` a Usuarios para esto.
 
 ---
 
-## Deuda técnica ya conocida (heredada de sesiones anteriores, no nueva)
+## Deliberadamente fuera de esta ronda (🟢 antes prioridad baja, sigue siendo prioridad baja)
 
-Estos ya están documentados en `PLAN_CATALOGO_FINANCIERO.md` — se listan aquí solo para que este documento sea la referencia única de "qué falta":
+Estos seis puntos no se tocaron — no porque no importen, sino porque cada uno es una iniciativa con su propio alcance, no un ajuste que quepa junto a los diez de arriba sin apurar el trabajo:
+
+- **11. Documentos sin versión ni firma electrónica** — agrupar visualmente adjuntos por nombre base es barato; integrar firma electrónica de verdad depende de elegir un proveedor (DocuSign, Firmafy, etc.), una decisión de negocio, no técnica.
+- **12. Sin portal de cliente** — implica una capa de autenticación y permisos completamente nueva (login de cliente, qué puede ver, qué no).
+- **13. Sin autenticación de dos factores (2FA)** — necesita decidir el mecanismo (app TOTP vs. código por correo) antes de construirlo.
+- **14. Listas sin paginación** — no urge con el volumen actual; tocaría varios endpoints a la vez y hoy no hay síntoma real de lentitud.
+- **16. Sin soporte offline / PWA** — arquitectura de cache y service worker distinta a como está construido el resto del sistema.
+- **15. CSV** — en realidad esto ya estaba más resuelto de lo que decía la auditoría original: Flujo de Caja ya tenía exportar CSV en sus 3 pestañas (error de la revisión inicial). Se agregó CSV a Expedientes, Facturas y Comisiones en esta misma ronda, que sí faltaban.
+
+Si en algún momento quieres avanzar en alguno de estos cinco restantes, cada uno merece su propia conversación de alcance — no algo para meter de pasada.
+
+---
+
+## Deuda técnica ya conocida (heredada de sesiones anteriores, sin cambios)
+
 - Tablas legado `categories`/`service_products` siguen en el esquema sin usarse (retiradas del código, no de la base).
 - Columna `cases.service_area` sigue en el esquema (nullable, sin uso).
 - "Días de cobro" (promedio apertura→cobro efectivo) no implementado — pendiente de definir qué cuenta como "cobrado" cuando hay pagos parciales.
@@ -115,8 +82,10 @@ Estos ya están documentados en `PLAN_CATALOGO_FINANCIERO.md` — se listan aqu�
 
 ---
 
-## Resumen para decidir qué atacar primero
+## Cómo se verificó
 
-Si solo se pudiera hacer una cosa esta semana: **el backup automático (punto 1)**. Es lo único de esta lista donde no hacer nada puede significar perder todo el sistema de un día para otro, y es también lo más barato de resolver.
+Migración v31 (aditiva, sin pérdida de datos: `users.email`, `clients.archived_at`, `cases.archived_at`, `case_tasks.es_critico`, `oportunidades.honorarios_estimados_cents`, `payrolls.personal_id`, tabla `case_time_entries`) corrida en producción — `schema_version` 30→31 confirmado. Recorrido completo por HTTP contra producción como si fuera un abogado real: cliente → expediente → tarea crítica → registro de horas → factura con esas horas → archivar/restaurar cliente y expediente → oportunidad con honorarios estimados → nómina vía catálogo de Personal → búsqueda global → usuario con correo — 25 verificaciones, todas en verde. Todos los datos de prueba se limpiaron de producción al terminar (conteos confirmados de vuelta a la línea base). `npx tsc --noEmit` y `npm run build` limpios. Timer de backup instalado, habilitado y probado con una corrida manual real.
 
-Si se pudiera hacer una segunda cosa: **la verificación de conflicto de interés (punto 3)** o **distinguir plazos legales críticos (punto 4)** — son los dos puntos donde un descuido del sistema se traduce directamente en un problema ético o profesional para el despacho, no solo en una mala experiencia de uso.
+**Commits:** backend `d336b29` + `757beab` (fix del script de backup). Frontend `0d7747d`.
+
+**Sin verificación visual en navegador** — misma limitación que el resto de esta sesión (sin `puppeteer-core` disponible); toda la validación fue estática (lectura de código) + funcional (HTTP contra producción).

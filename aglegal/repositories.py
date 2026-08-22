@@ -2867,7 +2867,16 @@ class Repository:
     def list_supuestos(self) -> list[Any]:
         return list(self.conn.execute("SELECT * FROM supuestos_financieros ORDER BY periodo DESC").fetchall())
 
-    def get_supuestos_activos(self) -> Any | None:
+    def get_supuestos_activos(self, *, periodo: str | None = None) -> Any | None:
+        """Si se pide un período (ej. el año del mes que se está calculando) y existen
+        supuestos para ese período exacto, se usan esos. Si no, cae al más reciente que
+        haya — antes siempre tomaba el más reciente sin importar qué mes se pedía, así
+        que calcular el punto de equilibrio de un mes viejo con supuestos nuevos ya
+        creados para otro año habría usado los supuestos equivocados sin avisar."""
+        if periodo:
+            row = self.conn.execute("SELECT * FROM supuestos_financieros WHERE periodo=%s", (periodo,)).fetchone()
+            if row:
+                return row
         return self.conn.execute("SELECT * FROM supuestos_financieros ORDER BY periodo DESC LIMIT 1").fetchone()
 
     @staticmethod
@@ -2930,7 +2939,7 @@ class Repository:
         ).fetchone()
         gastos_fijos_cents = int(row["total"])
 
-        supuestos = self.get_supuestos_activos()
+        supuestos = self.get_supuestos_activos(periodo=m[:4])
         if not supuestos:
             raise ValueError("No hay supuestos financieros configurados todavía")
         cv = float(supuestos["costo_variable_pct"])
