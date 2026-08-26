@@ -217,8 +217,32 @@ def cumplimiento_familia(current_user: CurrentUser, repo: RepoDep, mes: str, _: 
         {
             "family_id": r["family_id"], "family_code": r["family_code"], "family_nombre": r["family_nombre"],
             "meta_casos": r["meta_casos"], "casos_reales": r["casos_reales"], "cumplimiento_casos_pct": r["cumplimiento_casos_pct"],
+            "semaforo_casos": r["semaforo_casos"],
             "meta_ingresos": r["meta_ingresos_cents"] / 100, "ingresos_reales": r["ingresos_reales_cents"] / 100,
             "cumplimiento_ingresos_pct": r["cumplimiento_ingresos_pct"],
+            "semaforo_ingresos": r["semaforo_ingresos"],
+            "brecha_ingresos": r["brecha_ingresos_cents"] / 100,
+            "costos_directos_reales": r["costos_directos_reales_cents"] / 100,
+            "utilidad_directa_meta": r["utilidad_directa_meta_cents"] / 100,
+            "utilidad_directa_real": r["utilidad_directa_real_cents"] / 100,
+            "cumplimiento_utilidad_pct": r["cumplimiento_utilidad_pct"],
+            "semaforo_utilidad": r["semaforo_utilidad"],
+            "ticket_real": (r["ticket_real_cents"] / 100) if r["ticket_real_cents"] is not None else None,
         }
         for r in rows
     ]
+
+
+@router.get("/utilidad-operativa-real")
+def utilidad_operativa_real(current_user: CurrentUser, repo: RepoDep, mes: str, _: dict = require_permission("finanzas", "ver")) -> dict:
+    r = repo.utilidad_operativa_real(mes=mes)
+    return {
+        "mes": r["mes"],
+        "ingresos_reales": r["ingresos_reales_cents"] / 100,
+        "costos_directos_reales": r["costos_directos_reales_cents"] / 100,
+        "utilidad_directa_real": r["utilidad_directa_real_cents"] / 100,
+        "gastos_fijos": r["gastos_fijos_cents"] / 100,
+        "comisiones": r["comisiones_cents"] / 100,
+        "utilidad_operativa_real": r["utilidad_operativa_real_cents"] / 100,
+        "margen_operativo_real_pct": r["margen_operativo_real_pct"],
+    }

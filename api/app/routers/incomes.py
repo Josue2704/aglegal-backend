@@ -40,6 +40,7 @@ def create_income(body: IncomeIn, current_user: CurrentUser, repo: RepoDep, _: d
         service_id=body.service_id,
         monto_iva_text=str(body.monto_iva) if body.monto_iva is not None else "",
         monto_reembolsable_text=str(body.monto_reembolsable) if body.monto_reembolsable is not None else "",
+        monto_fondos_terceros_text=str(body.monto_fondos_terceros) if body.monto_fondos_terceros is not None else "",
     )
     if body.case_id:
         # Reconoce comisión automáticamente si el expediente tiene originadores configurados.
@@ -67,6 +68,7 @@ def update_income(income_id: int, body: IncomeIn, current_user: CurrentUser, rep
         service_id=body.service_id,
         monto_iva_text=str(body.monto_iva) if body.monto_iva is not None else "",
         monto_reembolsable_text=str(body.monto_reembolsable) if body.monto_reembolsable is not None else "",
+        monto_fondos_terceros_text=str(body.monto_fondos_terceros) if body.monto_fondos_terceros is not None else "",
     )
     row = repo.get_income(income_id)
     if not row:

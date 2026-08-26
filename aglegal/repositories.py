@@ -528,6 +528,7 @@ class Repository:
         service_id: int | None = None,
         monto_iva_text: str = "",
         monto_reembolsable_text: str = "",
+        monto_fondos_terceros_text: str = "",
     ) -> int:
         amount_cents = _to_cents(amount_text)
         resolved_detail = (detail or concept or "").strip()
@@ -537,12 +538,13 @@ class Repository:
             self.get_servicio(service_id)
         iva_cents = self._to_cents_or_zero(monto_iva_text)
         reembolsable_cents = self._to_cents_or_zero(monto_reembolsable_text)
-        if iva_cents + reembolsable_cents > amount_cents:
-            raise ValueError("IVA + reembolsable no puede superar el monto bruto")
+        fondos_terceros_cents = self._to_cents_or_zero(monto_fondos_terceros_text)
+        if iva_cents + reembolsable_cents + fondos_terceros_cents > amount_cents:
+            raise ValueError("IVA + reembolsable + fondos de terceros no puede superar el monto bruto")
         cur = self.conn.execute(
             "INSERT INTO incomes(client_id, case_id, concept, amount_cents, income_date, created_at, detail, "
-            "invoice_id, account_id, service_id, monto_iva_cents, monto_reembolsable_cents) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "invoice_id, account_id, service_id, monto_iva_cents, monto_reembolsable_cents, monto_fondos_terceros_cents) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
@@ -556,6 +558,7 @@ class Repository:
                 int(service_id) if service_id else None,
                 iva_cents,
                 reembolsable_cents,
+                fondos_terceros_cents,
             ),
         )
         self.conn.commit()
@@ -577,6 +580,7 @@ class Repository:
         service_id: int | None = None,
         monto_iva_text: str = "",
         monto_reembolsable_text: str = "",
+        monto_fondos_terceros_text: str = "",
     ) -> None:
         amount_cents = _to_cents(amount_text)
         resolved_detail = (detail or "").strip()
@@ -586,11 +590,13 @@ class Repository:
             self.get_servicio(service_id)
         iva_cents = self._to_cents_or_zero(monto_iva_text)
         reembolsable_cents = self._to_cents_or_zero(monto_reembolsable_text)
-        if iva_cents + reembolsable_cents > amount_cents:
-            raise ValueError("IVA + reembolsable no puede superar el monto bruto")
+        fondos_terceros_cents = self._to_cents_or_zero(monto_fondos_terceros_text)
+        if iva_cents + reembolsable_cents + fondos_terceros_cents > amount_cents:
+            raise ValueError("IVA + reembolsable + fondos de terceros no puede superar el monto bruto")
         self.conn.execute(
             "UPDATE incomes SET amount_cents=%s, income_date=%s, client_id=%s, "
-            "case_id=%s, detail=%s, concept=%s, account_id=%s, service_id=%s, monto_iva_cents=%s, monto_reembolsable_cents=%s "
+            "case_id=%s, detail=%s, concept=%s, account_id=%s, service_id=%s, monto_iva_cents=%s, "
+            "monto_reembolsable_cents=%s, monto_fondos_terceros_cents=%s "
             "WHERE id=%s",
             (
                 amount_cents,
@@ -603,6 +609,7 @@ class Repository:
                 int(service_id) if service_id else None,
                 iva_cents,
                 reembolsable_cents,
+                fondos_terceros_cents,
                 int(income_id),
             ),
         )
@@ -638,18 +645,20 @@ class Repository:
         account_id: int | None = None,
         monto_iva_text: str = "",
         monto_reembolsable_text: str = "",
+        monto_fondos_terceros_text: str = "",
     ) -> int:
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
         self._validate_movement_account(account_id, expected_tipo="Egreso")
         iva_cents = self._to_cents_or_zero(monto_iva_text)
         reembolsable_cents = self._to_cents_or_zero(monto_reembolsable_text)
-        if iva_cents + reembolsable_cents > amount_cents:
-            raise ValueError("IVA + reembolsable no puede superar el monto bruto")
+        fondos_terceros_cents = self._to_cents_or_zero(monto_fondos_terceros_text)
+        if iva_cents + reembolsable_cents + fondos_terceros_cents > amount_cents:
+            raise ValueError("IVA + reembolsable + fondos de terceros no puede superar el monto bruto")
         cur = self.conn.execute(
             "INSERT INTO expenses(concept, amount_cents, expense_date, notes, created_at, detail, "
-            "account_id, monto_iva_cents, monto_reembolsable_cents) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "account_id, monto_iva_cents, monto_reembolsable_cents, monto_fondos_terceros_cents) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 concept,
                 amount_cents,
@@ -660,6 +669,7 @@ class Repository:
                 int(account_id) if account_id else None,
                 iva_cents,
                 reembolsable_cents,
+                fondos_terceros_cents,
             ),
         )
         self.conn.commit()
@@ -679,17 +689,19 @@ class Repository:
         account_id: int | None = None,
         monto_iva_text: str = "",
         monto_reembolsable_text: str = "",
+        monto_fondos_terceros_text: str = "",
     ) -> None:
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
         self._validate_movement_account(account_id, expected_tipo="Egreso")
         iva_cents = self._to_cents_or_zero(monto_iva_text)
         reembolsable_cents = self._to_cents_or_zero(monto_reembolsable_text)
-        if iva_cents + reembolsable_cents > amount_cents:
-            raise ValueError("IVA + reembolsable no puede superar el monto bruto")
+        fondos_terceros_cents = self._to_cents_or_zero(monto_fondos_terceros_text)
+        if iva_cents + reembolsable_cents + fondos_terceros_cents > amount_cents:
+            raise ValueError("IVA + reembolsable + fondos de terceros no puede superar el monto bruto")
         self.conn.execute(
             "UPDATE expenses SET detail=%s, concept=%s, amount_cents=%s, expense_date=%s, notes=%s, "
-            "account_id=%s, monto_iva_cents=%s, monto_reembolsable_cents=%s WHERE id=%s",
+            "account_id=%s, monto_iva_cents=%s, monto_reembolsable_cents=%s, monto_fondos_terceros_cents=%s WHERE id=%s",
             (
                 (detail or "").strip(),
                 concept,
@@ -699,6 +711,7 @@ class Repository:
                 int(account_id) if account_id else None,
                 iva_cents,
                 reembolsable_cents,
+                fondos_terceros_cents,
                 int(expense_id),
             ),
         )
@@ -738,6 +751,7 @@ class Repository:
         service_id: int | None = None,
         monto_iva_text: str = "",
         monto_reembolsable_text: str = "",
+        monto_fondos_terceros_text: str = "",
     ) -> int:
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
@@ -746,12 +760,13 @@ class Repository:
             self.get_servicio(service_id)
         iva_cents = self._to_cents_or_zero(monto_iva_text)
         reembolsable_cents = self._to_cents_or_zero(monto_reembolsable_text)
-        if iva_cents + reembolsable_cents > amount_cents:
-            raise ValueError("IVA + reembolsable no puede superar el monto bruto")
+        fondos_terceros_cents = self._to_cents_or_zero(monto_fondos_terceros_text)
+        if iva_cents + reembolsable_cents + fondos_terceros_cents > amount_cents:
+            raise ValueError("IVA + reembolsable + fondos de terceros no puede superar el monto bruto")
         cur = self.conn.execute(
             "INSERT INTO costs(client_id, case_id, concept, detail, amount_cents, cost_date, notes, created_at, "
-            "account_id, service_id, monto_iva_cents, monto_reembolsable_cents) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "account_id, service_id, monto_iva_cents, monto_reembolsable_cents, monto_fondos_terceros_cents) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
@@ -765,6 +780,7 @@ class Repository:
                 int(service_id) if service_id else None,
                 iva_cents,
                 reembolsable_cents,
+                fondos_terceros_cents,
             ),
         )
         self.conn.commit()
@@ -787,6 +803,7 @@ class Repository:
         service_id: int | None = None,
         monto_iva_text: str = "",
         monto_reembolsable_text: str = "",
+        monto_fondos_terceros_text: str = "",
     ) -> None:
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
@@ -795,11 +812,13 @@ class Repository:
             self.get_servicio(service_id)
         iva_cents = self._to_cents_or_zero(monto_iva_text)
         reembolsable_cents = self._to_cents_or_zero(monto_reembolsable_text)
-        if iva_cents + reembolsable_cents > amount_cents:
-            raise ValueError("IVA + reembolsable no puede superar el monto bruto")
+        fondos_terceros_cents = self._to_cents_or_zero(monto_fondos_terceros_text)
+        if iva_cents + reembolsable_cents + fondos_terceros_cents > amount_cents:
+            raise ValueError("IVA + reembolsable + fondos de terceros no puede superar el monto bruto")
         self.conn.execute(
             "UPDATE costs SET client_id=%s, case_id=%s, concept=%s, detail=%s, "
-            "amount_cents=%s, cost_date=%s, notes=%s, account_id=%s, service_id=%s, monto_iva_cents=%s, monto_reembolsable_cents=%s "
+            "amount_cents=%s, cost_date=%s, notes=%s, account_id=%s, service_id=%s, monto_iva_cents=%s, "
+            "monto_reembolsable_cents=%s, monto_fondos_terceros_cents=%s "
             "WHERE id=%s",
             (
                 int(client_id) if client_id else None,
@@ -813,6 +832,7 @@ class Repository:
                 int(service_id) if service_id else None,
                 iva_cents,
                 reembolsable_cents,
+                fondos_terceros_cents,
                 int(cost_id),
             ),
         )
@@ -2710,9 +2730,9 @@ class Repository:
         return [(int(r["id"]), str(r["account_code"]), str(r["nombre"])) for r in self.list_plan_cuentas(tipo=tipo, estado=estado)]
 
     def _validate_movement_account(self, account_id: int | None, *, expected_tipo: str) -> None:
-        """Un movimiento con cuenta ING-* debe ser un ingreso; EGR-* debe ser un egreso."""
+        """Todo movimiento debe llevar un código de cuenta; ING-* solo en ingresos, EGR-* solo en egresos."""
         if account_id is None:
-            return
+            raise ValueError("El movimiento debe tener una cuenta contable")
         cuenta = self.get_cuenta(account_id)
         if cuenta["tipo"] != expected_tipo:
             raise ValueError(f"La cuenta {cuenta['account_code']} es de {cuenta['tipo'].lower()} y no puede usarse en un movimiento de {expected_tipo.lower()}")
@@ -3335,10 +3355,13 @@ class Repository:
         t3 = max(u - COMISION_TRAMO2_CENTS, 0)
         return round(t1 * 0.10 + t2 * 0.12 + t3 * COMISION_TRAMO3_PCT)
 
-    def _comision_marginal(self, *, personal_id: int, mes: str, tipo_origen: str, utilidad_incremento_cents: int) -> int:
-        """Comisión de ESTE cobro = fórmula(acumulado_después) − fórmula(acumulado_antes), acumulado por persona y mes."""
+    def _comision_marginal(self, *, personal_id: int, mes: str, tipo_origen: str, utilidad_incremento_cents: int) -> tuple[int, int, int]:
+        """Comisión de ESTE cobro = fórmula(acumulado_después) − fórmula(acumulado_antes), acumulado por persona y mes.
+        Devuelve (comision_cents, acumulado_antes_cents, acumulado_despues_cents) — los dos últimos se guardan
+        junto a la comisión para poder reconstruir el desglose por tramo sin duplicar los umbrales en el frontend."""
         if tipo_origen == "Venta cruzada":
-            return round(utilidad_incremento_cents * COMISION_VENTA_CRUZADA_PCT)
+            # Tasa plana, no acumulada por tramos — "antes/después" es solo este movimiento.
+            return round(utilidad_incremento_cents * COMISION_VENTA_CRUZADA_PCT), 0, utilidad_incremento_cents
         row = self.conn.execute(
             """SELECT COALESCE(SUM(base_utilidad_directa_cents), 0) AS total FROM comisiones
                WHERE personal_id=%s AND mes_reconocimiento=%s AND tipo_origen='Cliente nuevo' AND ajusta_a_commission_id IS NULL""",
@@ -3346,7 +3369,29 @@ class Repository:
         ).fetchone()
         u_antes = int(row["total"])
         u_despues = u_antes + utilidad_incremento_cents
-        return self._formula_comision_tramos(u_despues) - self._formula_comision_tramos(u_antes)
+        comision_cents = self._formula_comision_tramos(u_despues) - self._formula_comision_tramos(u_antes)
+        return comision_cents, u_antes, u_despues
+
+    @staticmethod
+    def desglose_tramos_comision(tipo_origen: str, antes_cents: int | None, despues_cents: int | None) -> list[dict]:
+        """Reparte el tramo [antes, después) de una comisión ya reconocida entre las tasas COM-001/002/003
+        (o la tasa plana de venta cruzada) — única fuente de verdad para que la UI explique el cálculo."""
+        if antes_cents is None or despues_cents is None or despues_cents <= antes_cents:
+            return []
+        if tipo_origen == "Venta cruzada":
+            monto = despues_cents - antes_cents
+            return [{"tasa": COMISION_VENTA_CRUZADA_PCT, "monto_cents": round(monto * COMISION_VENTA_CRUZADA_PCT)}]
+        limites = [0, COMISION_TRAMO1_CENTS, COMISION_TRAMO2_CENTS, None]
+        tasas = [0.10, 0.12, COMISION_TRAMO3_PCT]
+        tramos = []
+        for i, tasa in enumerate(tasas):
+            lo, hi = limites[i], limites[i + 1]
+            tramo_lo = max(antes_cents, lo)
+            tramo_hi = min(despues_cents, hi) if hi is not None else despues_cents
+            ancho = tramo_hi - tramo_lo
+            if ancho > 0:
+                tramos.append({"tasa": tasa, "monto_cents": round(ancho * tasa)})
+        return tramos
 
     def reconocer_comision_income(self, income_id: int, *, created_at: str) -> list[Any]:
         """Punto de entrada: al cobrarse efectivamente un honorario, reconoce la comisión de cada originador
@@ -3381,15 +3426,16 @@ class Repository:
         ids: list[int] = []
         for orig in originadores:
             share_cents = round(utilidad_directa_total_cents * float(orig["porcentaje_participacion"]) / 100)
-            comision_cents = self._comision_marginal(
+            comision_cents, acumulado_antes_cents, acumulado_despues_cents = self._comision_marginal(
                 personal_id=orig["personal_id"], mes=mes, tipo_origen=orig["tipo_origen"], utilidad_incremento_cents=share_cents,
             )
             cur = self.conn.execute(
                 """INSERT INTO comisiones(income_id, case_id, personal_id, tipo_origen, porcentaje_participacion,
-                       base_utilidad_directa_cents, comision_cents, mes_reconocimiento, created_at)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                       base_utilidad_directa_cents, comision_cents, mes_reconocimiento,
+                       base_acumulada_antes_cents, base_acumulada_despues_cents, created_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (int(income_id), income["case_id"], orig["personal_id"], orig["tipo_origen"], orig["porcentaje_participacion"],
-                 share_cents, comision_cents, mes, created_at),
+                 share_cents, comision_cents, mes, acumulado_antes_cents, acumulado_despues_cents, created_at),
             )
             ids.append(int(cur.lastrowid))
         self.conn.commit()
@@ -3509,6 +3555,17 @@ class Repository:
             })
         return sorted(resultado, key=lambda r: r["utilidad_directa_cents"], reverse=True)
 
+    @staticmethod
+    def _semaforo(pct: float | None) -> str | None:
+        """Umbral único del Archivo Maestro: verde >=100%, amarillo 85%-99%, rojo <85%."""
+        if pct is None:
+            return None
+        if pct >= 1:
+            return "verde"
+        if pct >= 0.85:
+            return "amarillo"
+        return "rojo"
+
     def cumplimiento_por_familia(self, *, mes: str) -> list[dict]:
         """Compara la meta de presupuesto (Fase 7) contra lo realmente cobrado ese mes, por familia —
         mismo espíritu que la hoja 15_Cumplimiento_Metas del Excel."""
@@ -3529,21 +3586,94 @@ class Repository:
             (m + "-%",),
         ).fetchall()
         reales_map = {int(r["family_id"]): r for r in reales}
+        costos = self.conn.execute(
+            """SELECT fa.id AS family_id,
+                      COALESCE(SUM(co.monto_neto_operativo_cents), 0) AS costos_directos_reales_cents
+               FROM costs co
+               JOIN cases cs ON cs.id = co.case_id
+               JOIN servicios sv ON sv.id = cs.service_id
+               JOIN subcategorias sc ON sc.id = sv.subcategory_id
+               JOIN categorias ct ON ct.id = sc.category_id
+               JOIN familias fa ON fa.category_id = ct.id
+               WHERE co.cost_date LIKE %s
+               GROUP BY fa.id""",
+            (m + "-%",),
+        ).fetchall()
+        costos_map = {int(r["family_id"]): int(r["costos_directos_reales_cents"]) for r in costos}
         resultado = []
         for meta in metas:
             real = reales_map.get(int(meta["family_id"]))
             casos_reales = int(real["casos_reales"]) if real else 0
             ingresos_reales_cents = int(real["ingresos_reales_cents"]) if real else 0
+            costos_directos_reales_cents = costos_map.get(int(meta["family_id"]), 0)
             volumen_meta = int(meta["volumen_meta"])
             ingreso_proyectado_cents = int(meta["ingreso_proyectado_cents"])
+            margen_directo_objetivo_pct = float(meta["margen_directo_objetivo_pct"] or 0)
+
+            utilidad_directa_real_cents = ingresos_reales_cents - costos_directos_reales_cents
+            utilidad_directa_meta_cents = round(ingreso_proyectado_cents * margen_directo_objetivo_pct)
+            ticket_real_cents = round(ingresos_reales_cents / casos_reales) if casos_reales else None
+            cumplimiento_casos_pct = round(casos_reales / volumen_meta, 4) if volumen_meta else None
+            cumplimiento_ingresos_pct = round(ingresos_reales_cents / ingreso_proyectado_cents, 4) if ingreso_proyectado_cents else None
+            cumplimiento_utilidad_pct = (
+                round(utilidad_directa_real_cents / utilidad_directa_meta_cents, 4) if utilidad_directa_meta_cents else None
+            )
+
             resultado.append({
                 "family_id": meta["family_id"], "family_code": meta["family_code"], "family_nombre": meta["family_nombre"],
                 "meta_casos": volumen_meta, "casos_reales": casos_reales,
-                "cumplimiento_casos_pct": round(casos_reales / volumen_meta, 4) if volumen_meta else None,
+                "cumplimiento_casos_pct": cumplimiento_casos_pct,
+                "semaforo_casos": self._semaforo(cumplimiento_casos_pct),
                 "meta_ingresos_cents": ingreso_proyectado_cents, "ingresos_reales_cents": ingresos_reales_cents,
-                "cumplimiento_ingresos_pct": round(ingresos_reales_cents / ingreso_proyectado_cents, 4) if ingreso_proyectado_cents else None,
+                "cumplimiento_ingresos_pct": cumplimiento_ingresos_pct,
+                "semaforo_ingresos": self._semaforo(cumplimiento_ingresos_pct),
+                "brecha_ingresos_cents": ingresos_reales_cents - ingreso_proyectado_cents,
+                "costos_directos_reales_cents": costos_directos_reales_cents,
+                "utilidad_directa_meta_cents": utilidad_directa_meta_cents,
+                "utilidad_directa_real_cents": utilidad_directa_real_cents,
+                "cumplimiento_utilidad_pct": cumplimiento_utilidad_pct,
+                "semaforo_utilidad": self._semaforo(cumplimiento_utilidad_pct),
+                "ticket_real_cents": ticket_real_cents,
             })
         return sorted(resultado, key=lambda r: (r["cumplimiento_ingresos_pct"] if r["cumplimiento_ingresos_pct"] is not None else -1))
+
+    def utilidad_operativa_real(self, *, mes: str) -> dict:
+        """Utilidad operativa real de todo el despacho para el mes — a diferencia de la utilidad
+        directa (§cumplimiento_por_familia), gastos fijos y comisiones no están ligados a una
+        familia/categoría en el modelo, así que esta cifra es exacta solo a nivel de despacho."""
+        m = self._clean_mes(mes, "Mes")
+        ingresos_cents = int(self.conn.execute(
+            "SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS total FROM incomes WHERE income_date LIKE %s",
+            (m + "-%",),
+        ).fetchone()["total"])
+        costos_directos_cents = int(self.conn.execute(
+            "SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS total FROM costs WHERE cost_date LIKE %s",
+            (m + "-%",),
+        ).fetchone()["total"])
+        gastos_fijos_cents = int(self.conn.execute(
+            "SELECT COALESCE(SUM(monto_mensual_cents), 0) AS total FROM gastos_fijos "
+            "WHERE estado='Activo' AND mes_inicio <= %s AND (mes_fin IS NULL OR mes_fin >= %s)",
+            (m, m),
+        ).fetchone()["total"])
+        comisiones_cents = int(self.conn.execute(
+            "SELECT COALESCE(SUM(comision_cents), 0) AS total FROM comisiones WHERE mes_reconocimiento=%s",
+            (m,),
+        ).fetchone()["total"])
+
+        utilidad_directa_real_cents = ingresos_cents - costos_directos_cents
+        utilidad_operativa_real_cents = utilidad_directa_real_cents - gastos_fijos_cents - comisiones_cents
+        margen_operativo_real_pct = round(utilidad_operativa_real_cents / ingresos_cents, 4) if ingresos_cents else None
+
+        return {
+            "mes": m,
+            "ingresos_reales_cents": ingresos_cents,
+            "costos_directos_reales_cents": costos_directos_cents,
+            "utilidad_directa_real_cents": utilidad_directa_real_cents,
+            "gastos_fijos_cents": gastos_fijos_cents,
+            "comisiones_cents": comisiones_cents,
+            "utilidad_operativa_real_cents": utilidad_operativa_real_cents,
+            "margen_operativo_real_pct": margen_operativo_real_pct,
+        }
 
     # ── Gobierno del catálogo — solicitudes de alta/cambio (Fase 10) ────────
 
@@ -3554,6 +3684,32 @@ class Repository:
             (f"^SOL-{year}-[0-9]+$",),
         ).fetchone()
         return f"SOL-{year}-{int(row['max_seq']) + 1:03d}"
+
+    _DUPLICADOS_TABLA = {
+        "Categoria": ("categorias", "category_code"),
+        "Subcategoria": ("subcategorias", "subcategory_code"),
+        "Servicio": ("servicios", "service_code"),
+        "Familia": ("familias", "family_code"),
+    }
+
+    def buscar_posibles_duplicados(self, *, tipo_registro: str, nombre: str, umbral: float = 0.3) -> list[dict]:
+        """Revisión de duplicidad asistida (pg_trgm): compara `nombre` contra el catálogo existente
+        del mismo tipo de registro por similitud de texto, no solo coincidencia exacta. El aprobador
+        sigue decidiendo — esto solo le ahorra tener que recordarlo de memoria."""
+        tabla_col = self._DUPLICADOS_TABLA.get(tipo_registro)
+        if not tabla_col or not nombre.strip():
+            return []
+        tabla, codigo_col = tabla_col
+        estado_col = "estado" if tabla != "familias" else "'Activo'"  # familias no tiene columna estado
+        rows = self.conn.execute(
+            f"""SELECT {codigo_col} AS codigo, nombre, {estado_col} AS estado, similarity(nombre, %s) AS score
+                FROM {tabla}
+                WHERE similarity(nombre, %s) > %s
+                ORDER BY score DESC
+                LIMIT 5""",
+            (nombre, nombre, umbral),
+        ).fetchall()
+        return [{"codigo": r["codigo"], "nombre": r["nombre"], "estado": r["estado"], "similitud": round(float(r["score"]), 2)} for r in rows]
 
     def list_solicitudes(self, *, estado: str | None = None, tipo_registro: str | None = None, q: str | None = None) -> list[Any]:
         where, params = [], []

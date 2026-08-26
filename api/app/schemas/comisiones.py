@@ -4,6 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from aglegal.repositories import Repository
+
 
 class OriginadorIn(BaseModel):
     personal_id: int
@@ -34,6 +36,11 @@ class OriginadorOut(BaseModel):
         return cls(**d)
 
 
+class TramoComisionOut(BaseModel):
+    tasa: float
+    monto: float
+
+
 class ComisionOut(BaseModel):
     id: int
     income_id: int
@@ -49,6 +56,7 @@ class ComisionOut(BaseModel):
     comision: float
     mes_reconocimiento: str
     ajusta_a_commission_id: int | None
+    tramos: list[TramoComisionOut]
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -59,6 +67,12 @@ class ComisionOut(BaseModel):
         d["porcentaje_participacion"] = float(d["porcentaje_participacion"])
         d["base_utilidad_directa"] = (d.pop("base_utilidad_directa_cents", 0) or 0) / 100
         d["comision"] = (d.pop("comision_cents", 0) or 0) / 100
+        antes = d.pop("base_acumulada_antes_cents", None)
+        despues = d.pop("base_acumulada_despues_cents", None)
+        d["tramos"] = [
+            TramoComisionOut(tasa=t["tasa"], monto=t["monto_cents"] / 100)
+            for t in Repository.desglose_tramos_comision(d["tipo_origen"], antes, despues)
+        ]
         return cls(**d)
 
 

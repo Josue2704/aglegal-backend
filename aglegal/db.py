@@ -192,9 +192,13 @@ def date_iso(d: date) -> str:
 
 
 def _column_exists(conn: PgConnection, table: str, column: str) -> bool:
+    # information_schema.columns no filtra por schema, así que en una base con más de un
+    # schema (p. ej. un schema de pruebas aislado junto al de producción) reportaba una
+    # columna como existente porque la vio en OTRO schema, y la migración se saltaba el
+    # ALTER TABLE que sí hacía falta en el schema actual. to_regclass() resuelve el nombre
+    # de tabla exactamente igual que lo hace el propio ALTER/CREATE INDEX: vía search_path.
     row = conn.execute(
-        "SELECT 1 FROM information_schema.columns "
-        "WHERE table_name = %s AND column_name = %s",
+        "SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass(%s) AND attname = %s AND NOT attisdropped",
         (table, column),
     ).fetchone()
     return row is not None
@@ -924,6 +928,47 @@ def _migrate(conn: PgConnection) -> None:
             CREATE INDEX IF NOT EXISTS idx_cases_archived ON cases(archived_at);
         """)
         _set_schema_version(conn, 31)
+
+    # v32: fondos de terceros como cuarta categoría de movimiento (junto a honorarios/IVA
+    # 13% El Salvador/reembolsable) y código de cuenta contable obligatorio en todo
+    # movimiento — ambos exigidos por el Archivo Maestro AG Legal. Los movimientos
+    # existentes son datos de prueba: se eliminan los que no tienen cuenta asignada en
+    # vez de forzar una reclasificación manual (comisiones cae en cascada con ellos).
+    if v < 32:
+        for table in ("incomes", "expenses", "costs"):
+            if not _column_exists(conn, table, "monto_fondos_terceros_cents"):
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN monto_fondos_terceros_cents "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK (monto_fondos_terceros_cents >= 0)"
+                )
+            # GENERATED ALWAYS AS no admite ALTER; se recrea con la fórmula ampliada.
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN IF EXISTS monto_neto_operativo_cents")
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN monto_neto_operativo_cents INTEGER "
+                "GENERATED ALWAYS AS (amount_cents - monto_iva_cents - monto_reembolsable_cents "
+                "- monto_fondos_terceros_cents) STORED"
+            )
+            conn.execute(f"DELETE FROM {table} WHERE account_id IS NULL")
+            conn.execute(f"ALTER TABLE {table} ALTER COLUMN account_id SET NOT NULL")
+        _set_schema_version(conn, 32)
+
+    # v33: desglose de tramos de comisión — guarda el punto de la curva acumulada antes y
+    # después de cada cobro para que la UI pueda mostrar "10% x $1,000 + 12% x $600" sin
+    # duplicar los umbrales COM-001/002/003 como números mágicos en el frontend. Nulo en
+    # las filas de ajuste/reversión (no representan un tramo real).
+    if v < 33:
+        if not _column_exists(conn, "comisiones", "base_acumulada_antes_cents"):
+            conn.execute("ALTER TABLE comisiones ADD COLUMN base_acumulada_antes_cents INTEGER")
+        if not _column_exists(conn, "comisiones", "base_acumulada_despues_cents"):
+            conn.execute("ALTER TABLE comisiones ADD COLUMN base_acumulada_despues_cents INTEGER")
+        _set_schema_version(conn, 33)
+
+    # v34: revisión de duplicidad asistida en el gobierno del catálogo — pg_trgm permite
+    # comparar el nombre propuesto contra el catálogo existente por similitud, en vez de que
+    # el aprobador tenga que recordar de memoria si algo parecido ya existe.
+    if v < 34:
+        conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+        _set_schema_version(conn, 34)
 
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────

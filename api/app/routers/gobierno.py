@@ -23,6 +23,17 @@ def list_solicitudes(
     return [SolicitudOut.from_row(row) for row in repo.list_solicitudes(estado=estado, tipo_registro=tipo_registro, q=q)]
 
 
+@router.get("/duplicados")
+def buscar_duplicados(
+    current_user: CurrentUser, repo: RepoDep, tipo_registro: str, nombre: str,
+    _: dict = require_permission("gobierno_catalogo", "ver"),
+) -> list[dict]:
+    """Revisión de duplicidad asistida: nombres del catálogo existente parecidos al propuesto,
+    por similitud de texto — el aprobador sigue decidiendo, esto solo evita que tenga que
+    recordarlo de memoria."""
+    return repo.buscar_posibles_duplicados(tipo_registro=tipo_registro, nombre=nombre)
+
+
 @router.post("", response_model=SolicitudOut, status_code=201)
 def create_solicitud(body: SolicitudIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("gobierno_catalogo", "crear")) -> SolicitudOut:
     try:
