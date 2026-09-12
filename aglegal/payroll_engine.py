@@ -18,14 +18,20 @@ from dataclasses import dataclass, field
 class PayrollConfig:
     isss_tasa_empleado: float
     isss_tasa_patronal: float
-    isss_tope_cotizable_cents: int
     afp_tasa_empleado: float
     afp_tasa_patronal: float
-    afp_tope_cotizable_cents: int
     tramos_renta: list[dict]
     recargo_hora_extra_pct: float
     recargo_nocturnidad_pct: float
     horas_jornada_mensual: float
+    # None = sin tope de cotización. AFP no tiene tope desde la Ley Integral del Sistema
+    # de Pensiones; ISSS sí lo tiene hoy ($1,000) pero se deja igual de opcional por si
+    # la ley vuelve a cambiarlo.
+    isss_tope_cotizable_cents: int | None = None
+    afp_tope_cotizable_cents: int | None = None
+    # Tope del salario base a considerar para indemnización (Art. 58 CT, ligado a un
+    # múltiplo del salario mínimo vigente) — None = sin tope configurado todavía.
+    tope_salario_indemnizacion_cents: int | None = None
     id: int | None = None
 
 
@@ -126,9 +132,15 @@ def calcular_planilla(
     )
 
     # ISSS y AFP se calculan sobre el salario devengado regular (sin horas extra ni bonos
-    # ocasionales, que no cotizan) y respetan el tope de cotización de ley.
-    base_cotizable_isss = min(salario_devengado_base, config.isss_tope_cotizable_cents)
-    base_cotizable_afp = min(salario_devengado_base, config.afp_tope_cotizable_cents)
+    # ocasionales, que no cotizan) y respetan el tope de cotización de ley, si existe.
+    base_cotizable_isss = (
+        salario_devengado_base if config.isss_tope_cotizable_cents is None
+        else min(salario_devengado_base, config.isss_tope_cotizable_cents)
+    )
+    base_cotizable_afp = (
+        salario_devengado_base if config.afp_tope_cotizable_cents is None
+        else min(salario_devengado_base, config.afp_tope_cotizable_cents)
+    )
     isss_empleado_cents = round(base_cotizable_isss * config.isss_tasa_empleado)
     isss_patronal_cents = round(base_cotizable_isss * config.isss_tasa_patronal)
     afp_empleado_cents = round(base_cotizable_afp * config.afp_tasa_empleado)
@@ -180,3 +192,90 @@ def calcular_planilla(
         neto_cents=neto_cents,
         advertencias=advertencias,
     )
+
+
+# ── Prestaciones de ley (Código de Trabajo de El Salvador) ────────────────────
+# Estas tres son cálculos independientes de la planilla mensual — se pagan una vez al
+# año (aguinaldo, vacaciones) o al terminar la relación laboral (indemnización), no cada
+# mes, así que viven como funciones aparte en vez de dentro de calcular_planilla().
+# Los días/porcentajes de ley (15/19/21 días, 30%, 30 días/año) son fijos por artículo
+# del Código de Trabajo y rara vez cambian — a diferencia de ISSS/AFP/renta no se
+# versionan en payroll_config, pero si una reforma los toca hay que actualizar esta
+# constante y los tests que la fijan.
+
+@dataclass
+class AguinaldoResultado:
+    dias_correspondientes: float
+    salario_diario_cents: int
+    monto_cents: int
+    proporcional: bool
+    advertencias: list[str] = field(default_factory=list)
+
+
+def calcular_aguinaldo(*, salario_base_cents: int, anios_antiguedad: float, dias_trabajados_en_anio: int | None = None) -> AguinaldoResultado:
+    """Art. 198 Código de Trabajo: 15 días (1 a <3 años), 19 días (3 a <10 años),
+    21 días (10+ años); proporcional sobre la base de 15 días si lleva menos de 1 año."""
+    if salario_base_cents < 0:
+        raise ValueError("El salario base no puede ser negativo")
+    if anios_antiguedad < 0:
+        raise ValueError("Los años de antigüedad no pueden ser negativos")
+    salario_diario_cents = salario_base_cents / 30
+    advertencias: list[str] = []
+    if anios_antiguedad < 1:
+        dias = dias_trabajados_en_anio if dias_trabajados_en_anio is not None else round(anios_antiguedad * 365)
+        if dias_trabajados_en_anio is None:
+            advertencias.append("No se indicaron días trabajados en el año — se estimó a partir de la antigüedad en años.")
+        monto = round(salario_diario_cents * 15 / 365 * dias)
+        return AguinaldoResultado(dias_correspondientes=15 * dias / 365, salario_diario_cents=round(salario_diario_cents), monto_cents=monto, proporcional=True, advertencias=advertencias)
+    dias = 15 if anios_antiguedad < 3 else 19 if anios_antiguedad < 10 else 21
+    monto = round(salario_diario_cents * dias)
+    return AguinaldoResultado(dias_correspondientes=dias, salario_diario_cents=round(salario_diario_cents), monto_cents=monto, proporcional=False, advertencias=advertencias)
+
+
+@dataclass
+class VacacionesResultado:
+    salario_dias_cents: int
+    recargo_30_cents: int
+    total_cents: int
+
+
+def calcular_vacaciones(*, salario_base_cents: int, dias: float = 15, recargo_pct: float = 0.30) -> VacacionesResultado:
+    """Art. 177 CT: 15 días de salario + 30% de recargo sobre ese mismo salario."""
+    if salario_base_cents < 0:
+        raise ValueError("El salario base no puede ser negativo")
+    if dias < 0:
+        raise ValueError("Los días de vacación no pueden ser negativos")
+    salario_diario_cents = salario_base_cents / 30
+    salario_dias_cents = round(salario_diario_cents * dias)
+    recargo_cents = round(salario_dias_cents * recargo_pct)
+    return VacacionesResultado(salario_dias_cents=salario_dias_cents, recargo_30_cents=recargo_cents, total_cents=salario_dias_cents + recargo_cents)
+
+
+@dataclass
+class IndemnizacionResultado:
+    salario_base_usado_cents: int
+    tope_aplicado: bool
+    anios_servicio: float
+    monto_cents: int
+    advertencias: list[str] = field(default_factory=list)
+
+
+def calcular_indemnizacion(*, salario_base_cents: int, anios_servicio: float, tope_salario_cents: int | None) -> IndemnizacionResultado:
+    """Art. 58 CT: 30 días de salario por cada año de servicio (fracciones proporcionales),
+    sobre el salario base topado a un múltiplo del salario mínimo vigente si se conoce ese tope."""
+    if salario_base_cents < 0:
+        raise ValueError("El salario base no puede ser negativo")
+    if anios_servicio < 0:
+        raise ValueError("Los años de servicio no pueden ser negativos")
+    advertencias: list[str] = []
+    tope_aplicado = tope_salario_cents is not None and salario_base_cents > tope_salario_cents
+    salario_usado = min(salario_base_cents, tope_salario_cents) if tope_salario_cents is not None else salario_base_cents
+    if tope_salario_cents is None:
+        advertencias.append(
+            "No hay un tope de salario configurado para indemnización (ligado al salario mínimo vigente) "
+            "— se usó el salario base completo sin topar. Configúralo en Configuración → Nómina si el "
+            "salario de esta persona supera el tope legal."
+        )
+    # 30 días de salario por año = el salario mensual completo por cada año de servicio.
+    monto = round(salario_usado * anios_servicio)
+    return IndemnizacionResultado(salario_base_usado_cents=salario_usado, tope_aplicado=tope_aplicado, anios_servicio=anios_servicio, monto_cents=monto, advertencias=advertencias)

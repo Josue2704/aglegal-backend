@@ -26,7 +26,18 @@ Contrastado contra el sistema ya existente:
 
 **Las 10 fases del plan están completas.** No queda ningún punto pendiente de los 8 bloques originales del cliente ni de los 7 puntos de retroalimentación del revisor — ver el detalle fase por fase abajo. Si aparece trabajo nuevo, es una iteración/mejora sobre lo ya construido, no una fase pendiente.
 
-**Cómo verificar que el estado de arriba sigue siendo cierto:** `SELECT value FROM meta WHERE key='schema_version'` en la base local debe devolver `27`. Si es distinto, alguien corrió una migración fuera de esta conversación — confiar en la base, no en esta tabla.
+**Cómo verificar que el estado de arriba sigue siendo cierto:** `SELECT value FROM meta WHERE key='schema_version'` en la base debe devolver como mínimo `27` (las fases de este documento). Si es mayor, hay iteraciones posteriores — ver "Iteraciones posteriores al cierre de este plan" abajo antes de asumir que algo falta.
+
+### Iteraciones posteriores al cierre de este plan (no reflejadas en las fases de arriba)
+
+Este documento describe el estado al cerrar la Fase 10 (`schema_version=27`). Trabajo real posterior, resumido aquí para que nadie audite contra un snapshot desactualizado (revisar el `git log` de ambos repos para el detalle completo):
+
+- **v28-v31**: fixes de punto de equilibrio, papelera de clientes/expedientes, plazos legales críticos, registro de horas por expediente, valor monetario del pipeline.
+- **v32** (commit `fdbce63`): fondos de terceros como cuarta categoría de movimiento (junto a IVA/reembolsable), `account_id` obligatorio en todo movimiento, desglose de comisión por tramo, revisión de duplicados por similitud (`pg_trgm`) en Gobierno del Catálogo.
+- **v33-v35** (commit `6e609d9`): motor de cálculo de nómina real — antes "Nóminas" solo guardaba un monto único digitado a mano. Ahora calcula ISSS, AFP, horas extra, nocturnidad, descuentos por faltas/préstamos, con `payroll_config` versionada (las tasas de ley cambian) y enlace explícito Personal→cuenta contable.
+- **v36**: corrección verificada contra Ministerio de Hacienda — AFP no tiene tope de cotización (se había puesto por error el mismo tope de ISSS); tabla real de retención de renta mensual (Decreto Ejecutivo No. 10, vigente desde mayo 2025); funciones de aguinaldo/vacaciones/indemnización (Arts. 198/177/58 del Código de Trabajo) como calculadora aparte de la planilla mensual.
+
+**Pendientes reales que siguen abiertos** (no inventados, confirmados por auditoría de código): "días de cobro" real (apertura→cobro efectivo, pedido explícito del cliente, sin fuente de datos limpia todavía — ver línea 54); probabilidad de cobro por `estado_cobro` sigue siendo un supuesto del desarrollador sin validar con el despacho; tablas legado `categories`/`service_products`/`cases.service_area` sin limpiar del esquema; los 5 puntos de mejora de largo plazo de `AUDITORIA_USO_ABOGADO.md` (portal de cliente, 2FA, firma electrónica, paginación de listas, PWA/offline) siguen en cero.
 
 **Reglas que se mantuvieron en las 4 fases construidas** (para no repetir el patrón cada vez que se retome):
 - Todo código (`category_code`, `service_code`, `account_code`, `person_code`, `expense_code`, `family_code`) es **inmutable por diseño de API** — el campo simplemente no existe en los endpoints de edición, no hay lógica condicional que lo permita "a veces".
@@ -323,7 +334,7 @@ Pedido del cliente: "analiza el sistema completo en busca de bugs, en especial e
 
 **Verificación:** `npx tsc --noEmit` y `npm run build` limpios en cada ronda de cambios. Sin verificación visual en navegador (misma limitación de toda la sesión) — la validación de los fixes de layout fue por lectura de código y por conteo programático de patrones (ej. confirmar que las 22 tablas de la app quedaran cubiertas), no por captura de pantalla.
 
-**Commits:** frontend `8b47519`. Backend: fix de `get_supuestos_activos` pendiente de commit/despliegue en este mismo corte.
+**Commits:** frontend `8b47519`. Backend: fix de `get_supuestos_activos` en `fa81247` — ya commiteado y desplegado.
 
 ---
 

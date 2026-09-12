@@ -13,7 +13,7 @@ import uuid
 from psycopg2.extras import Json
 
 from .db import now_iso
-from .payroll_engine import PayrollConfig, calcular_planilla
+from .payroll_engine import PayrollConfig, calcular_aguinaldo, calcular_indemnizacion, calcular_planilla, calcular_vacaciones
 from .security import hash_password, verify_password
 
 
@@ -884,10 +884,11 @@ class Repository:
         vigente_desde: str,
         isss_tasa_empleado: float,
         isss_tasa_patronal: float,
-        isss_tope_cotizable_text: str,
+        isss_tope_cotizable_text: str = "",
         afp_tasa_empleado: float,
         afp_tasa_patronal: float,
-        afp_tope_cotizable_text: str,
+        afp_tope_cotizable_text: str = "",
+        tope_salario_indemnizacion_text: str = "",
         tramos_renta: list[dict],
         recargo_hora_extra_pct: float,
         recargo_nocturnidad_pct: float,
@@ -912,15 +913,20 @@ class Repository:
             faltantes = {"sobre_exceso_de_cents", "cuota_fija_cents", "porcentaje_exceso"} - set(tramo)
             if faltantes:
                 raise ValueError(f"Tramo de renta #{i}: faltan campos {sorted(faltantes)}")
+        def _to_cents_or_none(text: str) -> int | None:
+            return _to_cents(text) if (text or "").strip() else None
+
         try:
             cur = self.conn.execute(
                 "INSERT INTO payroll_config(vigente_desde, isss_tasa_empleado, isss_tasa_patronal, "
                 "isss_tope_cotizable_cents, afp_tasa_empleado, afp_tasa_patronal, afp_tope_cotizable_cents, "
-                "tramos_renta, recargo_hora_extra_pct, recargo_nocturnidad_pct, horas_jornada_mensual, notas, created_at) "
-                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "tope_salario_indemnizacion_cents, tramos_renta, recargo_hora_extra_pct, recargo_nocturnidad_pct, "
+                "horas_jornada_mensual, notas, created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
-                    fecha, isss_tasa_empleado, isss_tasa_patronal, _to_cents(isss_tope_cotizable_text),
-                    afp_tasa_empleado, afp_tasa_patronal, _to_cents(afp_tope_cotizable_text),
+                    fecha, isss_tasa_empleado, isss_tasa_patronal, _to_cents_or_none(isss_tope_cotizable_text),
+                    afp_tasa_empleado, afp_tasa_patronal, _to_cents_or_none(afp_tope_cotizable_text),
+                    _to_cents_or_none(tope_salario_indemnizacion_text),
                     Json(tramos_renta), recargo_hora_extra_pct, recargo_nocturnidad_pct, horas_jornada_mensual,
                     (notas or "").strip(), created_at,
                 ),
@@ -938,14 +944,34 @@ class Repository:
             id=int(row["id"]),
             isss_tasa_empleado=float(row["isss_tasa_empleado"]),
             isss_tasa_patronal=float(row["isss_tasa_patronal"]),
-            isss_tope_cotizable_cents=int(row["isss_tope_cotizable_cents"]),
+            isss_tope_cotizable_cents=int(row["isss_tope_cotizable_cents"]) if row["isss_tope_cotizable_cents"] is not None else None,
             afp_tasa_empleado=float(row["afp_tasa_empleado"]),
             afp_tasa_patronal=float(row["afp_tasa_patronal"]),
-            afp_tope_cotizable_cents=int(row["afp_tope_cotizable_cents"]),
+            afp_tope_cotizable_cents=int(row["afp_tope_cotizable_cents"]) if row["afp_tope_cotizable_cents"] is not None else None,
             tramos_renta=list(row["tramos_renta"] or []),
             recargo_hora_extra_pct=float(row["recargo_hora_extra_pct"]),
             recargo_nocturnidad_pct=float(row["recargo_nocturnidad_pct"]),
             horas_jornada_mensual=float(row["horas_jornada_mensual"]),
+            tope_salario_indemnizacion_cents=int(row["tope_salario_indemnizacion_cents"]) if row.get("tope_salario_indemnizacion_cents") is not None else None,
+        )
+
+    def calcular_aguinaldo_preview(self, *, salario_base_text: str, anios_antiguedad: float, dias_trabajados_en_anio: int | None = None):
+        return calcular_aguinaldo(
+            salario_base_cents=_to_cents(salario_base_text),
+            anios_antiguedad=anios_antiguedad,
+            dias_trabajados_en_anio=dias_trabajados_en_anio,
+        )
+
+    def calcular_vacaciones_preview(self, *, salario_base_text: str, dias: float = 15):
+        return calcular_vacaciones(salario_base_cents=_to_cents(salario_base_text), dias=dias)
+
+    def calcular_indemnizacion_preview(self, *, salario_base_text: str, anios_servicio: float, fecha_config: str | None = None):
+        config_row = self.get_payroll_config_vigente(fecha=fecha_config)
+        tope = config_row["tope_salario_indemnizacion_cents"]
+        return calcular_indemnizacion(
+            salario_base_cents=_to_cents(salario_base_text),
+            anios_servicio=anios_servicio,
+            tope_salario_cents=int(tope) if tope is not None else None,
         )
 
     def calcular_planilla_preview(

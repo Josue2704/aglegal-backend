@@ -9,7 +9,7 @@ from typing import Any
 
 import psycopg2
 import psycopg2.extras
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import Json, RealDictCursor
 
 from .security import hash_password
 
@@ -1059,6 +1059,52 @@ def _migrate(conn: PgConnection) -> None:
              0.5, 0.25, 240, "Config inicial migrada automáticamente — VERIFICAR tasas y completar tramos_renta.", now_iso()),
         )
         _set_schema_version(conn, 35)
+
+    # v36: dos correcciones verificadas contra fuente oficial (Ministerio de Hacienda,
+    # Decreto Ejecutivo No. 10 del 30/abr/2025, vigente desde mayo 2025) más el soporte
+    # para las prestaciones de ley que la v35 no cubría:
+    #  1. AFP NO tiene tope de cotización desde la Ley Integral del Sistema de Pensiones
+    #     ("No se establece un monto máximo de salario a utilizar como base para cálculo
+    #     de las cotizaciones") — la v35 le puso por error el mismo tope de $1,000 de
+    #     ISSS. Se permite NULL en ambos topes para representar "sin tope" (ISSS sí
+    #     conserva el suyo de $1,000 hoy, pero la ley puede volver a cambiarlo).
+    #  2. Se agrega la tabla real de retención de renta mensual del decreto vigente.
+    #  3. `tope_salario_indemnizacion_cents`: el salario base para la indemnización por
+    #     despido (Art. 58 Código de Trabajo) está limitado a un múltiplo del salario
+    #     mínimo vigente, que cambia por decreto ejecutivo — se deja NULL (sin tope) hasta
+    #     que se configure explícitamente, en vez de asumir un multiplicador no verificado.
+    # Se inserta una nueva versión vigente_desde 2025-05-01 en vez de tocar la fila de la
+    # v35 — esa fila queda como registro histórico de lo que estaba configurado antes de
+    # esta corrección, consistente con que payroll_config nunca se edita en el sitio.
+    if v < 36:
+        conn.executescript("""
+            ALTER TABLE payroll_config ALTER COLUMN afp_tope_cotizable_cents DROP NOT NULL;
+            ALTER TABLE payroll_config ALTER COLUMN isss_tope_cotizable_cents DROP NOT NULL;
+            ALTER TABLE payroll_config ADD COLUMN IF NOT EXISTS tope_salario_indemnizacion_cents INTEGER;
+        """)
+        tramos_renta_2025 = [
+            {"sobre_exceso_de_cents": 0, "hasta_cents": 55000, "cuota_fija_cents": 0, "porcentaje_exceso": 0},
+            {"sobre_exceso_de_cents": 55000, "hasta_cents": 89524, "cuota_fija_cents": 1767, "porcentaje_exceso": 0.10},
+            {"sobre_exceso_de_cents": 89524, "hasta_cents": 203810, "cuota_fija_cents": 6000, "porcentaje_exceso": 0.20},
+            {"sobre_exceso_de_cents": 203810, "hasta_cents": None, "cuota_fija_cents": 28857, "porcentaje_exceso": 0.30},
+        ]
+        conn.execute(
+            "INSERT INTO payroll_config(vigente_desde, isss_tasa_empleado, isss_tasa_patronal, "
+            "isss_tope_cotizable_cents, afp_tasa_empleado, afp_tasa_patronal, afp_tope_cotizable_cents, "
+            "tope_salario_indemnizacion_cents, tramos_renta, recargo_hora_extra_pct, recargo_nocturnidad_pct, "
+            "horas_jornada_mensual, notas, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (vigente_desde) DO NOTHING",
+            (
+                "2025-05-01", 0.03, 0.075, 100000, 0.0725, 0.0875, None, None,
+                Json(tramos_renta_2025), 0.5, 0.25, 240,
+                "Corrige el tope de AFP (no tiene, según Ley Integral del Sistema de Pensiones) y agrega "
+                "la tabla real de retención de renta mensual (Decreto Ejecutivo No. 10, vigente desde "
+                "mayo 2025, fuente: Ministerio de Hacienda). Falta configurar el tope de salario para "
+                "indemnización (ligado al salario mínimo vigente) antes de usar esa prestación.",
+                now_iso(),
+            ),
+        )
+        _set_schema_version(conn, 36)
 
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────

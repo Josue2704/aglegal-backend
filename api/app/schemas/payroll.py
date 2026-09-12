@@ -158,10 +158,11 @@ class PayrollConfigIn(BaseModel):
     vigente_desde: str
     isss_tasa_empleado: float
     isss_tasa_patronal: float
-    isss_tope_cotizable: float
+    isss_tope_cotizable: float | None = None
     afp_tasa_empleado: float
     afp_tasa_patronal: float
-    afp_tope_cotizable: float
+    afp_tope_cotizable: float | None = None
+    tope_salario_indemnizacion: float | None = None
     tramos_renta: list[PayrollConfigTramoRenta] = []
     recargo_hora_extra_pct: float = 0.5
     recargo_nocturnidad_pct: float = 0.25
@@ -174,10 +175,11 @@ class PayrollConfigOut(BaseModel):
     vigente_desde: str
     isss_tasa_empleado: float
     isss_tasa_patronal: float
-    isss_tope_cotizable: float
+    isss_tope_cotizable: float | None = None
     afp_tasa_empleado: float
     afp_tasa_patronal: float
-    afp_tope_cotizable: float
+    afp_tope_cotizable: float | None = None
+    tope_salario_indemnizacion: float | None = None
     tramos_renta: list[dict]
     recargo_hora_extra_pct: float
     recargo_nocturnidad_pct: float
@@ -188,6 +190,67 @@ class PayrollConfigOut(BaseModel):
     @classmethod
     def from_row(cls, row: Any) -> PayrollConfigOut:
         d = dict(row)
-        d["isss_tope_cotizable"] = (d.pop("isss_tope_cotizable_cents") or 0) / 100
-        d["afp_tope_cotizable"] = (d.pop("afp_tope_cotizable_cents") or 0) / 100
+        isss_tope = d.pop("isss_tope_cotizable_cents")
+        afp_tope = d.pop("afp_tope_cotizable_cents")
+        indemnizacion_tope = d.pop("tope_salario_indemnizacion_cents", None)
+        d["isss_tope_cotizable"] = isss_tope / 100 if isss_tope is not None else None
+        d["afp_tope_cotizable"] = afp_tope / 100 if afp_tope is not None else None
+        d["tope_salario_indemnizacion"] = indemnizacion_tope / 100 if indemnizacion_tope is not None else None
         return cls(**d)
+
+
+class AguinaldoIn(BaseModel):
+    salario_base: float
+    anios_antiguedad: float
+    dias_trabajados_en_anio: int | None = None
+
+
+class AguinaldoOut(BaseModel):
+    dias_correspondientes: float
+    salario_diario: float
+    monto: float
+    proporcional: bool
+    advertencias: list[str] = []
+
+    @classmethod
+    def from_resultado(cls, r: Any) -> AguinaldoOut:
+        return cls(
+            dias_correspondientes=r.dias_correspondientes, salario_diario=r.salario_diario_cents / 100,
+            monto=r.monto_cents / 100, proporcional=r.proporcional, advertencias=r.advertencias,
+        )
+
+
+class VacacionesIn(BaseModel):
+    salario_base: float
+    dias: float = 15
+
+
+class VacacionesOut(BaseModel):
+    salario_dias: float
+    recargo_30: float
+    total: float
+
+    @classmethod
+    def from_resultado(cls, r: Any) -> VacacionesOut:
+        return cls(salario_dias=r.salario_dias_cents / 100, recargo_30=r.recargo_30_cents / 100, total=r.total_cents / 100)
+
+
+class IndemnizacionIn(BaseModel):
+    salario_base: float
+    anios_servicio: float
+    fecha: str | None = None
+
+
+class IndemnizacionOut(BaseModel):
+    salario_base_usado: float
+    tope_aplicado: bool
+    anios_servicio: float
+    monto: float
+    advertencias: list[str] = []
+
+    @classmethod
+    def from_resultado(cls, r: Any) -> IndemnizacionOut:
+        return cls(
+            salario_base_usado=r.salario_base_usado_cents / 100, tope_aplicado=r.tope_aplicado,
+            anios_servicio=r.anios_servicio, monto=r.monto_cents / 100, advertencias=r.advertencias,
+        )

@@ -6,6 +6,10 @@ from aglegal.db import now_iso
 
 from ..deps import CurrentUser, RepoDep, require_permission
 from ..schemas.payroll import (
+    AguinaldoIn,
+    AguinaldoOut,
+    IndemnizacionIn,
+    IndemnizacionOut,
     PayrollConfigIn,
     PayrollConfigOut,
     PayrollIn,
@@ -13,6 +17,8 @@ from ..schemas.payroll import (
     PayrollPreviewIn,
     PayrollPreviewOut,
     PayrollUpdate,
+    VacacionesIn,
+    VacacionesOut,
 )
 
 router = APIRouter(prefix="/payroll", tags=["payroll"])
@@ -28,6 +34,29 @@ def _tramos_a_centavos(tramos) -> list[dict]:
         }
         for t in tramos
     ]
+
+
+@router.post("/prestaciones/aguinaldo", response_model=AguinaldoOut)
+def calcular_aguinaldo(body: AguinaldoIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("nominas", "ver")) -> AguinaldoOut:
+    resultado = repo.calcular_aguinaldo_preview(
+        salario_base_text=str(body.salario_base), anios_antiguedad=body.anios_antiguedad,
+        dias_trabajados_en_anio=body.dias_trabajados_en_anio,
+    )
+    return AguinaldoOut.from_resultado(resultado)
+
+
+@router.post("/prestaciones/vacaciones", response_model=VacacionesOut)
+def calcular_vacaciones(body: VacacionesIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("nominas", "ver")) -> VacacionesOut:
+    resultado = repo.calcular_vacaciones_preview(salario_base_text=str(body.salario_base), dias=body.dias)
+    return VacacionesOut.from_resultado(resultado)
+
+
+@router.post("/prestaciones/indemnizacion", response_model=IndemnizacionOut)
+def calcular_indemnizacion(body: IndemnizacionIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("nominas", "ver")) -> IndemnizacionOut:
+    resultado = repo.calcular_indemnizacion_preview(
+        salario_base_text=str(body.salario_base), anios_servicio=body.anios_servicio, fecha_config=body.fecha,
+    )
+    return IndemnizacionOut.from_resultado(resultado)
 
 
 @router.get("", response_model=list[PayrollOut])
@@ -113,10 +142,11 @@ def create_payroll_config(body: PayrollConfigIn, current_user: CurrentUser, repo
         vigente_desde=body.vigente_desde,
         isss_tasa_empleado=body.isss_tasa_empleado,
         isss_tasa_patronal=body.isss_tasa_patronal,
-        isss_tope_cotizable_text=str(body.isss_tope_cotizable),
+        isss_tope_cotizable_text=str(body.isss_tope_cotizable) if body.isss_tope_cotizable is not None else "",
         afp_tasa_empleado=body.afp_tasa_empleado,
         afp_tasa_patronal=body.afp_tasa_patronal,
-        afp_tope_cotizable_text=str(body.afp_tope_cotizable),
+        afp_tope_cotizable_text=str(body.afp_tope_cotizable) if body.afp_tope_cotizable is not None else "",
+        tope_salario_indemnizacion_text=str(body.tope_salario_indemnizacion) if body.tope_salario_indemnizacion is not None else "",
         tramos_renta=_tramos_a_centavos(body.tramos_renta),
         recargo_hora_extra_pct=body.recargo_hora_extra_pct,
         recargo_nocturnidad_pct=body.recargo_nocturnidad_pct,
