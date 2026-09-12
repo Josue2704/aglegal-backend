@@ -1611,6 +1611,13 @@ class Repository:
         )
         self.conn.commit()
 
+    def set_case_task_responsible(self, task_id: int, responsible_username: str | None) -> None:
+        self.conn.execute(
+            "UPDATE case_tasks SET responsible_username=%s WHERE id=%s",
+            ((responsible_username or "").strip() or None, int(task_id)),
+        )
+        self.conn.commit()
+
     def set_case_task_done(self, task_id: int, done: bool, completed_notes: str | None = None) -> None:
         self.conn.execute(
             "UPDATE case_tasks SET done=%s, completed_notes=%s WHERE id=%s",

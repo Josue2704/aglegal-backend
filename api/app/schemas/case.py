@@ -181,6 +181,10 @@ class CaseTaskCriticoUpdate(BaseModel):
     es_critico: bool
 
 
+class CaseTaskResponsibleUpdate(BaseModel):
+    responsible_username: str | None = None
+
+
 class CaseTaskOut(BaseModel):
     id: int
     case_id: int

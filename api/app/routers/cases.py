@@ -7,6 +7,7 @@ from aglegal.db import now_iso
 from ..deps import AdminRequired, CurrentUser, LawyerRequired, RepoDep
 from ..schemas.case import (
     CaseAttachmentOut, CaseIn, CaseOut, CaseTaskCriticoUpdate, CaseTaskDone, CaseTaskIn, CaseTaskNotesUpdate,
+    CaseTaskResponsibleUpdate,
     CaseTaskOut, CaseTimeEntryIn, CaseTimeEntryOut, CaseUpdate, ConflictoInteresOut, GlobalCaseTaskOut, TiempoAtencionOut,
 )
 
@@ -182,6 +183,17 @@ def create_task(case_id: int, body: CaseTaskIn, current_user: CurrentUser, repo:
 @router.patch("/tasks/{task_id}/critico", response_model=CaseTaskOut)
 def set_task_critico(task_id: int, body: CaseTaskCriticoUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
     repo.set_case_task_critico(task_id, body.es_critico)
+    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Tarea no encontrada")
+    return CaseTaskOut.from_row(row)
+
+
+@router.patch("/tasks/{task_id}/responsible", response_model=CaseTaskOut)
+def set_task_responsible(task_id: int, body: CaseTaskResponsibleUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
+    if not current_user["is_admin"] and "tareas.editar" not in current_user["permissions"]:
+        raise HTTPException(403, "Sin permiso: tareas.editar")
+    repo.set_case_task_responsible(task_id, body.responsible_username)
     row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Tarea no encontrada")
