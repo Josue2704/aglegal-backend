@@ -14,6 +14,7 @@ class SessionIn(BaseModel):
     consult_type: str
     notes: str = ""
     status: str
+    monto_adicional: float | None = None
 
 
 class SessionOut(BaseModel):
@@ -27,10 +28,13 @@ class SessionOut(BaseModel):
     consult_type: str
     notes: str | None = None
     status: str
+    monto_adicional: float = 0
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)
 
     @classmethod
     def from_row(cls, row: Any) -> SessionOut:
-        return cls(**dict(row))
+        d = dict(row)
+        d["monto_adicional"] = (d.pop("monto_adicional_cents", 0) or 0) / 100
+        return cls(**d)

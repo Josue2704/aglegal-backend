@@ -54,8 +54,9 @@ def unbilled_items(
     client_id: int,
     current_user: CurrentUser,
     repo: RepoDep,
+    case_id: int | None = None,
 ) -> UnbilledItems:
-    data = repo.get_unbilled_items(client_id)
+    data = repo.get_unbilled_items(client_id, case_id=case_id)
     sessions = [
         UnbilledSession(
             id=r["id"],

@@ -1106,6 +1106,56 @@ def _migrate(conn: PgConnection) -> None:
         )
         _set_schema_version(conn, 36)
 
+    # v37: ancla lo financiero a lo operativo — hasta ahora un expediente tenía un costo
+    # pactado fijo (`honorarios_contratados_cents`) que nada tocaba, aunque se agregaran
+    # tareas o sesiones de más; y una factura con `case_id` podía jalar partidas de
+    # CUALQUIER expediente del mismo cliente (el `case_id` era solo metadata, no filtro).
+    # Tres piezas:
+    #  1. `plantillas_tareas`: catálogo de tareas típicas por servicio. Al crear un
+    #     expediente con ese servicio, se sugieren (editable) — no obligan a nada.
+    #  2. `case_tasks`/`sessions` ganan `origen` ('plantilla' = ya incluida en lo
+    #     pactado, 'manual' = agregada aparte) y `monto_adicional_cents`. Cada vez que se
+    #     crea una tarea/sesión manual con monto > 0, ese monto se SUMA a
+    #     `cases.honorarios_contratados_cents` automáticamente (y se resta si se borra) —
+    #     `case_honorarios_log` deja registro de cada movimiento para que nunca sea un
+    #     cambio invisible al monto pactado con el cliente.
+    #  3. `costs` no tenía `invoice_id` — un costo facturado nunca se marcaba como tal y
+    #     podía reaparecer en el selector de "no facturado" y cobrarse dos veces. Se
+    #     agrega la columna, igual que ya la tienen `sessions`/`case_tasks`/`case_time_entries`.
+    if v < 37:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS plantillas_tareas (
+              id SERIAL PRIMARY KEY,
+              service_id INTEGER NOT NULL REFERENCES servicios(id) ON DELETE CASCADE,
+              titulo TEXT NOT NULL,
+              orden INTEGER NOT NULL DEFAULT 0,
+              dias_plazo_relativo INTEGER,
+              es_critico_default INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_plantillas_tareas_service ON plantillas_tareas(service_id, orden);
+
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS origen TEXT NOT NULL DEFAULT 'manual' CHECK (origen IN ('plantilla','manual'));
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS monto_adicional_cents INTEGER NOT NULL DEFAULT 0 CHECK (monto_adicional_cents >= 0);
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS origen TEXT NOT NULL DEFAULT 'manual' CHECK (origen IN ('plantilla','manual'));
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS monto_adicional_cents INTEGER NOT NULL DEFAULT 0 CHECK (monto_adicional_cents >= 0);
+            ALTER TABLE costs ADD COLUMN IF NOT EXISTS invoice_id INTEGER REFERENCES invoices(id) ON DELETE SET NULL;
+
+            CREATE TABLE IF NOT EXISTS case_honorarios_log (
+              id SERIAL PRIMARY KEY,
+              case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+              origen_tipo TEXT NOT NULL CHECK (origen_tipo IN ('tarea','sesion')),
+              origen_id INTEGER NOT NULL,
+              monto_cents INTEGER NOT NULL,
+              motivo TEXT NOT NULL,
+              username TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_case_honorarios_log_case ON case_honorarios_log(case_id);
+        """)
+        _set_schema_version(conn, 37)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 

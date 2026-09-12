@@ -380,14 +380,20 @@ class Repository:
         created_at: str,
         start_time: str | None = None,
         end_time: str | None = None,
+        monto_adicional_text: str = "0",
+        username: str = "",
     ) -> int:
         if status not in SESSION_STATUSES:
             raise ValueError("Estado inválido")
         if start_time and end_time and end_time <= start_time:
             raise ValueError("La hora de fin debe ser posterior a la hora de inicio")
+        monto_cents = self._to_cents_or_zero(monto_adicional_text)
+        if monto_cents > 0 and not case_id:
+            raise ValueError("Una sesión con monto adicional debe estar ligada a un expediente")
         cur = self.conn.execute(
-            "INSERT INTO sessions(client_id, case_id, session_date, start_time, end_time, consult_type, notes, status, created_at) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO sessions(client_id, case_id, session_date, start_time, end_time, consult_type, notes, "
+            "status, monto_adicional_cents, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
@@ -397,11 +403,18 @@ class Repository:
                 consult_type.strip(),
                 notes.strip(),
                 status,
+                monto_cents,
                 created_at,
             ),
         )
+        session_id = int(cur.lastrowid)
+        if monto_cents > 0:
+            self._registrar_honorarios_log(
+                case_id=case_id, origen_tipo="sesion", origen_id=session_id, monto_cents=monto_cents,
+                motivo=f"Sesión adicional: {consult_type.strip()}", username=username or "sistema",
+            )
         self.conn.commit()
-        return int(cur.lastrowid)
+        return session_id
 
     def update_session(
         self,
@@ -432,8 +445,17 @@ class Repository:
         )
         self.conn.commit()
 
-    def delete_session(self, session_id: int) -> None:
+    def delete_session(self, session_id: int, *, username: str = "") -> None:
+        row = self.conn.execute(
+            "SELECT case_id, consult_type, monto_adicional_cents FROM sessions WHERE id=%s", (int(session_id),)
+        ).fetchone()
         self.conn.execute("DELETE FROM sessions WHERE id = %s", (int(session_id),))
+        if row and row["monto_adicional_cents"] and row["case_id"]:
+            self._registrar_honorarios_log(
+                case_id=row["case_id"], origen_tipo="sesion", origen_id=int(session_id),
+                monto_cents=-int(row["monto_adicional_cents"]),
+                motivo=f"Reversión al eliminar la sesión: {row['consult_type']}", username=username or "sistema",
+            )
         self.conn.commit()
 
     def get_session(self, session_id: int) -> Any | None:
@@ -1344,6 +1366,12 @@ class Repository:
             next_num = 1
         return f"{prefix}{next_num:04d}"
 
+    def get_case(self, case_id: int) -> Any:
+        row = self.conn.execute("SELECT * FROM cases WHERE id=%s", (int(case_id),)).fetchone()
+        if not row:
+            raise ValueError("Expediente no encontrado")
+        return row
+
     def create_case(
         self,
         *,
@@ -1366,6 +1394,7 @@ class Repository:
         estado_cobro: str = "En ejecución",
         fecha_cierre_estimada: str | None = None,
         proxima_accion: str | None = None,
+        tareas_iniciales: list[dict] | None = None,
     ) -> int:
         if status not in CASE_STATUSES:
             raise ValueError("Estado de caso inválido")
@@ -1412,8 +1441,24 @@ class Repository:
                 (proxima_accion or "").strip() or None,
             ),
         )
+        case_id = int(cur.lastrowid)
+        # Tareas sugeridas por la plantilla del servicio, ya editadas por quien crea el
+        # expediente — quedan incluidas en honorarios_contratados_cents sin recargo, por
+        # eso origen='plantilla' y no pasan por create_case_task (que sí recargaría).
+        for tarea in (tareas_iniciales or []):
+            titulo_tarea = (tarea.get("titulo") or "").strip()
+            if not titulo_tarea:
+                continue
+            self.conn.execute(
+                "INSERT INTO case_tasks(case_id, title, done, due_date, notes, es_critico, origen, created_at) "
+                "VALUES(%s,%s,0,%s,%s,%s,'plantilla',%s)",
+                (
+                    case_id, titulo_tarea, (tarea.get("due_date") or "").strip() or None,
+                    (tarea.get("notes") or "").strip() or None, 1 if tarea.get("es_critico") else 0, created_at,
+                ),
+            )
         self.conn.commit()
-        return int(cur.lastrowid)
+        return case_id
 
     def update_case(
         self,
@@ -1575,6 +1620,28 @@ class Repository:
             ).fetchall()
         )
 
+    def _registrar_honorarios_log(
+        self, *, case_id: int, origen_tipo: str, origen_id: int, monto_cents: int, motivo: str, username: str,
+    ) -> None:
+        if monto_cents == 0:
+            return
+        self.conn.execute(
+            "UPDATE cases SET honorarios_contratados_cents = honorarios_contratados_cents + %s WHERE id=%s",
+            (monto_cents, int(case_id)),
+        )
+        self.conn.execute(
+            "INSERT INTO case_honorarios_log(case_id, origen_tipo, origen_id, monto_cents, motivo, username, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s)",
+            (int(case_id), origen_tipo, int(origen_id), monto_cents, motivo, username, now_iso()),
+        )
+
+    def list_case_honorarios_log(self, case_id: int) -> list[Any]:
+        return list(
+            self.conn.execute(
+                "SELECT * FROM case_honorarios_log WHERE case_id=%s ORDER BY created_at DESC, id DESC", (int(case_id),)
+            ).fetchall()
+        )
+
     def create_case_task(
         self,
         *,
@@ -1585,24 +1652,38 @@ class Repository:
         notes: str | None = None,
         responsible_username: str | None = None,
         es_critico: bool = False,
+        origen: str = "manual",
+        monto_adicional_text: str = "0",
+        username: str = "",
     ) -> int:
         t = (title or "").strip()
         if not t:
             raise ValueError("Título requerido")
+        if origen not in ("plantilla", "manual"):
+            raise ValueError("Origen inválido")
+        monto_cents = self._to_cents_or_zero(monto_adicional_text)
         cur = self.conn.execute(
-            "INSERT INTO case_tasks(case_id, title, done, due_date, notes, responsible_username, es_critico, created_at) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO case_tasks(case_id, title, done, due_date, notes, responsible_username, es_critico, "
+            "origen, monto_adicional_cents, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(case_id), t, 0,
                 (due_date or "").strip() or None,
                 (notes or "").strip() or None,
                 (responsible_username or "").strip() or None,
                 1 if es_critico else 0,
+                origen, monto_cents,
                 created_at,
             ),
         )
+        task_id = int(cur.lastrowid)
+        if monto_cents > 0:
+            self._registrar_honorarios_log(
+                case_id=case_id, origen_tipo="tarea", origen_id=task_id, monto_cents=monto_cents,
+                motivo=f"Tarea adicional: {t}", username=username or "sistema",
+            )
         self.conn.commit()
-        return int(cur.lastrowid)
+        return task_id
 
     def set_case_task_critico(self, task_id: int, es_critico: bool) -> None:
         self.conn.execute(
@@ -1632,8 +1713,17 @@ class Repository:
         )
         self.conn.commit()
 
-    def delete_case_task(self, task_id: int) -> None:
+    def delete_case_task(self, task_id: int, *, username: str = "") -> None:
+        row = self.conn.execute(
+            "SELECT case_id, title, monto_adicional_cents FROM case_tasks WHERE id=%s", (int(task_id),)
+        ).fetchone()
         self.conn.execute("DELETE FROM case_tasks WHERE id=%s", (int(task_id),))
+        if row and row["monto_adicional_cents"]:
+            self._registrar_honorarios_log(
+                case_id=row["case_id"], origen_tipo="tarea", origen_id=int(task_id),
+                monto_cents=-int(row["monto_adicional_cents"]),
+                motivo=f"Reversión al eliminar la tarea: {row['title']}", username=username or "sistema",
+            )
         self.conn.commit()
 
     # --- Registro de horas (servicios cobrados "Por hora" — servicios.unidad_cobro ya
@@ -2264,6 +2354,36 @@ class Repository:
         n = int(row["cnt"]) + 1
         return f"FAC-{n:04d}"
 
+    # Un expediente puede tener varios en un mismo cliente; sin esto, el selector de
+    # "no facturado" traía partidas de CUALQUIER expediente del cliente y nada impedía
+    # que terminaran en la factura de otro — el `case_id` de la factura era solo
+    # metadata decorativa, no un filtro real.
+    def _validate_items_belong_to_case(self, case_id: int | None, items: list[dict]) -> None:
+        if case_id is None:
+            return
+        by_type: dict[str, list[int]] = {}
+        for it in items:
+            et, eid = it.get("entity_type"), it.get("entity_id")
+            if et and eid:
+                by_type.setdefault(et, []).append(int(eid))
+        checks = {
+            "session": "SELECT id FROM sessions WHERE id = ANY(%s) AND case_id = %s",
+            "case_task": "SELECT id FROM case_tasks WHERE id = ANY(%s) AND case_id = %s",
+            "time_entry": "SELECT id FROM case_time_entries WHERE id = ANY(%s) AND case_id = %s",
+            "cost": "SELECT id FROM costs WHERE id = ANY(%s) AND case_id = %s",
+        }
+        for et, ids in by_type.items():
+            sql = checks.get(et)
+            if not sql:
+                continue
+            found = {int(r["id"]) for r in self.conn.execute(sql, (ids, int(case_id))).fetchall()}
+            faltantes = set(ids) - found
+            if faltantes:
+                raise ValueError(
+                    f"La factura está ligada al expediente #{case_id}, pero {et} {sorted(faltantes)} "
+                    "pertenece a otro expediente — no se puede mezclar el trabajo de dos expedientes en una factura."
+                )
+
     def create_invoice(
         self,
         client_id: int,
@@ -2280,6 +2400,7 @@ class Repository:
         items: list[dict],
         created_at: str,
     ) -> int:
+        self._validate_items_belong_to_case(case_id, items)
         total_cents = sum(
             round(float(it.get("unit_price", 0)) * float(it.get("quantity", 1)) * 100)
             for it in items
@@ -2323,6 +2444,8 @@ class Repository:
             self.conn.execute("UPDATE case_tasks SET invoice_id=%s WHERE id = ANY(%s)", (invoice_id, by_type["case_task"]))
         if by_type.get("time_entry"):
             self.conn.execute("UPDATE case_time_entries SET invoice_id=%s WHERE id = ANY(%s)", (invoice_id, by_type["time_entry"]))
+        if by_type.get("cost"):
+            self.conn.execute("UPDATE costs SET invoice_id=%s WHERE id = ANY(%s)", (invoice_id, by_type["cost"]))
 
     def update_invoice(
         self,
@@ -2340,6 +2463,8 @@ class Repository:
         items: list[dict],
         created_at: str,
     ) -> None:
+        existing = self.get_invoice(invoice_id)
+        self._validate_items_belong_to_case(existing["case_id"] if existing else None, items)
         total_cents = sum(
             round(float(it.get("unit_price", 0)) * float(it.get("quantity", 1)) * 100)
             for it in items
@@ -2397,36 +2522,47 @@ class Repository:
         self.conn.commit()
 
     def delete_invoice(self, invoice_id: int) -> None:
+        # sessions/case_tasks.invoice_id no tienen FK real (columnas agregadas sueltas,
+        # sin REFERENCES) — sin este UPDATE, borrar una factura dejaba sus partidas con un
+        # invoice_id apuntando a una factura inexistente, nunca más elegibles para
+        # re-facturar aunque el "no facturado" las siga buscando con invoice_id IS NULL.
+        self.conn.execute("UPDATE sessions SET invoice_id=NULL WHERE invoice_id=%s", (invoice_id,))
+        self.conn.execute("UPDATE case_tasks SET invoice_id=NULL WHERE invoice_id=%s", (invoice_id,))
+        self.conn.execute("UPDATE case_time_entries SET invoice_id=NULL WHERE invoice_id=%s", (invoice_id,))
+        self.conn.execute("UPDATE costs SET invoice_id=NULL WHERE invoice_id=%s", (invoice_id,))
         self.conn.execute("DELETE FROM invoices WHERE id=%s", (invoice_id,))
         self.conn.commit()
 
-    def get_unbilled_items(self, client_id: int) -> dict:
+    def get_unbilled_items(self, client_id: int, case_id: int | None = None) -> dict:
+        case_filter, params_extra = ("AND ca.id = %s", (int(case_id),)) if case_id else ("", ())
+        sessions_case_filter, sessions_params_extra = ("AND case_id = %s", (int(case_id),)) if case_id else ("", ())
         sessions = self.conn.execute(
-            """SELECT id, session_date, consult_type, notes FROM sessions
-               WHERE client_id=%s AND (invoice_id IS NULL)
+            f"""SELECT id, session_date, consult_type, notes FROM sessions
+               WHERE client_id=%s AND (invoice_id IS NULL) {sessions_case_filter}
                ORDER BY session_date DESC""",
-            (client_id,),
+            (client_id, *sessions_params_extra),
         ).fetchall()
         tasks = self.conn.execute(
-            """SELECT ct.id, ct.title, ct.due_date, ca.title AS case_title, ca.id AS case_id
+            f"""SELECT ct.id, ct.title, ct.due_date, ca.title AS case_title, ca.id AS case_id
                FROM case_tasks ct
                JOIN cases ca ON ca.id = ct.case_id
-               WHERE ca.client_id=%s AND (ct.invoice_id IS NULL)
+               WHERE ca.client_id=%s AND (ct.invoice_id IS NULL) {case_filter}
                ORDER BY ct.due_date DESC NULLS LAST""",
-            (client_id,),
+            (client_id, *params_extra),
         ).fetchall()
         costs = self.conn.execute(
-            """SELECT id, concept, detail, amount_cents, cost_date FROM costs
-               WHERE client_id=%s ORDER BY cost_date DESC""",
-            (client_id,),
+            f"""SELECT id, concept, detail, amount_cents, cost_date FROM costs
+               WHERE client_id=%s AND invoice_id IS NULL {sessions_case_filter}
+               ORDER BY cost_date DESC""",
+            (client_id, *sessions_params_extra),
         ).fetchall()
         time_entries = self.conn.execute(
-            """SELECT te.id, te.work_date, te.hours, te.description, ca.title AS case_title, ca.id AS case_id
+            f"""SELECT te.id, te.work_date, te.hours, te.description, ca.title AS case_title, ca.id AS case_id
                FROM case_time_entries te
                JOIN cases ca ON ca.id = te.case_id
-               WHERE ca.client_id=%s AND te.billable=1 AND te.invoice_id IS NULL
+               WHERE ca.client_id=%s AND te.billable=1 AND te.invoice_id IS NULL {case_filter}
                ORDER BY te.work_date DESC""",
-            (client_id,),
+            (client_id, *params_extra),
         ).fetchall()
         return {"sessions": sessions, "tasks": tasks, "costs": costs, "time_entries": time_entries}
 
@@ -2721,6 +2857,52 @@ class Repository:
         if not row:
             raise ValueError("Servicio no encontrado")
         return row
+
+    # ── Plantillas de tareas por servicio ───────────────────────────────────
+    # Al crear un expediente con un servicio, estas se sugieren como checklist inicial
+    # (editable) — quedan incluidas en honorarios_contratados_cents sin recargo aparte,
+    # a diferencia de una tarea agregada después (ver create_case_task/monto_adicional).
+
+    def list_plantilla_tareas(self, service_id: int) -> list[Any]:
+        return list(
+            self.conn.execute(
+                "SELECT * FROM plantillas_tareas WHERE service_id=%s ORDER BY orden ASC, id ASC",
+                (int(service_id),),
+            ).fetchall()
+        )
+
+    def create_plantilla_tarea(
+        self, *, service_id: int, titulo: str, orden: int = 0,
+        dias_plazo_relativo: int | None = None, es_critico_default: bool = False, created_at: str,
+    ) -> int:
+        t = (titulo or "").strip()
+        if not t:
+            raise ValueError("Título requerido")
+        self.get_servicio(service_id)  # 404 si no existe
+        cur = self.conn.execute(
+            "INSERT INTO plantillas_tareas(service_id, titulo, orden, dias_plazo_relativo, es_critico_default, created_at, updated_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s)",
+            (int(service_id), t, orden, dias_plazo_relativo, 1 if es_critico_default else 0, created_at, created_at),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def update_plantilla_tarea(
+        self, plantilla_id: int, *, titulo: str, orden: int = 0,
+        dias_plazo_relativo: int | None = None, es_critico_default: bool = False,
+    ) -> None:
+        t = (titulo or "").strip()
+        if not t:
+            raise ValueError("Título requerido")
+        self.conn.execute(
+            "UPDATE plantillas_tareas SET titulo=%s, orden=%s, dias_plazo_relativo=%s, es_critico_default=%s, updated_at=%s WHERE id=%s",
+            (t, orden, dias_plazo_relativo, 1 if es_critico_default else 0, now_iso(), int(plantilla_id)),
+        )
+        self.conn.commit()
+
+    def delete_plantilla_tarea(self, plantilla_id: int) -> None:
+        self.conn.execute("DELETE FROM plantillas_tareas WHERE id=%s", (int(plantilla_id),))
+        self.conn.commit()
 
     def _next_service_code(self, subcategory_id: int) -> tuple[str, str, str]:
         """Returns (service_code, category_code, subcategory_code) for a new service in this subcategory."""

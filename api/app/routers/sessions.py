@@ -121,6 +121,8 @@ def create_session(body: SessionIn, current_user: CurrentUser, repo: RepoDep, _:
         consult_type=body.consult_type,
         notes=body.notes,
         status=body.status,
+        monto_adicional_text=str(body.monto_adicional) if body.monto_adicional is not None else "0",
+        username=current_user["username"],
         created_at=now_iso(),
     )
     _sync_create(current_user["username"], session_id, repo)
@@ -174,4 +176,4 @@ def delete_session(session_id: int, current_user: CurrentUser, repo: RepoDep, _:
                         resend_from=s.resend_from_email,
                     )
     _sync_delete(current_user["username"], session_id, repo)
-    repo.delete_session(session_id)
+    repo.delete_session(session_id, username=current_user["username"])

@@ -6,8 +6,8 @@ from aglegal.db import now_iso
 
 from ..deps import AdminRequired, CurrentUser, LawyerRequired, RepoDep
 from ..schemas.case import (
-    CaseAttachmentOut, CaseIn, CaseOut, CaseTaskCriticoUpdate, CaseTaskDone, CaseTaskIn, CaseTaskNotesUpdate,
-    CaseTaskResponsibleUpdate,
+    CaseAttachmentOut, CaseHonorariosLogOut, CaseIn, CaseOut, CaseTaskCriticoUpdate, CaseTaskDone, CaseTaskIn,
+    CaseTaskNotesUpdate, CaseTaskResponsibleUpdate,
     CaseTaskOut, CaseTimeEntryIn, CaseTimeEntryOut, CaseUpdate, ConflictoInteresOut, GlobalCaseTaskOut, TiempoAtencionOut,
 )
 
@@ -81,6 +81,7 @@ def create_case(body: CaseIn, current_user: CurrentUser, repo: RepoDep) -> CaseO
         estado_cobro=body.estado_cobro,
         fecha_cierre_estimada=body.fecha_cierre_estimada,
         proxima_accion=body.proxima_accion,
+        tareas_iniciales=[t.model_dump() for t in body.tareas_iniciales],
     )
     rows = repo.list_cases()
     row = next((r for r in rows if r["id"] == case_id), None)
@@ -174,6 +175,8 @@ def create_task(case_id: int, body: CaseTaskIn, current_user: CurrentUser, repo:
         notes=body.notes,
         responsible_username=body.responsible_username,
         es_critico=body.es_critico,
+        monto_adicional_text=str(body.monto_adicional) if body.monto_adicional is not None else "0",
+        username=current_user["username"],
         created_at=now_iso(),
     )
     row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
@@ -220,7 +223,12 @@ def update_task_notes(task_id: int, body: CaseTaskNotesUpdate, current_user: Cur
 
 @router.delete("/tasks/{task_id}", status_code=204)
 def delete_task(task_id: int, current_user: LawyerRequired, repo: RepoDep):
-    repo.delete_case_task(task_id)
+    repo.delete_case_task(task_id, username=current_user["username"])
+
+
+@router.get("/{case_id}/honorarios-log", response_model=list[CaseHonorariosLogOut])
+def get_case_honorarios_log(case_id: int, current_user: CurrentUser, repo: RepoDep) -> list[CaseHonorariosLogOut]:
+    return [CaseHonorariosLogOut.from_row(row) for row in repo.list_case_honorarios_log(case_id)]
 
 
 # --- Sessions por caso ---

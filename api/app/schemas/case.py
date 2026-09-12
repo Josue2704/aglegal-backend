@@ -5,6 +5,13 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 
+class TareaInicialIn(BaseModel):
+    titulo: str
+    due_date: str | None = None
+    notes: str | None = None
+    es_critico: bool = False
+
+
 class CaseIn(BaseModel):
     client_id: int
     title: str
@@ -24,6 +31,7 @@ class CaseIn(BaseModel):
     estado_cobro: str = "En ejecución"
     fecha_cierre_estimada: str | None = None
     proxima_accion: str = ""
+    tareas_iniciales: list[TareaInicialIn] = []
 
 
 class CaseUpdate(BaseModel):
@@ -133,6 +141,8 @@ class GlobalCaseTaskOut(BaseModel):
     completed_notes: str | None = None
     responsible_username: str | None = None
     es_critico: bool = False
+    origen: str = "manual"
+    monto_adicional: float = 0
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -142,6 +152,7 @@ class GlobalCaseTaskOut(BaseModel):
         d = dict(row)
         d["done"] = bool(d.get("done", 0))
         d["es_critico"] = bool(d.get("es_critico", 0))
+        d["monto_adicional"] = (d.pop("monto_adicional_cents", 0) or 0) / 100
         return cls(**d)
 
 
@@ -165,6 +176,7 @@ class CaseTaskIn(BaseModel):
     notes: str | None = None
     responsible_username: str = ""
     es_critico: bool = False
+    monto_adicional: float | None = None
 
 
 class CaseTaskDone(BaseModel):
@@ -195,6 +207,8 @@ class CaseTaskOut(BaseModel):
     completed_notes: str | None = None
     responsible_username: str | None = None
     es_critico: bool = False
+    origen: str = "manual"
+    monto_adicional: float = 0
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -204,6 +218,52 @@ class CaseTaskOut(BaseModel):
         d = dict(row)
         d["done"] = bool(d.get("done", 0))
         d["es_critico"] = bool(d.get("es_critico", 0))
+        d["monto_adicional"] = (d.pop("monto_adicional_cents", 0) or 0) / 100
+        return cls(**d)
+
+
+class PlantillaTareaIn(BaseModel):
+    titulo: str
+    orden: int = 0
+    dias_plazo_relativo: int | None = None
+    es_critico_default: bool = False
+
+
+class PlantillaTareaOut(BaseModel):
+    id: int
+    service_id: int
+    titulo: str
+    orden: int
+    dias_plazo_relativo: int | None = None
+    es_critico_default: bool = False
+    created_at: str
+    updated_at: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @classmethod
+    def from_row(cls, row: Any) -> PlantillaTareaOut:
+        d = dict(row)
+        d["es_critico_default"] = bool(d.get("es_critico_default", 0))
+        return cls(**d)
+
+
+class CaseHonorariosLogOut(BaseModel):
+    id: int
+    case_id: int
+    origen_tipo: str
+    origen_id: int
+    monto: float
+    motivo: str
+    username: str
+    created_at: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @classmethod
+    def from_row(cls, row: Any) -> CaseHonorariosLogOut:
+        d = dict(row)
+        d["monto"] = (d.pop("monto_cents", 0) or 0) / 100
         return cls(**d)
 
 

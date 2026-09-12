@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
+
+from aglegal.db import now_iso
 
 from ..deps import CurrentUser, RepoDep, require_permission
+from ..schemas.case import PlantillaTareaIn, PlantillaTareaOut
 from ..schemas.catalogo import (
     CategoriaOut,
     FamiliaOut,
@@ -64,6 +67,48 @@ def servicio_choices(
 ) -> list[ServicioChoice]:
     """Búsqueda por código o nombre — usada para seleccionar servicio en expedientes."""
     return [ServicioChoice.from_row(row) for row in repo.servicio_choices(q=q, estado=estado, limit=limit)]
+
+
+# Plantillas de tareas por servicio — a diferencia del catálogo maestro (categorías,
+# servicios), esto no pasa por Gobierno del Catálogo: es un checklist operativo que
+# conviene poder ajustar rápido, no una alta/baja del catálogo de precios/servicios.
+
+@router.get("/servicios/{service_id}/plantilla-tareas", response_model=list[PlantillaTareaOut])
+def list_plantilla_tareas(service_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("catalogo", "ver")) -> list[PlantillaTareaOut]:
+    return [PlantillaTareaOut.from_row(row) for row in repo.list_plantilla_tareas(service_id)]
+
+
+@router.post("/servicios/{service_id}/plantilla-tareas", response_model=PlantillaTareaOut, status_code=201)
+def create_plantilla_tarea(service_id: int, body: PlantillaTareaIn, current_user: CurrentUser, repo: RepoDep) -> PlantillaTareaOut:
+    if not current_user["is_admin"]:
+        raise HTTPException(403, "Solo un administrador puede editar plantillas de tareas")
+    plantilla_id = repo.create_plantilla_tarea(
+        service_id=service_id, titulo=body.titulo, orden=body.orden,
+        dias_plazo_relativo=body.dias_plazo_relativo, es_critico_default=body.es_critico_default, created_at=now_iso(),
+    )
+    row = next(r for r in repo.list_plantilla_tareas(service_id) if r["id"] == plantilla_id)
+    return PlantillaTareaOut.from_row(row)
+
+
+@router.put("/plantilla-tareas/{plantilla_id}", response_model=PlantillaTareaOut)
+def update_plantilla_tarea(plantilla_id: int, body: PlantillaTareaIn, current_user: CurrentUser, repo: RepoDep) -> PlantillaTareaOut:
+    if not current_user["is_admin"]:
+        raise HTTPException(403, "Solo un administrador puede editar plantillas de tareas")
+    repo.update_plantilla_tarea(
+        plantilla_id, titulo=body.titulo, orden=body.orden,
+        dias_plazo_relativo=body.dias_plazo_relativo, es_critico_default=body.es_critico_default,
+    )
+    row = repo.conn.execute("SELECT * FROM plantillas_tareas WHERE id=%s", (plantilla_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Plantilla no encontrada")
+    return PlantillaTareaOut.from_row(row)
+
+
+@router.delete("/plantilla-tareas/{plantilla_id}", status_code=204)
+def delete_plantilla_tarea(plantilla_id: int, current_user: CurrentUser, repo: RepoDep):
+    if not current_user["is_admin"]:
+        raise HTTPException(403, "Solo un administrador puede editar plantillas de tareas")
+    repo.delete_plantilla_tarea(plantilla_id)
 
 
 @router.get("/historial", response_model=list[HistorialEntryOut])
