@@ -74,7 +74,7 @@ def create_persona(body: PersonaIn, current_user: CurrentUser, repo: RepoDep, _:
     persona_id = repo.create_persona(
         persona=body.persona, cargo=body.cargo,
         monto_mensual_text=str(body.monto_mensual) if body.monto_mensual is not None else "",
-        mes_inicio=body.mes_inicio, mes_fin=body.mes_fin, created_at=now_iso(),
+        mes_inicio=body.mes_inicio, mes_fin=body.mes_fin, account_id=body.account_id, created_at=now_iso(),
     )
     return PersonaOut.from_row(repo.get_persona(persona_id))
 
@@ -84,7 +84,7 @@ def update_persona(persona_id: int, body: PersonaUpdate, current_user: CurrentUs
     repo.update_persona(
         persona_id, persona=body.persona, cargo=body.cargo,
         monto_mensual_text=str(body.monto_mensual) if body.monto_mensual is not None else "",
-        mes_inicio=body.mes_inicio, mes_fin=body.mes_fin, estado=body.estado,
+        mes_inicio=body.mes_inicio, mes_fin=body.mes_fin, account_id=body.account_id, estado=body.estado,
     )
     return PersonaOut.from_row(repo.get_persona(persona_id))
 

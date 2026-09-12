@@ -970,6 +970,96 @@ def _migrate(conn: PgConnection) -> None:
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         _set_schema_version(conn, 34)
 
+    # v35: motor de cálculo de nómina real. Hasta ahora "Nóminas" solo guardaba un monto
+    # único que el usuario ya calculaba a mano fuera del sistema (ISSS, AFP, renta, horas
+    # extra, etc. vivían en un Excel aparte). Esta migración:
+    #  1. Crea `payroll_config`, una tabla de configuración VERSIONADA (nunca se edita una
+    #     fila existente, se inserta una nueva vigente_desde) porque las tasas de ley
+    #     cambian con el tiempo y necesitamos poder recalcular planillas pasadas con la
+    #     tasa que estaba vigente en ese momento, no con la de hoy.
+    #  2. Agrega `personal.account_id`: enlace EXPLÍCITO a la cuenta contable de cada
+    #     persona. Antes, create_payroll() buscaba la cuenta por "ILIKE %nombre%" sobre
+    #     plan_cuentas — frágil (coincidencias parciales, o ninguna coincidencia hace que
+    #     _validate_movement_account() truene con account_id=None) y ahora innecesario.
+    #  3. Amplía `payrolls` con el desglose completo (devengos, deducciones, cálculo) y un
+    #     campo `modo` para distinguir una planilla calculada por el motor de un pago
+    #     manual (bono suelto, ajuste) que sigue sin desglose. `amount_cents` se mantiene
+    #     como el neto a pagar final en ambos casos — no se toca su significado.
+    #  4. Evita el doble pago accidental de la planilla mensual de una misma persona con un
+    #     índice único parcial (solo aplica a modo='calculado', un bono sí puede repetirse).
+    #  5. `payroll_audit_log` registra cada corrección de una planilla ya creada — antes la
+    #     única forma de corregir era borrar y recrear, perdiendo el porqué del cambio.
+    if v < 35:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS payroll_config (
+              id SERIAL PRIMARY KEY,
+              vigente_desde TEXT NOT NULL UNIQUE,
+              isss_tasa_empleado NUMERIC(6,4) NOT NULL,
+              isss_tasa_patronal NUMERIC(6,4) NOT NULL,
+              isss_tope_cotizable_cents INTEGER NOT NULL,
+              afp_tasa_empleado NUMERIC(6,4) NOT NULL,
+              afp_tasa_patronal NUMERIC(6,4) NOT NULL,
+              afp_tope_cotizable_cents INTEGER NOT NULL,
+              tramos_renta JSONB NOT NULL DEFAULT '[]'::jsonb,
+              recargo_hora_extra_pct NUMERIC(6,4) NOT NULL DEFAULT 0.5,
+              recargo_nocturnidad_pct NUMERIC(6,4) NOT NULL DEFAULT 0.25,
+              horas_jornada_mensual NUMERIC(6,2) NOT NULL DEFAULT 240,
+              notas TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            ALTER TABLE personal ADD COLUMN IF NOT EXISTS account_id INTEGER REFERENCES plan_cuentas(id);
+
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS modo TEXT NOT NULL DEFAULT 'manual' CHECK (modo IN ('calculado','manual'));
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS salario_base_cents INTEGER;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS horas_extra_cantidad NUMERIC(6,2) NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS horas_extra_monto_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS nocturnidad_horas NUMERIC(6,2) NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS nocturnidad_monto_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS bonificaciones_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS otros_ingresos_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS descuento_faltas_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS descuento_prestamos_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS otros_descuentos_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS isss_empleado_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS afp_empleado_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS renta_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS isss_patronal_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS afp_patronal_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS total_devengado_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS total_descuentos_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS payroll_config_id INTEGER REFERENCES payroll_config(id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_payrolls_personal_period_calculado
+              ON payrolls(personal_id, period) WHERE modo = 'calculado' AND personal_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS payroll_audit_log (
+              id SERIAL PRIMARY KEY,
+              payroll_id INTEGER NOT NULL REFERENCES payrolls(id) ON DELETE CASCADE,
+              campo TEXT NOT NULL,
+              valor_anterior TEXT,
+              valor_nuevo TEXT,
+              username TEXT NOT NULL,
+              changed_at TEXT NOT NULL
+            );
+        """)
+        # Config inicial con las tasas de ISSS/AFP y el tope de cotización vigentes según la
+        # reforma de 2023 (Decreto 843) — verificar con tu contador antes de depender de
+        # estos números en producción, y actualizarlos aquí (Configuración → Nómina) el día
+        # que cambien por ley. La tabla de tramos de renta se deja VACÍA a propósito: son
+        # los más propensos a quedar desactualizados y un valor inventado aquí podría causar
+        # una retención de ISR incorrecta — el motor avisa explícitamente si intentas
+        # calcular una planilla sin la tabla de renta configurada.
+        conn.execute(
+            "INSERT INTO payroll_config(vigente_desde, isss_tasa_empleado, isss_tasa_patronal, "
+            "isss_tope_cotizable_cents, afp_tasa_empleado, afp_tasa_patronal, afp_tope_cotizable_cents, "
+            "tramos_renta, recargo_hora_extra_pct, recargo_nocturnidad_pct, horas_jornada_mensual, notas, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (vigente_desde) DO NOTHING",
+            ("2023-05-01", 0.03, 0.075, 100000, 0.0725, 0.0875, 100000, "[]",
+             0.5, 0.25, 240, "Config inicial migrada automáticamente — VERIFICAR tasas y completar tramos_renta.", now_iso()),
+        )
+        _set_schema_version(conn, 35)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 

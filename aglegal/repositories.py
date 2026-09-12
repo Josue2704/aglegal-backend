@@ -13,6 +13,7 @@ import uuid
 from psycopg2.extras import Json
 
 from .db import now_iso
+from .payroll_engine import PayrollConfig, calcular_planilla
 from .security import hash_password, verify_password
 
 
@@ -856,59 +857,282 @@ class Repository:
     def list_payrolls(self) -> list[Any]:
         return list(self.conn.execute("SELECT * FROM payrolls ORDER BY payment_date DESC, id DESC").fetchall())
 
+    def get_payroll(self, payroll_id: int) -> Any:
+        row = self.conn.execute("SELECT * FROM payrolls WHERE id=%s", (int(payroll_id),)).fetchone()
+        if not row:
+            raise ValueError("Nómina no encontrada")
+        return row
+
+    # --- Configuración de ley (ISSS/AFP/renta) — versionada, nunca se edita una fila
+    def get_payroll_config_vigente(self, *, fecha: str | None = None) -> Any:
+        """La fila cuyo vigente_desde es la más reciente que no supera `fecha` (hoy si no se da)."""
+        f = (fecha or _iso_today())
+        row = self.conn.execute(
+            "SELECT * FROM payroll_config WHERE vigente_desde <= %s ORDER BY vigente_desde DESC LIMIT 1",
+            (f,),
+        ).fetchone()
+        if not row:
+            raise ValueError("No hay configuración de nómina vigente — créala en Configuración → Nómina")
+        return row
+
+    def list_payroll_config_historial(self) -> list[Any]:
+        return list(self.conn.execute("SELECT * FROM payroll_config ORDER BY vigente_desde DESC").fetchall())
+
+    def create_payroll_config(
+        self,
+        *,
+        vigente_desde: str,
+        isss_tasa_empleado: float,
+        isss_tasa_patronal: float,
+        isss_tope_cotizable_text: str,
+        afp_tasa_empleado: float,
+        afp_tasa_patronal: float,
+        afp_tope_cotizable_text: str,
+        tramos_renta: list[dict],
+        recargo_hora_extra_pct: float,
+        recargo_nocturnidad_pct: float,
+        horas_jornada_mensual: float,
+        notas: str = "",
+        created_at: str,
+    ) -> int:
+        try:
+            fecha = date.fromisoformat((vigente_desde or "").strip()).isoformat()
+        except ValueError:
+            raise ValueError("Fecha de vigencia inválida — usa formato YYYY-MM-DD") from None
+        for nombre, tasa in (
+            ("ISSS empleado", isss_tasa_empleado), ("ISSS patronal", isss_tasa_patronal),
+            ("AFP empleado", afp_tasa_empleado), ("AFP patronal", afp_tasa_patronal),
+            ("recargo de hora extra", recargo_hora_extra_pct), ("recargo de nocturnidad", recargo_nocturnidad_pct),
+        ):
+            if tasa < 0 or tasa > 1:
+                raise ValueError(f"La tasa de {nombre} debe estar entre 0 y 1 (ej. 0.075 = 7.5%)")
+        if horas_jornada_mensual <= 0:
+            raise ValueError("Las horas de jornada mensual deben ser mayores a 0")
+        for i, tramo in enumerate(tramos_renta, start=1):
+            faltantes = {"sobre_exceso_de_cents", "cuota_fija_cents", "porcentaje_exceso"} - set(tramo)
+            if faltantes:
+                raise ValueError(f"Tramo de renta #{i}: faltan campos {sorted(faltantes)}")
+        try:
+            cur = self.conn.execute(
+                "INSERT INTO payroll_config(vigente_desde, isss_tasa_empleado, isss_tasa_patronal, "
+                "isss_tope_cotizable_cents, afp_tasa_empleado, afp_tasa_patronal, afp_tope_cotizable_cents, "
+                "tramos_renta, recargo_hora_extra_pct, recargo_nocturnidad_pct, horas_jornada_mensual, notas, created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    fecha, isss_tasa_empleado, isss_tasa_patronal, _to_cents(isss_tope_cotizable_text),
+                    afp_tasa_empleado, afp_tasa_patronal, _to_cents(afp_tope_cotizable_text),
+                    Json(tramos_renta), recargo_hora_extra_pct, recargo_nocturnidad_pct, horas_jornada_mensual,
+                    (notas or "").strip(), created_at,
+                ),
+            )
+        except Exception as exc:
+            self.conn.rollback()
+            if getattr(exc, "pgcode", None) == "23505":  # unique_violation, código estable sin importar el idioma del servidor
+                raise ValueError(f"Ya existe una configuración vigente desde {fecha}") from None
+            raise
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def _payroll_config_as_engine_config(self, row: Any) -> PayrollConfig:
+        return PayrollConfig(
+            id=int(row["id"]),
+            isss_tasa_empleado=float(row["isss_tasa_empleado"]),
+            isss_tasa_patronal=float(row["isss_tasa_patronal"]),
+            isss_tope_cotizable_cents=int(row["isss_tope_cotizable_cents"]),
+            afp_tasa_empleado=float(row["afp_tasa_empleado"]),
+            afp_tasa_patronal=float(row["afp_tasa_patronal"]),
+            afp_tope_cotizable_cents=int(row["afp_tope_cotizable_cents"]),
+            tramos_renta=list(row["tramos_renta"] or []),
+            recargo_hora_extra_pct=float(row["recargo_hora_extra_pct"]),
+            recargo_nocturnidad_pct=float(row["recargo_nocturnidad_pct"]),
+            horas_jornada_mensual=float(row["horas_jornada_mensual"]),
+        )
+
+    def calcular_planilla_preview(
+        self,
+        *,
+        salario_base_text: str,
+        horas_extra_cantidad: float = 0,
+        nocturnidad_horas: float = 0,
+        bonificaciones_text: str = "",
+        otros_ingresos_text: str = "",
+        descuento_faltas_text: str = "",
+        descuento_prestamos_text: str = "",
+        otros_descuentos_text: str = "",
+        fecha_config: str | None = None,
+    ):
+        config_row = self.get_payroll_config_vigente(fecha=fecha_config)
+        config = self._payroll_config_as_engine_config(config_row)
+        calculo = calcular_planilla(
+            salario_base_cents=_to_cents(salario_base_text),
+            config=config,
+            horas_extra_cantidad=horas_extra_cantidad,
+            nocturnidad_horas=nocturnidad_horas,
+            bonificaciones_cents=self._to_cents_or_zero(bonificaciones_text),
+            otros_ingresos_cents=self._to_cents_or_zero(otros_ingresos_text),
+            descuento_faltas_cents=self._to_cents_or_zero(descuento_faltas_text),
+            descuento_prestamos_cents=self._to_cents_or_zero(descuento_prestamos_text),
+            otros_descuentos_cents=self._to_cents_or_zero(otros_descuentos_text),
+        )
+        return calculo, config_row
+
     def create_payroll(
         self,
         *,
         employee_name: str = "",
         role: str = "",
         period: str,
-        amount_text: str,
         payment_date: str,
         notes: str,
         created_at: str,
         personal_id: int | None = None,
+        modo: str = "manual",
+        amount_text: str | None = None,
+        salario_base_text: str = "",
+        horas_extra_cantidad: float = 0,
+        nocturnidad_horas: float = 0,
+        bonificaciones_text: str = "",
+        otros_ingresos_text: str = "",
+        descuento_faltas_text: str = "",
+        descuento_prestamos_text: str = "",
+        otros_descuentos_text: str = "",
     ) -> int:
+        if modo not in ("calculado", "manual"):
+            raise ValueError("Modo inválido")
+        if modo == "calculado" and personal_id is None:
+            raise ValueError("Una planilla calculada requiere seleccionar a la persona del catálogo")
         # Preferir el catálogo de Personal (PER-XXX, ya usado por gastos fijos y comisiones)
         # en vez de texto libre — un solo lugar con el nombre correcto de cada colaborador,
         # sin depender de que alguien lo escriba igual en dos pantallas distintas.
+        account_id: int | None = None
         if personal_id is not None:
-            persona = self.conn.execute("SELECT persona, cargo FROM personal WHERE id=%s", (int(personal_id),)).fetchone()
+            persona = self.conn.execute("SELECT persona, cargo, account_id FROM personal WHERE id=%s", (int(personal_id),)).fetchone()
             if not persona:
                 raise ValueError("Persona del catálogo no encontrada")
             employee = str(persona["persona"])
             role = str(persona["cargo"] or role or "")
+            account_id = persona["account_id"]
         else:
             employee = (employee_name or "").strip()
         if not employee:
             raise ValueError("Empleado requerido")
         if not period.strip() or not payment_date.strip():
             raise ValueError("Periodo y fecha de pago requeridos")
-        # Plan de cuentas tiene una cuenta EGR-PER-XXX por persona (grupo 'Personal'); se busca la
-        # que coincide con el nombre del empleado. Si no hay una cuenta que calce, queda sin asignar
-        # — no es obligatorio y se puede corregir luego desde Flujo de Caja.
-        account = self.conn.execute(
-            "SELECT id FROM plan_cuentas WHERE tipo='Egreso' AND grupo='Personal' AND nombre ILIKE %s LIMIT 1",
-            (f"%{employee}%",),
-        ).fetchone()
-        account_id = int(account["id"]) if account else None
+        if account_id is None and personal_id is not None:
+            raise ValueError(
+                f"{employee} no tiene una cuenta contable enlazada — asígnala en Finanzas → Personal antes de registrar su planilla."
+            )
+
+        calculo = None
+        config_row = None
+        if modo == "calculado":
+            calculo, config_row = self.calcular_planilla_preview(
+                salario_base_text=salario_base_text,
+                horas_extra_cantidad=horas_extra_cantidad,
+                nocturnidad_horas=nocturnidad_horas,
+                bonificaciones_text=bonificaciones_text,
+                otros_ingresos_text=otros_ingresos_text,
+                descuento_faltas_text=descuento_faltas_text,
+                descuento_prestamos_text=descuento_prestamos_text,
+                otros_descuentos_text=otros_descuentos_text,
+                fecha_config=payment_date,
+            )
+            amount_cents = calculo.neto_cents
+            if self.conn.execute(
+                "SELECT 1 FROM payrolls WHERE personal_id=%s AND period=%s AND modo='calculado'",
+                (int(personal_id), period.strip()),
+            ).fetchone():
+                raise ValueError(f"Ya existe una planilla calculada para {employee} en el periodo {period.strip()}")
+        else:
+            if amount_text is None:
+                raise ValueError("Monto requerido")
+            amount_cents = _to_cents(amount_text)
+
         detail = f"Nómina - {employee} - {period.strip()}"
         expense_id = self.create_expense(
             detail=detail,
-            amount_text=amount_text,
+            amount_text=str(amount_cents / 100),
             expense_date=payment_date,
             notes=notes,
             created_at=created_at,
             account_id=account_id,
         )
-        amount_cents = _to_cents(amount_text)
-        cur = self.conn.execute(
-            "INSERT INTO payrolls(employee_name, role, period, amount_cents, payment_date, notes, expense_id, personal_id, created_at) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (employee, (role or "").strip(), period.strip(), amount_cents, payment_date.strip(), (notes or "").strip(),
-             expense_id, personal_id, created_at),
-        )
+        if calculo is not None:
+            cur = self.conn.execute(
+                "INSERT INTO payrolls(employee_name, role, period, amount_cents, payment_date, notes, expense_id, "
+                "personal_id, created_at, modo, salario_base_cents, horas_extra_cantidad, horas_extra_monto_cents, "
+                "nocturnidad_horas, nocturnidad_monto_cents, bonificaciones_cents, otros_ingresos_cents, "
+                "descuento_faltas_cents, descuento_prestamos_cents, otros_descuentos_cents, isss_empleado_cents, "
+                "afp_empleado_cents, renta_cents, isss_patronal_cents, afp_patronal_cents, total_devengado_cents, "
+                "total_descuentos_cents, payroll_config_id) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    employee, (role or "").strip(), period.strip(), amount_cents, payment_date.strip(), (notes or "").strip(),
+                    expense_id, personal_id, created_at, "calculado", calculo.salario_base_cents,
+                    calculo.horas_extra_cantidad, calculo.horas_extra_monto_cents, calculo.nocturnidad_horas,
+                    calculo.nocturnidad_monto_cents, calculo.bonificaciones_cents, calculo.otros_ingresos_cents,
+                    calculo.descuento_faltas_cents, calculo.descuento_prestamos_cents, calculo.otros_descuentos_cents,
+                    calculo.isss_empleado_cents, calculo.afp_empleado_cents, calculo.renta_cents,
+                    calculo.isss_patronal_cents, calculo.afp_patronal_cents, calculo.total_devengado_cents,
+                    calculo.total_descuentos_cents, int(config_row["id"]),
+                ),
+            )
+        else:
+            cur = self.conn.execute(
+                "INSERT INTO payrolls(employee_name, role, period, amount_cents, payment_date, notes, expense_id, personal_id, created_at, modo) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (employee, (role or "").strip(), period.strip(), amount_cents, payment_date.strip(), (notes or "").strip(),
+                 expense_id, personal_id, created_at, "manual"),
+            )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def update_payroll(
+        self,
+        payroll_id: int,
+        *,
+        payment_date: str,
+        notes: str,
+        amount_text: str,
+        username: str,
+    ) -> None:
+        """Solo corrige fecha de pago, notas y el monto neto — no recalcula el desglose de
+        ley (para eso hay que borrar y recrear). Cada cambio queda en `payroll_audit_log`
+        para que una corrección posterior al pago tenga registro de quién y qué cambió."""
+        row = self.get_payroll(payroll_id)
+        if not payment_date.strip():
+            raise ValueError("Fecha de pago requerida")
+        amount_cents = _to_cents(amount_text)
+        fecha = now_iso()
+        cambios = [
+            ("payment_date", row["payment_date"], payment_date.strip()),
+            ("notes", row["notes"] or "", (notes or "").strip()),
+            ("amount_cents", str(row["amount_cents"]), str(amount_cents)),
+        ]
+        self.conn.execute(
+            "UPDATE payrolls SET payment_date=%s, notes=%s, amount_cents=%s WHERE id=%s",
+            (payment_date.strip(), (notes or "").strip(), amount_cents, int(payroll_id)),
+        )
+        if row["expense_id"]:
+            self.conn.execute(
+                "UPDATE expenses SET amount_cents=%s, expense_date=%s, notes=%s WHERE id=%s",
+                (amount_cents, payment_date.strip(), (notes or "").strip(), int(row["expense_id"])),
+            )
+        for campo, antes, despues in cambios:
+            if antes != despues:
+                self.conn.execute(
+                    "INSERT INTO payroll_audit_log(payroll_id, campo, valor_anterior, valor_nuevo, username, changed_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s)",
+                    (int(payroll_id), campo, antes, despues, username, fecha),
+                )
+        self.conn.commit()
+
+    def list_payroll_audit_log(self, payroll_id: int) -> list[Any]:
+        return list(
+            self.conn.execute(
+                "SELECT * FROM payroll_audit_log WHERE payroll_id=%s ORDER BY changed_at DESC", (int(payroll_id),)
+            ).fetchall()
+        )
 
     def delete_payroll(self, payroll_id: int) -> None:
         row = self.conn.execute("SELECT expense_id FROM payrolls WHERE id=%s", (int(payroll_id),)).fetchone()
@@ -2744,11 +2968,23 @@ class Repository:
     def list_personal(self, *, estado: str | None = None) -> list[Any]:
         where, params = ("", ())
         if estado:
-            where, params = " WHERE estado=%s", (estado,)
-        return list(self.conn.execute(f"SELECT * FROM personal{where} ORDER BY person_code ASC", params).fetchall())
+            where, params = " WHERE p.estado=%s", (estado,)
+        return list(
+            self.conn.execute(
+                f"""SELECT p.*, pc.account_code, pc.nombre AS account_nombre
+                    FROM personal p LEFT JOIN plan_cuentas pc ON pc.id = p.account_id
+                    {where} ORDER BY p.person_code ASC""",
+                params,
+            ).fetchall()
+        )
 
     def get_persona(self, persona_id: int) -> Any:
-        row = self.conn.execute("SELECT * FROM personal WHERE id=%s", (int(persona_id),)).fetchone()
+        row = self.conn.execute(
+            """SELECT p.*, pc.account_code, pc.nombre AS account_nombre
+               FROM personal p LEFT JOIN plan_cuentas pc ON pc.id = p.account_id
+               WHERE p.id=%s""",
+            (int(persona_id),),
+        ).fetchone()
         if not row:
             raise ValueError("Registro de personal no encontrado")
         return row
@@ -2761,7 +2997,8 @@ class Repository:
         return f"PER-{int(row['max_seq']) + 1:03d}"
 
     def create_persona(
-        self, *, persona: str, cargo: str = "", monto_mensual_text: str = "", mes_inicio: str, mes_fin: str | None = None, created_at: str,
+        self, *, persona: str, cargo: str = "", monto_mensual_text: str = "", mes_inicio: str, mes_fin: str | None = None,
+        account_id: int | None = None, created_at: str,
     ) -> int:
         p = (persona or "").strip()
         if not p:
@@ -2770,13 +3007,15 @@ class Repository:
         fin = self._clean_mes(mes_fin, "Mes de fin") if mes_fin else None
         if fin and fin < inicio:
             raise ValueError("El mes de fin no puede ser anterior al mes de inicio")
+        if account_id is not None:
+            self._validate_movement_account(account_id, expected_tipo="Egreso")
         monto_cents = self._to_cents_or_zero(monto_mensual_text)
         code = self._next_person_code()
         try:
             cur = self.conn.execute(
-                """INSERT INTO personal(person_code, persona, cargo, monto_mensual_cents, mes_inicio, mes_fin, created_at, updated_at)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (code, p, (cargo or "").strip(), monto_cents, inicio, fin, created_at, created_at),
+                """INSERT INTO personal(person_code, persona, cargo, monto_mensual_cents, mes_inicio, mes_fin, account_id, created_at, updated_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (code, p, (cargo or "").strip(), monto_cents, inicio, fin, account_id, created_at, created_at),
             )
         except Exception:
             self.conn.rollback()
@@ -2785,7 +3024,8 @@ class Repository:
         return int(cur.lastrowid)
 
     def update_persona(
-        self, persona_id: int, *, persona: str, cargo: str = "", monto_mensual_text: str = "", mes_inicio: str, mes_fin: str | None = None, estado: str,
+        self, persona_id: int, *, persona: str, cargo: str = "", monto_mensual_text: str = "", mes_inicio: str, mes_fin: str | None = None,
+        account_id: int | None = None, estado: str,
     ) -> None:
         p = (persona or "").strip()
         if not p:
@@ -2796,13 +3036,15 @@ class Repository:
             raise ValueError("El mes de fin no puede ser anterior al mes de inicio")
         if estado not in CATALOGO_ESTADOS:
             raise ValueError("Estado inválido")
+        if account_id is not None:
+            self._validate_movement_account(account_id, expected_tipo="Egreso")
         self.get_persona(persona_id)  # 404 if missing
         monto_cents = self._to_cents_or_zero(monto_mensual_text)
         fecha = now_iso()
         self.conn.execute(
-            """UPDATE personal SET persona=%s, cargo=%s, monto_mensual_cents=%s, mes_inicio=%s, mes_fin=%s, estado=%s, updated_at=%s
-               WHERE id=%s""",
-            (p, (cargo or "").strip(), monto_cents, inicio, fin, estado, fecha, int(persona_id)),
+            """UPDATE personal SET persona=%s, cargo=%s, monto_mensual_cents=%s, mes_inicio=%s, mes_fin=%s,
+               account_id=%s, estado=%s, updated_at=%s WHERE id=%s""",
+            (p, (cargo or "").strip(), monto_cents, inicio, fin, account_id, estado, fecha, int(persona_id)),
         )
         self.conn.commit()
 

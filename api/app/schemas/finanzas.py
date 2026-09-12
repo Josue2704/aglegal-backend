@@ -72,6 +72,7 @@ class PersonaIn(BaseModel):
     monto_mensual: float | None = None
     mes_inicio: str
     mes_fin: str | None = None
+    account_id: int | None = None
 
 
 class PersonaUpdate(BaseModel):
@@ -80,6 +81,7 @@ class PersonaUpdate(BaseModel):
     monto_mensual: float | None = None
     mes_inicio: str
     mes_fin: str | None = None
+    account_id: int | None = None
     estado: str
 
 
@@ -91,6 +93,9 @@ class PersonaOut(BaseModel):
     monto_mensual: float
     mes_inicio: str
     mes_fin: str | None
+    account_id: int | None = None
+    account_code: str | None = None
+    account_nombre: str | None = None
     estado: str
     created_at: str
     updated_at: str
