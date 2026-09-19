@@ -67,6 +67,14 @@ COMISION_TRAMO1_CENTS = 100_000   # $1,000.00 — 10%
 COMISION_TRAMO2_CENTS = 250_000   # $2,500.00 — 12% entre tramo1 y tramo2
 COMISION_TRAMO3_PCT = 0.15        # 15% en adelante
 COMISION_VENTA_CRUZADA_PCT = 0.05
+# 12_Reglas_Comision solo define compensación variable para Andrea; al ganarse una
+# oportunidad con este origen, el expediente nace con ella como originadora al 100%.
+ORIGENES_CON_COMISION = {"Andrea"}
+# Una comisión "vigente" es una original que no ha sido revertida por ningún ajuste.
+_SQL_COMISION_VIGENTE = (
+    "c.ajusta_a_commission_id IS NULL AND NOT EXISTS "
+    "(SELECT 1 FROM comisiones r WHERE r.ajusta_a_commission_id = c.id)"
+)
 
 # --- Gobierno del catálogo (Fase 10) — reglas reales de 18_Procedimiento_Catalogo
 TIPO_SOLICITUD_VALUES = ["Alta", "Cambio", "Baja"]
@@ -249,6 +257,7 @@ class Repository:
         notes: str = "",
         created_at: str,
     ) -> int:
+        self._validar_documento_unico(id_number)
         cur = self.conn.execute(
             "INSERT INTO clients(name, client_type, id_number, phone, phone2, email, address, notes, created_at) "
             "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -271,6 +280,7 @@ class Repository:
         address: str = "",
         notes: str = "",
     ) -> None:
+        self._validar_documento_unico(id_number, excluir_client_id=int(client_id))
         self.conn.execute(
             "UPDATE clients SET name=%s, client_type=%s, id_number=%s, phone=%s, phone2=%s, "
             "email=%s, address=%s, notes=%s WHERE id=%s",
@@ -279,6 +289,21 @@ class Repository:
         )
         self.conn.commit()
 
+
+    def _validar_documento_unico(self, id_number: str, *, excluir_client_id: int | None = None) -> None:
+        """13_Especificacion_Sistema, clientes: "Documento único cuando aplique" — el mismo
+        DUI/NIT/pasaporte no puede quedar en dos fichas (se compara sin guiones ni espacios,
+        incluyendo clientes archivados, para que la papelera no sea una puerta a duplicar)."""
+        doc = re.sub(r"[\s\-.]", "", (id_number or "")).upper()
+        if not doc:
+            return
+        row = self.conn.execute(
+            "SELECT id, name FROM clients WHERE upper(regexp_replace(COALESCE(id_number, ''), '[[:space:].-]', '', 'g')) = %s "
+            "AND id <> COALESCE(%s, -1) LIMIT 1",
+            (doc, excluir_client_id),
+        ).fetchone()
+        if row:
+            raise ValueError(f"Ya existe un cliente con ese documento de identidad: {row['name']} (#{row['id']})")
 
     def client_history(self, client_id: int) -> list[dict[str, Any]]:
         cid = int(client_id)
@@ -317,6 +342,19 @@ class Repository:
         # case) violates that the instant the cascade nulls client_id, crashing the
         # delete with an unhandled CheckViolation. Backfill prospecto_nombre from the
         # client's own name first so the opportunity's history survives deletion instead.
+        con_movimientos = self._movimientos_financieros_de_casos(
+            "case_id IN (SELECT id FROM cases WHERE client_id=%s)", (int(client_id),)
+        )
+        for tabla, etiqueta in (("incomes", "cobros"), ("costs", "costos directos"), ("invoices", "facturas")):
+            if etiqueta not in con_movimientos and self.conn.execute(
+                f"SELECT 1 FROM {tabla} WHERE client_id=%s LIMIT 1", (int(client_id),)
+            ).fetchone():
+                con_movimientos.append(etiqueta)
+        if con_movimientos:
+            raise ValueError(
+                f"Este cliente tiene {', '.join(con_movimientos)} registrados y no se puede eliminar "
+                "definitivamente — queda archivado en la papelera para conservar el histórico."
+            )
         client = self.conn.execute("SELECT name FROM clients WHERE id=%s", (int(client_id),)).fetchone()
         if client:
             self.conn.execute(
@@ -351,8 +389,8 @@ class Repository:
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         return list(
             self.conn.execute(
-                f"SELECT s.*, c.name AS client_name FROM sessions s "
-                f"LEFT JOIN clients c ON c.id=s.client_id {where} "
+                f"SELECT s.*, c.name AS client_name, cs.title AS case_title FROM sessions s "
+                f"LEFT JOIN clients c ON c.id=s.client_id LEFT JOIN cases cs ON cs.id=s.case_id {where} "
                 f"ORDER BY s.session_date DESC, COALESCE(s.start_time, '99:99') ASC, s.id DESC",
                 params,
             ).fetchall()
@@ -361,8 +399,8 @@ class Repository:
     def list_sessions_by_case(self, case_id: int) -> list[Any]:
         return list(
             self.conn.execute(
-                "SELECT s.*, c.name AS client_name FROM sessions s "
-                "LEFT JOIN clients c ON c.id=s.client_id "
+                "SELECT s.*, c.name AS client_name, cs.title AS case_title FROM sessions s "
+                "LEFT JOIN clients c ON c.id=s.client_id LEFT JOIN cases cs ON cs.id=s.case_id "
                 "WHERE s.case_id=%s ORDER BY s.session_date DESC, COALESCE(s.start_time, '99:99') ASC, s.id DESC",
                 (int(case_id),),
             ).fetchall()
@@ -460,8 +498,8 @@ class Repository:
 
     def get_session(self, session_id: int) -> Any | None:
         return self.conn.execute(
-            "SELECT s.*, c.name AS client_name "
-            "FROM sessions s LEFT JOIN clients c ON c.id=s.client_id "
+            "SELECT s.*, c.name AS client_name, cs.title AS case_title "
+            "FROM sessions s LEFT JOIN clients c ON c.id=s.client_id LEFT JOIN cases cs ON cs.id=s.case_id "
             "WHERE s.id=%s",
             (int(session_id),),
         ).fetchone()
@@ -552,22 +590,24 @@ class Repository:
         monto_iva_text: str = "",
         monto_reembolsable_text: str = "",
         monto_fondos_terceros_text: str = "",
+        es_ajuste: bool = False,
     ) -> int:
         amount_cents = _to_cents(amount_text)
         resolved_detail = (detail or concept or "").strip()
         resolved_concept = resolved_detail or "(Sin detalle)"
         self._validate_movement_account(account_id, expected_tipo="Ingreso")
-        if service_id is not None:
-            self.get_servicio(service_id)
+        service_id = self._servicio_del_movimiento(service_id, case_id)
         iva_cents = self._to_cents_or_zero(monto_iva_text)
         reembolsable_cents = self._to_cents_or_zero(monto_reembolsable_text)
         fondos_terceros_cents = self._to_cents_or_zero(monto_fondos_terceros_text)
         if iva_cents + reembolsable_cents + fondos_terceros_cents > amount_cents:
             raise ValueError("IVA + reembolsable + fondos de terceros no puede superar el monto bruto")
+        neto_cents = amount_cents - iva_cents - reembolsable_cents - fondos_terceros_cents
+        self._validar_saldo_cobro(case_id, neto_cents, es_ajuste=es_ajuste)
         cur = self.conn.execute(
             "INSERT INTO incomes(client_id, case_id, concept, amount_cents, income_date, created_at, detail, "
-            "invoice_id, account_id, service_id, monto_iva_cents, monto_reembolsable_cents, monto_fondos_terceros_cents) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "invoice_id, account_id, service_id, monto_iva_cents, monto_reembolsable_cents, monto_fondos_terceros_cents, es_ajuste) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(client_id) if client_id else None,
                 int(case_id) if case_id else None,
@@ -582,10 +622,15 @@ class Repository:
                 iva_cents,
                 reembolsable_cents,
                 fondos_terceros_cents,
+                bool(es_ajuste),
             ),
         )
+        income_id = int(cur.lastrowid)
+        # Comisión al cobrarse efectivamente el honorario (12_Reglas_Comision) — en la misma
+        # transacción que el cobro, venga de la pantalla de Ingresos o de una factura pagada.
+        self.reconocer_comision_income(income_id, created_at=created_at, commit=False)
         self.conn.commit()
-        return int(cur.lastrowid)
+        return income_id
 
     def get_income(self, income_id: int) -> Any | None:
         return self.conn.execute(f"{self._INCOME_SELECT} WHERE i.id=%s", (int(income_id),)).fetchone()
@@ -604,22 +649,27 @@ class Repository:
         monto_iva_text: str = "",
         monto_reembolsable_text: str = "",
         monto_fondos_terceros_text: str = "",
+        es_ajuste: bool = False,
     ) -> None:
+        anterior = self.conn.execute("SELECT * FROM incomes WHERE id=%s", (int(income_id),)).fetchone()
+        if not anterior:
+            raise ValueError("Ingreso no encontrado")
         amount_cents = _to_cents(amount_text)
         resolved_detail = (detail or "").strip()
         resolved_concept = resolved_detail or "(Sin detalle)"
         self._validate_movement_account(account_id, expected_tipo="Ingreso")
-        if service_id is not None:
-            self.get_servicio(service_id)
+        service_id = self._servicio_del_movimiento(service_id, case_id)
         iva_cents = self._to_cents_or_zero(monto_iva_text)
         reembolsable_cents = self._to_cents_or_zero(monto_reembolsable_text)
         fondos_terceros_cents = self._to_cents_or_zero(monto_fondos_terceros_text)
         if iva_cents + reembolsable_cents + fondos_terceros_cents > amount_cents:
             raise ValueError("IVA + reembolsable + fondos de terceros no puede superar el monto bruto")
+        neto_cents = amount_cents - iva_cents - reembolsable_cents - fondos_terceros_cents
+        self._validar_saldo_cobro(case_id, neto_cents, es_ajuste=es_ajuste, excluir_income_id=int(income_id))
         self.conn.execute(
             "UPDATE incomes SET amount_cents=%s, income_date=%s, client_id=%s, "
             "case_id=%s, detail=%s, concept=%s, account_id=%s, service_id=%s, monto_iva_cents=%s, "
-            "monto_reembolsable_cents=%s, monto_fondos_terceros_cents=%s "
+            "monto_reembolsable_cents=%s, monto_fondos_terceros_cents=%s, es_ajuste=%s "
             "WHERE id=%s",
             (
                 amount_cents,
@@ -633,14 +683,75 @@ class Repository:
                 iva_cents,
                 reembolsable_cents,
                 fondos_terceros_cents,
+                bool(es_ajuste),
                 int(income_id),
             ),
         )
+        # Si cambió lo que determina la comisión (monto neto, expediente o mes de cobro), la
+        # comisión ya reconocida se revierte con un ajuste trazable y se recalcula — nunca se
+        # edita la fila original ni se deja pagando sobre un monto que ya no es el real.
+        cambio_relevante = (
+            int(anterior["monto_neto_operativo_cents"] or 0) != neto_cents
+            or (anterior["case_id"] or None) != (int(case_id) if case_id else None)
+            or str(anterior["income_date"])[:7] != str(income_date)[:7]
+        )
+        ahora = now_iso()
+        if cambio_relevante:
+            self._revertir_comisiones_income(int(income_id), motivo=f"Corrección del cobro #{income_id}", created_at=ahora)
+        self.reconocer_comision_income(int(income_id), created_at=ahora, commit=False)
         self.conn.commit()
 
     def delete_income(self, income_id: int) -> None:
+        # La comisión de un cobro eliminado no desaparece: se revierte con un ajuste negativo y
+        # la fila original queda en el historial (income_id pasa a NULL por la FK).
+        self._revertir_comisiones_income(int(income_id), motivo=f"Cobro #{income_id} eliminado", created_at=now_iso())
         self.conn.execute("DELETE FROM incomes WHERE id = %s", (int(income_id),))
         self.conn.commit()
+
+    def _servicio_del_movimiento(self, service_id: int | None, case_id: int | None) -> int | None:
+        """El código de servicio lo completa el sistema desde el expediente cuando el
+        movimiento está ligado a uno y no se indicó otro (00_PARA_DESARROLLADOR, "Registrar cobro")."""
+        if service_id is not None:
+            self.get_servicio(service_id)
+            return int(service_id)
+        if case_id:
+            row = self.conn.execute("SELECT service_id FROM cases WHERE id=%s", (int(case_id),)).fetchone()
+            if not row:
+                raise ValueError("Expediente no encontrado")
+            return int(row["service_id"]) if row["service_id"] else None
+        return None
+
+    def saldo_pendiente_case(self, case_id: int, *, excluir_income_id: int | None = None) -> dict:
+        row = self.conn.execute(
+            """SELECT cs.honorarios_contratados_cents,
+                      COALESCE((SELECT SUM(monto_neto_operativo_cents) FROM incomes
+                                WHERE case_id = cs.id AND id <> COALESCE(%s, -1)), 0) AS cobrado_cents
+               FROM cases cs WHERE cs.id=%s""",
+            (excluir_income_id, int(case_id)),
+        ).fetchone()
+        if not row:
+            raise ValueError("Expediente no encontrado")
+        honorarios = int(row["honorarios_contratados_cents"] or 0)
+        cobrado = int(row["cobrado_cents"] or 0)
+        return {"honorarios_contratados_cents": honorarios, "cobrado_cents": cobrado, "saldo_pendiente_cents": honorarios - cobrado}
+
+    def _validar_saldo_cobro(
+        self, case_id: int | None, neto_cents: int, *, es_ajuste: bool, excluir_income_id: int | None = None,
+    ) -> None:
+        """00_PARA_DESARROLLADOR, "Registrar cobro": no exceder el saldo del expediente salvo ajuste."""
+        if not case_id or es_ajuste:
+            return
+        saldo = self.saldo_pendiente_case(int(case_id), excluir_income_id=excluir_income_id)
+        if neto_cents > saldo["saldo_pendiente_cents"]:
+            if saldo["honorarios_contratados_cents"] <= 0:
+                raise ValueError(
+                    "El expediente no tiene honorarios contratados registrados. Regístralos en el "
+                    "expediente o marca este cobro como ajuste."
+                )
+            raise ValueError(
+                f"El cobro neto (${_from_cents(neto_cents)}) excede el saldo pendiente del expediente "
+                f"(${_from_cents(max(saldo['saldo_pendiente_cents'], 0))}). Si es correcto, márcalo como ajuste."
+            )
 
     # --- Expenses
     _EXPENSE_SELECT = (
@@ -779,8 +890,7 @@ class Repository:
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
         self._validate_movement_account(account_id, expected_tipo="Egreso")
-        if service_id is not None:
-            self.get_servicio(service_id)
+        service_id = self._servicio_del_movimiento(service_id, case_id)
         iva_cents = self._to_cents_or_zero(monto_iva_text)
         reembolsable_cents = self._to_cents_or_zero(monto_reembolsable_text)
         fondos_terceros_cents = self._to_cents_or_zero(monto_fondos_terceros_text)
@@ -831,8 +941,7 @@ class Repository:
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
         self._validate_movement_account(account_id, expected_tipo="Egreso")
-        if service_id is not None:
-            self.get_servicio(service_id)
+        service_id = self._servicio_del_movimiento(service_id, case_id)
         iva_cents = self._to_cents_or_zero(monto_iva_text)
         reembolsable_cents = self._to_cents_or_zero(monto_reembolsable_text)
         fondos_terceros_cents = self._to_cents_or_zero(monto_fondos_terceros_text)
@@ -869,7 +978,7 @@ class Repository:
         where, params = self._date_where("cost_date", start_date, end_date)
         return int(
             self.conn.execute(
-                f"SELECT COALESCE(SUM(amount_cents), 0) AS total FROM costs{where}",
+                f"SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS total FROM costs{where}",
                 params,
             ).fetchone()["total"]
         )
@@ -1270,9 +1379,14 @@ class Repository:
         subcategory_id: int | None = None,
         service_id: int | None = None,
         archived: bool = False,
+        case_id: int | None = None,
     ) -> list[Any]:
         where = ["cs.archived_at IS NOT NULL"] if archived else ["cs.archived_at IS NULL"]
         params: list[Any] = []
+        if case_id:
+            # Un expediente puntual se devuelve esté o no en la papelera.
+            where = ["cs.id = %s"]
+            params.append(int(case_id))
         if search:
             where.append("(cs.title ILIKE %s OR cl.name ILIKE %s OR sv.nombre ILIKE %s OR sv.service_code ILIKE %s)")
             like = f"%{search.strip()}%"
@@ -1494,6 +1608,8 @@ class Repository:
             self.get_servicio(service_id)
         if mes_cobro_esperado:
             mes_cobro_esperado = self._clean_mes(mes_cobro_esperado, "Mes de cobro esperado")
+            if mes_cobro_esperado < opened_at[:7]:
+                raise ValueError("El mes de cobro esperado no puede ser anterior a la fecha de apertura")
 
         # Al cerrar el expediente (status='Cerrado') se captura la fecha real de cierre sin
         # intervención manual, si todavía no se había registrado — de ahí sale días de duración.
@@ -1543,8 +1659,22 @@ class Repository:
         self.conn.execute("UPDATE cases SET archived_at=NULL WHERE id=%s", (int(case_id),))
         self.conn.commit()
 
+    def _movimientos_financieros_de_casos(self, where_sql: str, params: tuple) -> list[str]:
+        encontrados = []
+        for tabla, etiqueta in (("incomes", "cobros"), ("costs", "costos directos"), ("comisiones", "comisiones"), ("invoices", "facturas")):
+            if self.conn.execute(f"SELECT 1 FROM {tabla} WHERE {where_sql} LIMIT 1", params).fetchone():
+                encontrados.append(etiqueta)
+        return encontrados
+
     def delete_case(self, case_id: int) -> None:
-        """Permanent purge — only reachable from the archived (papelera) view."""
+        """Permanent purge — only reachable from the archived (papelera) view. Un expediente con
+        movimientos financieros no se purga: se conserva archivado para no perder el histórico."""
+        con_movimientos = self._movimientos_financieros_de_casos("case_id=%s", (int(case_id),))
+        if con_movimientos:
+            raise ValueError(
+                f"Este expediente tiene {', '.join(con_movimientos)} registrados y no se puede eliminar "
+                "definitivamente — queda archivado en la papelera para conservar el histórico."
+            )
         self.conn.execute("DELETE FROM cases WHERE id=%s", (int(case_id),))
         self.conn.commit()
 
@@ -1919,8 +2049,8 @@ class Repository:
     # --- Dashboard
     def dashboard_summary(self) -> DashboardSummary:
         total_clients = int(self.conn.execute("SELECT COUNT(1) AS n FROM clients").fetchone()["n"])
-        incomes = int(self.conn.execute("SELECT COALESCE(SUM(amount_cents), 0) AS s FROM incomes").fetchone()["s"])
-        expenses = int(self.conn.execute("SELECT COALESCE(SUM(amount_cents), 0) AS s FROM expenses").fetchone()["s"])
+        incomes = int(self.conn.execute("SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS s FROM incomes").fetchone()["s"])
+        expenses = int(self.conn.execute("SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS s FROM expenses").fetchone()["s"])
 
         month_prefix = date.today().strftime("%Y-%m-")
         sessions_this_month = int(
@@ -1963,13 +2093,13 @@ class Repository:
         )
         incomes_cents = int(
             self.conn.execute(
-                "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM incomes WHERE income_date LIKE %s",
+                "SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS s FROM incomes WHERE income_date LIKE %s",
                 (f"{month_prefix}%",),
             ).fetchone()["s"]
         )
         expenses_cents = int(
             self.conn.execute(
-                "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM expenses WHERE expense_date LIKE %s",
+                "SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS s FROM expenses WHERE expense_date LIKE %s",
                 (f"{month_prefix}%",),
             ).fetchone()["s"]
         )
@@ -1985,13 +2115,13 @@ class Repository:
         w_in, p_in = self._date_where("income_date", start_date, end_date)
         incomes = int(
             self.conn.execute(
-                f"SELECT COALESCE(SUM(amount_cents), 0) AS s FROM incomes{w_in}", p_in
+                f"SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS s FROM incomes{w_in}", p_in
             ).fetchone()["s"]
         )
         w_ex, p_ex = self._date_where("expense_date", start_date, end_date)
         expenses = int(
             self.conn.execute(
-                f"SELECT COALESCE(SUM(amount_cents), 0) AS s FROM expenses{w_ex}", p_ex
+                f"SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS s FROM expenses{w_ex}", p_ex
             ).fetchone()["s"]
         )
         return incomes, expenses
@@ -2006,7 +2136,7 @@ class Repository:
         w_in, p_in = self._date_where("income_date", start_iso, end_iso)
         income_rows = self.conn.execute(
             f"""
-            SELECT substr(income_date, 1, 7) AS ym, COALESCE(SUM(amount_cents), 0) AS total
+            SELECT substr(income_date, 1, 7) AS ym, COALESCE(SUM(monto_neto_operativo_cents), 0) AS total
             FROM incomes
             {w_in}
             GROUP BY ym
@@ -2019,7 +2149,7 @@ class Repository:
         w_ex, p_ex = self._date_where("expense_date", start_iso, end_iso)
         expense_rows = self.conn.execute(
             f"""
-            SELECT substr(expense_date, 1, 7) AS ym, COALESCE(SUM(amount_cents), 0) AS total
+            SELECT substr(expense_date, 1, 7) AS ym, COALESCE(SUM(monto_neto_operativo_cents), 0) AS total
             FROM expenses
             {w_ex}
             GROUP BY ym
@@ -2043,7 +2173,7 @@ class Repository:
         rows = self.conn.execute(
             f"""
             SELECT COALESCE(pc.nombre, '(Sin cuenta)') AS name,
-                   COALESCE(SUM({alias}.amount_cents), 0) AS total
+                   COALESCE(SUM({alias}.monto_neto_operativo_cents), 0) AS total
             FROM {table} {alias}
             LEFT JOIN plan_cuentas pc ON pc.id={alias}.account_id
             {where}
@@ -2061,12 +2191,12 @@ class Repository:
         rows = self.conn.execute(
             f"""
             SELECT COALESCE(c.name, '(Sin cliente)') AS name,
-                   COALESCE(SUM(i.amount_cents), 0) AS total
+                   COALESCE(SUM(i.monto_neto_operativo_cents), 0) AS total
             FROM incomes i
             LEFT JOIN clients c ON c.id=i.client_id
             {where}
             GROUP BY c.name
-            HAVING COALESCE(SUM(i.amount_cents), 0) > 0
+            HAVING COALESCE(SUM(i.monto_neto_operativo_cents), 0) > 0
             ORDER BY total DESC
             LIMIT %s
             """,
@@ -2082,13 +2212,13 @@ class Repository:
         rows = self.conn.execute(
             f"""
             SELECT COALESCE(sv.nombre, '(Sin servicio)') AS name,
-                   COALESCE(SUM(i.amount_cents), 0) AS total
+                   COALESCE(SUM(i.monto_neto_operativo_cents), 0) AS total
             FROM incomes i
             LEFT JOIN cases cs ON cs.id=i.case_id
             LEFT JOIN servicios sv ON sv.id=cs.service_id
             {where}{service_filter}
             GROUP BY COALESCE(sv.nombre, '(Sin servicio)')
-            HAVING COALESCE(SUM(i.amount_cents), 0) > 0
+            HAVING COALESCE(SUM(i.monto_neto_operativo_cents), 0) > 0
             ORDER BY total DESC
             LIMIT %s
             """,
@@ -2114,7 +2244,7 @@ class Repository:
         income_rows = self.conn.execute(
             f"""
             SELECT COALESCE(sv.nombre, '(Sin servicio)') AS name,
-                   COALESCE(SUM(i.amount_cents), 0) AS total
+                   COALESCE(SUM(i.monto_neto_operativo_cents), 0) AS total
             FROM incomes i
             LEFT JOIN cases cs ON cs.id=i.case_id
             LEFT JOIN servicios sv ON sv.id=cs.service_id
@@ -2126,7 +2256,7 @@ class Repository:
         cost_rows = self.conn.execute(
             f"""
             SELECT COALESCE(sv.nombre, '(Sin servicio)') AS name,
-                   COALESCE(SUM(co.amount_cents), 0) AS total
+                   COALESCE(SUM(co.monto_neto_operativo_cents), 0) AS total
             FROM costs co
             LEFT JOIN cases cs ON cs.id=co.case_id
             LEFT JOIN servicios sv ON sv.id=cs.service_id
@@ -2149,7 +2279,7 @@ class Repository:
         income_rows = self.conn.execute(
             f"""
             SELECT COALESCE(c.name, '(Sin cliente)') AS name,
-                   COALESCE(SUM(i.amount_cents), 0) AS total
+                   COALESCE(SUM(i.monto_neto_operativo_cents), 0) AS total
             FROM incomes i
             LEFT JOIN clients c ON c.id=i.client_id
             {income_where}
@@ -2160,7 +2290,7 @@ class Repository:
         cost_rows = self.conn.execute(
             f"""
             SELECT COALESCE(c.name, '(Sin cliente)') AS name,
-                   COALESCE(SUM(co.amount_cents), 0) AS total
+                   COALESCE(SUM(co.monto_neto_operativo_cents), 0) AS total
             FROM costs co
             LEFT JOIN clients c ON c.id=co.client_id
             {cost_where}
@@ -2185,7 +2315,7 @@ class Repository:
             f"""
             SELECT i.client_id,
                    COALESCE(c.name, '(Sin cliente)') AS client_name,
-                   COALESCE(SUM(i.amount_cents), 0) AS total
+                   COALESCE(SUM(i.monto_neto_operativo_cents), 0) AS total
             FROM incomes i
             LEFT JOIN clients c ON c.id = i.client_id
             {income_where}
@@ -2197,7 +2327,7 @@ class Repository:
             f"""
             SELECT co.client_id,
                    COALESCE(c.name, '(Sin cliente)') AS client_name,
-                   COALESCE(SUM(co.amount_cents), 0) AS total
+                   COALESCE(SUM(co.monto_neto_operativo_cents), 0) AS total
             FROM costs co
             LEFT JOIN clients c ON c.id = co.client_id
             {cost_where}
@@ -2504,22 +2634,47 @@ class Repository:
         inv = self.get_invoice(invoice_id)
         if not inv or not inv["total_cents"]:
             return
-        from aglegal.db import now_iso
-        self.conn.execute(
-            """INSERT INTO incomes(client_id, concept, amount_cents, income_date, case_id, invoice_id, detail, created_at)
-               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (
-                inv["client_id"],
-                f"Factura {inv['invoice_number']}",
-                inv["total_cents"],
-                inv["invoice_date"],
-                inv.get("case_id"),
-                invoice_id,
-                "Ingreso generado automáticamente desde facturación",
-                now_iso(),
-            ),
+        case_id = inv.get("case_id")
+        account_id = self._cuenta_ingreso_sugerida(case_id)
+        if account_id is None:
+            raise ValueError("No hay una cuenta de ingreso activa para registrar el cobro de esta factura")
+        # Pagar la factura es un cobro real; si excede el saldo del expediente se registra
+        # igual (el dinero ya entró) pero queda marcado como ajuste, visible para revisión.
+        es_ajuste = False
+        if case_id:
+            saldo = self.saldo_pendiente_case(int(case_id))
+            es_ajuste = int(inv["total_cents"]) > saldo["saldo_pendiente_cents"]
+        self.create_income(
+            amount_text=_from_cents(int(inv["total_cents"])),
+            income_date=str(inv["invoice_date"]),
+            created_at=now_iso(),
+            client_id=inv["client_id"],
+            case_id=case_id,
+            detail=f"Factura {inv['invoice_number']} — ingreso generado automáticamente desde facturación",
+            invoice_id=invoice_id,
+            account_id=account_id,
+            es_ajuste=es_ajuste,
         )
-        self.conn.commit()
+
+    def _cuenta_ingreso_sugerida(self, case_id: int | None) -> int | None:
+        """Cuenta de ingreso sugerida (00_PARA_DESARROLLADOR, "Nuevo expediente"): la de la
+        categoría del servicio del expediente; si no hay, ING-OTR-001 u otra cuenta de ingreso activa."""
+        if case_id:
+            row = self.conn.execute(
+                """SELECT pc.id FROM cases cs
+                   JOIN servicios sv ON sv.id = cs.service_id
+                   JOIN subcategorias sc ON sc.id = sv.subcategory_id
+                   JOIN plan_cuentas pc ON pc.category_id = sc.category_id AND pc.tipo='Ingreso' AND pc.estado='Activo'
+                   WHERE cs.id=%s ORDER BY pc.account_code LIMIT 1""",
+                (int(case_id),),
+            ).fetchone()
+            if row:
+                return int(row["id"])
+        row = self.conn.execute(
+            "SELECT id FROM plan_cuentas WHERE tipo='Ingreso' AND estado='Activo' "
+            "ORDER BY (account_code = 'ING-OTR-001') DESC, account_code LIMIT 1"
+        ).fetchone()
+        return int(row["id"]) if row else None
 
     def delete_invoice(self, invoice_id: int) -> None:
         # sessions/case_tasks.invoice_id no tienen FK real (columnas agregadas sueltas,
@@ -3535,7 +3690,7 @@ class Repository:
                            (SELECT SUM(monto_neto_operativo_cents) FROM incomes WHERE case_id = cs.id), 0
                        )) AS saldo_pendiente_cents
                 FROM cases cs
-                WHERE 1=1 {mes_filter}
+                WHERE cs.archived_at IS NULL {mes_filter}
             )
             SELECT * FROM saldos WHERE saldo_pendiente_cents > 0 ORDER BY saldo_pendiente_cents DESC
             """,
@@ -3732,13 +3887,39 @@ class Repository:
             created_at=fecha,
             service_id=int(current["service_id"]),
         )
-        self.conn.execute("UPDATE cases SET opportunity_id=%s WHERE id=%s", (int(oportunidad_id), case_id))
+        self.conn.execute(
+            "UPDATE cases SET opportunity_id=%s, honorarios_contratados_cents=%s WHERE id=%s",
+            (int(oportunidad_id), int(current["honorarios_estimados_cents"] or 0), case_id),
+        )
         self.conn.execute(
             "UPDATE oportunidades SET estado='Ganado', case_id=%s, fecha_cierre=%s, updated_at=%s WHERE id=%s",
             (case_id, hoy, fecha, int(oportunidad_id)),
         )
+        self._asignar_originador_desde_origen(case_id, origen_negocio=str(current["origen_negocio"]),
+                                              client_id=int(current["client_id"]), created_at=fecha)
         self.conn.commit()
         return case_id
+
+    def _asignar_originador_desde_origen(self, case_id: int, *, origen_negocio: str, client_id: int, created_at: str) -> None:
+        """El origen del negocio es la base de la comisión (13_Especificacion_Sistema): si quien
+        originó tiene reglas de comisión, queda registrada como originadora del expediente.
+        Venta cruzada si el cliente ya tenía otros expedientes con la firma (COM-004)."""
+        if origen_negocio not in ORIGENES_CON_COMISION:
+            return
+        personas = self.conn.execute(
+            "SELECT id FROM personal WHERE estado='Activo' AND (persona ILIKE %s OR persona ILIKE %s)",
+            (origen_negocio, f"{origen_negocio} %"),
+        ).fetchall()
+        if len(personas) != 1:
+            return  # sin coincidencia única no se adivina — se configura a mano en el expediente
+        cliente_existente = self.conn.execute(
+            "SELECT 1 FROM cases WHERE client_id=%s AND id<>%s LIMIT 1", (int(client_id), int(case_id))
+        ).fetchone()
+        self.conn.execute(
+            """INSERT INTO negocio_originadores(case_id, personal_id, porcentaje_participacion, tipo_origen, created_at)
+               VALUES(%s,%s,100,%s,%s) ON CONFLICT (case_id, personal_id) DO NOTHING""",
+            (int(case_id), int(personas[0]["id"]), "Venta cruzada" if cliente_existente else "Cliente nuevo", created_at),
+        )
 
     def conversion_comercial(self) -> dict:
         """Ganados / Cotizados — KPI de conversión comercial (solo cuenta lo que de verdad pasó por Cotizado)."""
@@ -3776,8 +3957,10 @@ class Repository:
         """Reemplaza por completo la lista de originadores de un expediente. Vacía = sin comisión configurada."""
         if not self.conn.execute("SELECT 1 FROM cases WHERE id=%s", (int(case_id),)).fetchone():
             raise ValueError("Expediente no encontrado")
+        antes = self._firma_originadores(case_id)
         if not originadores:
             self.conn.execute("DELETE FROM negocio_originadores WHERE case_id=%s", (int(case_id),))
+            self._resincronizar_comisiones_caso(case_id, revertir=bool(antes), created_at=created_at)
             self.conn.commit()
             return
         total = sum(float(o["porcentaje_participacion"]) for o in originadores)
@@ -3800,7 +3983,26 @@ class Repository:
                    VALUES(%s,%s,%s,%s,%s)""",
                 (int(case_id), int(o["personal_id"]), float(o["porcentaje_participacion"]), o["tipo_origen"], created_at),
             )
+        # Los cobros que llegaron antes de configurar originadores reconocen su comisión ahora
+        # (en el mes en que se cobraron). Si el reparto cambió, lo ya reconocido se revierte
+        # con ajuste trazable y se recalcula con el reparto nuevo.
+        self._resincronizar_comisiones_caso(case_id, revertir=antes != self._firma_originadores(case_id), created_at=created_at)
         self.conn.commit()
+
+    def _firma_originadores(self, case_id: int) -> list[tuple]:
+        return sorted(
+            (int(o["personal_id"]), round(float(o["porcentaje_participacion"]), 2), str(o["tipo_origen"]))
+            for o in self.list_negocio_originadores(case_id)
+        )
+
+    def _resincronizar_comisiones_caso(self, case_id: int, *, revertir: bool, created_at: str) -> None:
+        incomes = self.conn.execute(
+            "SELECT id FROM incomes WHERE case_id=%s ORDER BY income_date ASC, id ASC", (int(case_id),)
+        ).fetchall()
+        for inc in incomes:
+            if revertir:
+                self._revertir_comisiones_income(int(inc["id"]), motivo="Cambio de originadores del expediente", created_at=created_at)
+            self.reconocer_comision_income(int(inc["id"]), created_at=created_at, commit=False)
 
     @staticmethod
     def _formula_comision_tramos(utilidad_cents: int) -> int:
@@ -3820,8 +4022,8 @@ class Repository:
             # Tasa plana, no acumulada por tramos — "antes/después" es solo este movimiento.
             return round(utilidad_incremento_cents * COMISION_VENTA_CRUZADA_PCT), 0, utilidad_incremento_cents
         row = self.conn.execute(
-            """SELECT COALESCE(SUM(base_utilidad_directa_cents), 0) AS total FROM comisiones
-               WHERE personal_id=%s AND mes_reconocimiento=%s AND tipo_origen='Cliente nuevo' AND ajusta_a_commission_id IS NULL""",
+            f"""SELECT COALESCE(SUM(c.base_utilidad_directa_cents), 0) AS total FROM comisiones c
+               WHERE c.personal_id=%s AND c.mes_reconocimiento=%s AND c.tipo_origen='Cliente nuevo' AND {_SQL_COMISION_VIGENTE}""",
             (int(personal_id), mes),
         ).fetchone()
         u_antes = int(row["total"])
@@ -3850,15 +4052,15 @@ class Repository:
                 tramos.append({"tasa": tasa, "monto_cents": round(ancho * tasa)})
         return tramos
 
-    def reconocer_comision_income(self, income_id: int, *, created_at: str) -> list[Any]:
+    def reconocer_comision_income(self, income_id: int, *, created_at: str, commit: bool = True) -> list[Any]:
         """Punto de entrada: al cobrarse efectivamente un honorario, reconoce la comisión de cada originador
-        del expediente. Idempotente — si ya se reconoció para este income_id, devuelve lo existente sin duplicar."""
+        del expediente. Idempotente — si este cobro ya tiene comisión vigente (no revertida), la devuelve sin duplicar."""
         income = self.conn.execute("SELECT * FROM incomes WHERE id=%s", (int(income_id),)).fetchone()
         if not income:
             raise ValueError("Ingreso no encontrado")
-        existentes = self.list_comisiones(income_id=int(income_id))
+        existentes = self._comisiones_vigentes_income(int(income_id))
         if existentes:
-            return existentes
+            return [self.get_comision(int(r["id"])) for r in existentes]
         if not income["case_id"]:
             return []  # solo los cobros ligados a un expediente pueden generar comisión
 
@@ -3867,7 +4069,7 @@ class Repository:
             return []  # expediente sin originadores configurados — nada que reconocer todavía
 
         caso = self.conn.execute(
-            """SELECT cs.honorarios_contratados_cents,
+            """SELECT cs.honorarios_contratados_cents, COALESCE(cs.internal_ref || ' — ', '') || cs.title AS case_label,
                       COALESCE((SELECT SUM(monto_neto_operativo_cents) FROM costs WHERE case_id = cs.id), 0) AS costos_directos_reales_cents
                FROM cases cs WHERE cs.id=%s""",
             (income["case_id"],),
@@ -3889,22 +4091,35 @@ class Repository:
             cur = self.conn.execute(
                 """INSERT INTO comisiones(income_id, case_id, personal_id, tipo_origen, porcentaje_participacion,
                        base_utilidad_directa_cents, comision_cents, mes_reconocimiento,
-                       base_acumulada_antes_cents, base_acumulada_despues_cents, created_at)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                       base_acumulada_antes_cents, base_acumulada_despues_cents, fecha_cobro, case_label, created_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (int(income_id), income["case_id"], orig["personal_id"], orig["tipo_origen"], orig["porcentaje_participacion"],
-                 share_cents, comision_cents, mes, acumulado_antes_cents, acumulado_despues_cents, created_at),
+                 share_cents, comision_cents, mes, acumulado_antes_cents, acumulado_despues_cents,
+                 str(income["income_date"]), caso["case_label"], created_at),
             )
             ids.append(int(cur.lastrowid))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return [self.get_comision(cid) for cid in ids]
+
+    def _comisiones_vigentes_income(self, income_id: int) -> list[Any]:
+        return list(self.conn.execute(
+            f"SELECT c.* FROM comisiones c WHERE c.income_id=%s AND {_SQL_COMISION_VIGENTE} ORDER BY c.id",
+            (int(income_id),),
+        ).fetchall())
+
+    def _revertir_comisiones_income(self, income_id: int, *, motivo: str, created_at: str) -> None:
+        for c in self._comisiones_vigentes_income(income_id):
+            self.revertir_comision(int(c["id"]), created_at=created_at, motivo=motivo, commit=False)
 
     def get_comision(self, commission_id: int) -> Any:
         row = self.conn.execute(
-            """SELECT c.*, p.person_code, p.persona AS persona_nombre, cs.title AS case_title, i.income_date
+            """SELECT c.*, p.person_code, p.persona AS persona_nombre,
+                      COALESCE(cs.title, c.case_label) AS case_title, COALESCE(i.income_date, c.fecha_cobro) AS income_date
                FROM comisiones c
                JOIN personal p ON p.id = c.personal_id
-               JOIN cases cs ON cs.id = c.case_id
-               JOIN incomes i ON i.id = c.income_id
+               LEFT JOIN cases cs ON cs.id = c.case_id
+               LEFT JOIN incomes i ON i.id = c.income_id
                WHERE c.id=%s""",
             (int(commission_id),),
         ).fetchone()
@@ -3928,17 +4143,18 @@ class Repository:
             params.append(int(income_id))
         clause = " WHERE " + " AND ".join(where) if where else ""
         return list(self.conn.execute(
-            f"""SELECT c.*, p.person_code, p.persona AS persona_nombre, cs.title AS case_title, i.income_date
+            f"""SELECT c.*, p.person_code, p.persona AS persona_nombre,
+                       COALESCE(cs.title, c.case_label) AS case_title, COALESCE(i.income_date, c.fecha_cobro) AS income_date
                 FROM comisiones c
                 JOIN personal p ON p.id = c.personal_id
-                JOIN cases cs ON cs.id = c.case_id
-                JOIN incomes i ON i.id = c.income_id
+                LEFT JOIN cases cs ON cs.id = c.case_id
+                LEFT JOIN incomes i ON i.id = c.income_id
                 {clause}
                 ORDER BY c.created_at DESC""",
             tuple(params),
         ).fetchall())
 
-    def revertir_comision(self, commission_id: int, *, created_at: str) -> Any:
+    def revertir_comision(self, commission_id: int, *, created_at: str, motivo: str = "Reversión manual", commit: bool = True) -> Any:
         """Reversión trazable: crea un movimiento nuevo negativo referenciando el original — nunca edita el histórico.
         Se reconoce en el mes en curso, no en el mes original (regla del Excel: 'se corrige en el siguiente período')."""
         original = self.get_comision(commission_id)
@@ -3949,12 +4165,15 @@ class Repository:
         mes_ajuste = _iso_today()[:7]
         cur = self.conn.execute(
             """INSERT INTO comisiones(income_id, case_id, personal_id, tipo_origen, porcentaje_participacion,
-                   base_utilidad_directa_cents, comision_cents, mes_reconocimiento, ajusta_a_commission_id, created_at)
-               VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                   base_utilidad_directa_cents, comision_cents, mes_reconocimiento, ajusta_a_commission_id,
+                   fecha_cobro, case_label, motivo, created_at)
+               VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (original["income_id"], original["case_id"], original["personal_id"], original["tipo_origen"],
-             original["porcentaje_participacion"], 0, -int(original["comision_cents"]), mes_ajuste, int(commission_id), created_at),
+             original["porcentaje_participacion"], 0, -int(original["comision_cents"]), mes_ajuste, int(commission_id),
+             original["income_date"], original["case_title"], (motivo or "").strip() or None, created_at),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return self.get_comision(int(cur.lastrowid))
 
     def resumen_comisiones_mes(self, mes: str) -> list[Any]:
@@ -4028,32 +4247,41 @@ class Repository:
         mismo espíritu que la hoja 15_Cumplimiento_Metas del Excel."""
         m = self._clean_mes(mes, "Mes")
         metas = self.list_forecast(mes=m)
+        # La familia de un ingreso la define su cuenta contable (04_Plan_Cuentas, columna
+        # "Código familia relacionado"), no la categoría del servicio: una compraventa de
+        # inmueble es un servicio notarial (NOT-EST) pero se cobra con ING-RAI-001 y cuenta
+        # para FAM-03 Inmobiliario, igual que el ejemplo MOV-2026-0001 del Archivo Maestro.
         reales = self.conn.execute(
-            """SELECT fa.id AS family_id,
-                      COUNT(DISTINCT i.case_id) AS casos_reales,
+            """SELECT pc.family_id,
+                      COUNT(DISTINCT i.case_id) + COUNT(*) FILTER (WHERE i.case_id IS NULL) AS casos_reales,
                       COALESCE(SUM(i.monto_neto_operativo_cents), 0) AS ingresos_reales_cents
                FROM incomes i
-               JOIN cases cs ON cs.id = i.case_id
-               JOIN servicios sv ON sv.id = cs.service_id
-               JOIN subcategorias sc ON sc.id = sv.subcategory_id
-               JOIN categorias ct ON ct.id = sc.category_id
-               JOIN familias fa ON fa.category_id = ct.id
-               WHERE i.income_date LIKE %s
-               GROUP BY fa.id""",
+               JOIN plan_cuentas pc ON pc.id = i.account_id
+               WHERE i.income_date LIKE %s AND pc.family_id IS NOT NULL
+               GROUP BY pc.family_id""",
             (m + "-%",),
         ).fetchall()
         reales_map = {int(r["family_id"]): r for r in reales}
+        # Un costo directo no tiene cuenta de ingreso: hereda la familia en la que su expediente
+        # registra (mayormente) sus cobros; si aún no tiene cobros, la de la categoría del servicio.
         costos = self.conn.execute(
-            """SELECT fa.id AS family_id,
+            """WITH familia_cobros AS (
+                   SELECT DISTINCT ON (i.case_id) i.case_id, pc.family_id
+                   FROM incomes i JOIN plan_cuentas pc ON pc.id = i.account_id
+                   WHERE i.case_id IS NOT NULL AND pc.family_id IS NOT NULL
+                   GROUP BY i.case_id, pc.family_id
+                   ORDER BY i.case_id, SUM(i.monto_neto_operativo_cents) DESC, pc.family_id
+               )
+               SELECT COALESCE(fc.family_id, fa.id) AS family_id,
                       COALESCE(SUM(co.monto_neto_operativo_cents), 0) AS costos_directos_reales_cents
                FROM costs co
                JOIN cases cs ON cs.id = co.case_id
-               JOIN servicios sv ON sv.id = cs.service_id
-               JOIN subcategorias sc ON sc.id = sv.subcategory_id
-               JOIN categorias ct ON ct.id = sc.category_id
-               JOIN familias fa ON fa.category_id = ct.id
-               WHERE co.cost_date LIKE %s
-               GROUP BY fa.id""",
+               LEFT JOIN familia_cobros fc ON fc.case_id = cs.id
+               LEFT JOIN servicios sv ON sv.id = cs.service_id
+               LEFT JOIN subcategorias sc ON sc.id = sv.subcategory_id
+               LEFT JOIN familias fa ON fa.category_id = sc.category_id
+               WHERE co.cost_date LIKE %s AND COALESCE(fc.family_id, fa.id) IS NOT NULL
+               GROUP BY COALESCE(fc.family_id, fa.id)""",
             (m + "-%",),
         ).fetchall()
         costos_map = {int(r["family_id"]): int(r["costos_directos_reales_cents"]) for r in costos}

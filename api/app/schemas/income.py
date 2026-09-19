@@ -17,6 +17,8 @@ class IncomeIn(BaseModel):
     monto_iva: float | None = None
     monto_reembolsable: float | None = None
     monto_fondos_terceros: float | None = None
+    # Un cobro que excede el saldo del expediente solo se acepta marcado como ajuste.
+    es_ajuste: bool = False
 
 
 class IncomeOut(BaseModel):
@@ -42,6 +44,7 @@ class IncomeOut(BaseModel):
     monto_reembolsable: float = 0
     monto_fondos_terceros: float = 0
     monto_neto_operativo: float = 0
+    es_ajuste: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 

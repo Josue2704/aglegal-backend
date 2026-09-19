@@ -43,10 +43,10 @@ class TramoComisionOut(BaseModel):
 
 class ComisionOut(BaseModel):
     id: int
-    income_id: int
-    income_date: str
+    income_id: int | None  # NULL si el cobro fue eliminado — la comisión queda en el historial
+    income_date: str | None
     case_id: int
-    case_title: str
+    case_title: str | None
     personal_id: int
     person_code: str
     persona_nombre: str
@@ -56,6 +56,7 @@ class ComisionOut(BaseModel):
     comision: float
     mes_reconocimiento: str
     ajusta_a_commission_id: int | None
+    motivo: str | None = None
     tramos: list[TramoComisionOut]
     created_at: str
 

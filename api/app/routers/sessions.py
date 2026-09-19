@@ -20,7 +20,11 @@ _executor = ThreadPoolExecutor(max_workers=2)
 
 
 def _email_notify(session_row, repo: RepoDep, is_update: bool = False) -> None:
-    """Send email confirmation to client if they have an email address."""
+    """Send email confirmation to client if they have an email address.
+
+    La consulta del cliente se hace aquí, en el hilo de la petición: la conexión de `repo`
+    se cierra al terminar la respuesta, así que el hilo de fondo solo recibe valores planos
+    (antes consultaba la base desde el hilo y fallaba con "connection already closed")."""
     try:
         s = get_settings()
         if not s.resend_api_key:
@@ -33,7 +37,8 @@ def _email_notify(session_row, repo: RepoDep, is_update: bool = False) -> None:
         ).fetchone()
         if not client or not client["email"]:
             return
-        send_session_email(
+        _executor.submit(
+            _send_session_email_safe,
             session_row=session_row,
             client_email=str(client["email"]),
             client_name=str(client["name"]),
@@ -42,6 +47,13 @@ def _email_notify(session_row, repo: RepoDep, is_update: bool = False) -> None:
             resend_from=s.resend_from_email,
             is_update=is_update,
         )
+    except Exception as e:
+        log.warning("Email notify failed: %s", e)
+
+
+def _send_session_email_safe(**kwargs) -> None:
+    try:
+        send_session_email(**kwargs)
     except Exception as e:
         log.warning("Email notify failed: %s", e)
 
@@ -129,7 +141,7 @@ def create_session(body: SessionIn, current_user: CurrentUser, repo: RepoDep, _:
     row = repo.get_session(session_id)
     if not row:
         raise HTTPException(500, "Error al recuperar la sesión creada")
-    _executor.submit(_email_notify, dict(row), repo, False)
+    _email_notify(dict(row), repo, False)
     return SessionOut.from_row(row)
 
 
@@ -149,7 +161,7 @@ def update_session(session_id: int, body: SessionIn, current_user: CurrentUser, 
     row = repo.get_session(session_id)
     if not row:
         raise HTTPException(404, "Sesión no encontrada")
-    _executor.submit(_email_notify, dict(row), repo, True)
+    _email_notify(dict(row), repo, True)
     return SessionOut.from_row(row)
 
 

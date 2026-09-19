@@ -22,6 +22,7 @@ class SessionOut(BaseModel):
     client_id: int | None = None
     client_name: str | None = None
     case_id: int | None = None
+    case_title: str | None = None
     session_date: str
     start_time: str | None = None
     end_time: str | None = None

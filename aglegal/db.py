@@ -1156,6 +1156,33 @@ def _migrate(conn: PgConnection) -> None:
         """)
         _set_schema_version(conn, 37)
 
+    # v38: hallazgos críticos de la auditoría contra el Archivo Maestro.
+    #  1. El historial de comisiones ya no se borra en cascada: borrar un cobro dejaba
+    #     desaparecer su comisión sin ajuste trazable ("Reversión: se corrige en el
+    #     siguiente período"). income_id pasa a SET NULL y case_id a RESTRICT; se guarda
+    #     una copia de la fecha del cobro y de la referencia del expediente para que la
+    #     fila siga siendo legible aunque el cobro ya no exista, más el motivo del ajuste.
+    #  2. `incomes.es_ajuste`: un cobro que excede el saldo del expediente solo se acepta
+    #     marcado explícitamente como ajuste ("No exceder saldo salvo ajuste").
+    if v < 38:
+        conn.executescript("""
+            ALTER TABLE comisiones ALTER COLUMN income_id DROP NOT NULL;
+            ALTER TABLE comisiones DROP CONSTRAINT IF EXISTS comisiones_income_id_fkey;
+            ALTER TABLE comisiones ADD CONSTRAINT comisiones_income_id_fkey
+              FOREIGN KEY (income_id) REFERENCES incomes(id) ON DELETE SET NULL;
+            ALTER TABLE comisiones DROP CONSTRAINT IF EXISTS comisiones_case_id_fkey;
+            ALTER TABLE comisiones ADD CONSTRAINT comisiones_case_id_fkey
+              FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE RESTRICT;
+            ALTER TABLE comisiones ADD COLUMN IF NOT EXISTS fecha_cobro TEXT;
+            ALTER TABLE comisiones ADD COLUMN IF NOT EXISTS case_label TEXT;
+            ALTER TABLE comisiones ADD COLUMN IF NOT EXISTS motivo TEXT;
+            UPDATE comisiones c SET fecha_cobro = i.income_date FROM incomes i WHERE i.id = c.income_id AND c.fecha_cobro IS NULL;
+            UPDATE comisiones c SET case_label = COALESCE(cs.internal_ref || ' — ', '') || cs.title
+              FROM cases cs WHERE cs.id = c.case_id AND c.case_label IS NULL;
+            ALTER TABLE incomes ADD COLUMN IF NOT EXISTS es_ajuste BOOLEAN NOT NULL DEFAULT FALSE;
+        """)
+        _set_schema_version(conn, 38)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 

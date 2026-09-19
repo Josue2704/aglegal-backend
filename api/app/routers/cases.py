@@ -272,3 +272,13 @@ def create_time_entry(case_id: int, body: CaseTimeEntryIn, current_user: Current
 @router.delete("/time-entries/{entry_id}", status_code=204)
 def delete_time_entry(entry_id: int, current_user: LawyerRequired, repo: RepoDep):
     repo.delete_case_time_entry(entry_id)
+
+
+# Declarada al final: las rutas fijas (/tasks, /choices, /conflicto-interes...) deben
+# resolverse antes que este comodín.
+@router.get("/{case_id}", response_model=CaseOut)
+def get_case(case_id: int, current_user: CurrentUser, repo: RepoDep) -> CaseOut:
+    rows = repo.list_cases(case_id=case_id)
+    if not rows:
+        raise HTTPException(404, "Expediente no encontrado")
+    return CaseOut.from_row(rows[0])

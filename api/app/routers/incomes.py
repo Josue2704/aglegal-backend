@@ -41,14 +41,9 @@ def create_income(body: IncomeIn, current_user: CurrentUser, repo: RepoDep, _: d
         monto_iva_text=str(body.monto_iva) if body.monto_iva is not None else "",
         monto_reembolsable_text=str(body.monto_reembolsable) if body.monto_reembolsable is not None else "",
         monto_fondos_terceros_text=str(body.monto_fondos_terceros) if body.monto_fondos_terceros is not None else "",
+        es_ajuste=body.es_ajuste,
     )
-    if body.case_id:
-        # Reconoce comisión automáticamente si el expediente tiene originadores configurados.
-        # Nunca debe bloquear el registro del ingreso — un expediente sin originadores es normal.
-        try:
-            repo.reconocer_comision_income(income_id, created_at=now_iso())
-        except ValueError:
-            pass
+    # La comisión se reconoce dentro de create_income, en la misma transacción que el cobro.
     rows = repo.list_incomes_range(start_date=None, end_date=None)
     row = next((r for r in rows if r["id"] == income_id), None)
     return IncomeOut.from_row(row)
@@ -69,6 +64,7 @@ def update_income(income_id: int, body: IncomeIn, current_user: CurrentUser, rep
         monto_iva_text=str(body.monto_iva) if body.monto_iva is not None else "",
         monto_reembolsable_text=str(body.monto_reembolsable) if body.monto_reembolsable is not None else "",
         monto_fondos_terceros_text=str(body.monto_fondos_terceros) if body.monto_fondos_terceros is not None else "",
+        es_ajuste=body.es_ajuste,
     )
     row = repo.get_income(income_id)
     if not row:
