@@ -1,2 +1,4 @@
 -r api/requirements.txt
 pytest>=8.0
+# Starlette 0.36 (TestClient) no soporta httpx>=0.28
+httpx<0.28

@@ -13,6 +13,9 @@ class OportunidadIn(BaseModel):
     canal_captacion: str
     origen_negocio: str
     honorarios_estimados: float | None = None
+    responsable_username: str = ""
+    proxima_accion: str = ""
+    fecha_proxima_accion: str | None = None
 
 
 class OportunidadUpdate(BaseModel):
@@ -23,11 +26,21 @@ class OportunidadUpdate(BaseModel):
     canal_captacion: str
     origen_negocio: str
     honorarios_estimados: float | None = None
+    responsable_username: str = ""
+    proxima_accion: str = ""
+    fecha_proxima_accion: str | None = None
 
 
 class OportunidadTransicion(BaseModel):
     estado: str
     motivo_perdida: str | None = None
+    motivo_perdida_tipo: str | None = None
+    # Al ganar un prospecto: se registra como cliente en el mismo paso.
+    crear_cliente: bool = False
+    cliente_documento: str = ""
+    cliente_telefono: str = ""
+    cliente_email: str = ""
+    responsable_expediente: str = ""
 
 
 class OportunidadOut(BaseModel):
@@ -49,6 +62,11 @@ class OportunidadOut(BaseModel):
     fecha_prospecto: str
     fecha_cotizado: str | None
     fecha_cierre: str | None
+    responsable_username: str | None = None
+    proxima_accion: str | None = None
+    fecha_proxima_accion: str | None = None
+    motivo_perdida_tipo: str | None = None
+    dias_en_etapa: int | None = None
     created_at: str
     updated_at: str
 

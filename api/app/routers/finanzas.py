@@ -21,6 +21,7 @@ from ..schemas.finanzas import (
     PersonaUpdate,
     ProyeccionCierreMesOut,
     PuntoEquilibrioOut,
+    ResumenMensualOut,
     SupuestosIn,
     SupuestosOut,
     SupuestosUpdate,
@@ -231,6 +232,88 @@ def cumplimiento_familia(current_user: CurrentUser, repo: RepoDep, mes: str, _: 
         }
         for r in rows
     ]
+
+
+@router.get("/resumen-mensual", response_model=ResumenMensualOut)
+def resumen_mensual(
+    current_user: CurrentUser, repo: RepoDep, desde: str, hasta: str,
+    _: dict = require_permission("finanzas", "ver"),
+) -> ResumenMensualOut:
+    """Meta vs. realidad mes a mes — equivalente a la hoja 17 del Archivo Maestro."""
+    return ResumenMensualOut.from_calc(repo.resumen_mensual(desde=desde, hasta=hasta))
+
+
+@router.get("/ticket-promedio")
+def ticket_promedio(
+    current_user: CurrentUser, repo: RepoDep, desde: str, hasta: str, agrupar_por: str = "servicio",
+    _: dict = require_permission("finanzas", "ver"),
+) -> dict:
+    """KPI-009 — ingreso cobrado promedio por expediente, global y por servicio/categoria/familia."""
+    d = repo.ticket_promedio(desde=desde, hasta=hasta, agrupar_por=agrupar_por)
+    return {
+        "desde": d["desde"], "hasta": d["hasta"], "agrupar_por": d["agrupar_por"],
+        "ingresos": d["ingresos_cents"] / 100,
+        "casos_cobrados": d["casos_cobrados"],
+        "ticket_promedio": (d["ticket_promedio_cents"] / 100) if d["ticket_promedio_cents"] is not None else None,
+        "detalle": [
+            {
+                "codigo": r["codigo"], "nombre": r["nombre"],
+                "ingresos": r["ingresos_cents"] / 100, "casos_cobrados": r["casos_cobrados"],
+                "ticket_promedio": (r["ticket_promedio_cents"] / 100) if r["ticket_promedio_cents"] is not None else None,
+            }
+            for r in d["detalle"]
+        ],
+    }
+
+
+@router.get("/ingresos-por-origen")
+def ingresos_por_origen(
+    current_user: CurrentUser, repo: RepoDep, desde: str, hasta: str,
+    _: dict = require_permission("finanzas", "ver"),
+) -> list[dict]:
+    """KPI-015 — ingresos y utilidad directa por originador del negocio y tipo de origen."""
+    return [
+        {
+            "origen": r["origen"], "tipo_origen": r["tipo_origen"], "casos": r["casos"],
+            "ingresos": r["ingresos_cents"] / 100,
+            "costos_directos": r["costos_directos_cents"] / 100,
+            "utilidad_directa": r["utilidad_directa_cents"] / 100,
+            "margen_pct": r["margen_pct"],
+        }
+        for r in repo.ingresos_por_origen(desde=desde, hasta=hasta)
+    ]
+
+
+@router.get("/dias-cobro")
+def dias_cobro(
+    current_user: CurrentUser, repo: RepoDep, desde: str, hasta: str,
+    _: dict = require_permission("finanzas", "ver"),
+) -> dict:
+    """KPI-016 — dias promedio entre la facturacion (o el cierre) y el cobro."""
+    return repo.dias_promedio_cobro(desde=desde, hasta=hasta)
+
+
+@router.get("/aging-cartera")
+def aging_cartera(
+    current_user: CurrentUser, repo: RepoDep, fecha_corte: str | None = None,
+    _: dict = require_permission("finanzas", "ver"),
+) -> dict:
+    """Antiguedad del saldo por cobrar, por tramos de atraso."""
+    d = repo.aging_cartera(fecha_corte=fecha_corte)
+    return {
+        "fecha_corte": d["fecha_corte"],
+        "total_pendiente": d["total_pendiente_cents"] / 100,
+        "tramos": [{"tramo": t["tramo"], "saldo": t["saldo_cents"] / 100, "casos": t["casos"]} for t in d["tramos"]],
+        "casos": [
+            {
+                "case_id": c["case_id"], "title": c["title"], "client_name": c["client_name"],
+                "estado_cobro": c["estado_cobro"], "mes_cobro_esperado": c["mes_cobro_esperado"],
+                "saldo_pendiente": c["saldo_pendiente_cents"] / 100,
+                "dias_atraso": c["dias_atraso"], "tramo": c["tramo"],
+            }
+            for c in d["casos"]
+        ],
+    }
 
 
 @router.get("/utilidad-operativa-real")

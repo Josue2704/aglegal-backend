@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable
 from pathlib import Path
@@ -53,6 +53,12 @@ _MES_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 OPORTUNIDAD_ESTADOS = ["Prospecto", "Cotizado", "Ganado", "Perdido"]
 CANALES_CAPTACION = ["Instagram", "Google", "LinkedIn", "Referido", "Otro"]
 ORIGENES_NEGOCIO = ["Andrea", "Alfredo", "Guadalupe", "Referido", "Orgánico", "Otro"]
+# Causas de pérdida tipificadas: en texto libre no se podía medir nada. La nota libre
+# (motivo_perdida) sigue existiendo aparte, para el detalle del caso concreto.
+MOTIVOS_PERDIDA = [
+    "Precio", "Tiempo de respuesta", "Eligió otro despacho",
+    "No era nuestro servicio", "No respondió", "Desistió", "Otro",
+]
 _OPORTUNIDAD_TRANSICIONES: dict[str, set[str]] = {
     "Prospecto": {"Cotizado", "Ganado", "Perdido"},
     "Cotizado": {"Ganado", "Perdido"},
@@ -1740,7 +1746,8 @@ class Repository:
         return list(
             self.conn.execute(
                 f"SELECT ct.*, cs.title AS case_title, cs.status AS case_status, "
-                f"cs.client_id, cl.name AS client_name "
+                f"cs.client_id, cl.name AS client_name, "
+                f"cs.responsible_username AS case_responsible_username "
                 f"FROM case_tasks ct "
                 f"JOIN cases cs ON cs.id = ct.case_id "
                 f"LEFT JOIN clients cl ON cl.id = cs.client_id "
@@ -1923,7 +1930,8 @@ class Repository:
         today = date.today().isoformat()
         overdue_rows = self.conn.execute(
             """SELECT ct.id, ct.title, ct.due_date, ct.case_id, ct.es_critico,
-                      ca.title AS case_title, cl.name AS client_name
+                      ca.title AS case_title, cl.name AS client_name,
+                      ct.responsible_username, ca.responsible_username AS case_responsible_username
                FROM case_tasks ct
                JOIN cases ca ON ca.id = ct.case_id
                LEFT JOIN clients cl ON cl.id = ca.client_id
@@ -1938,7 +1946,8 @@ class Repository:
         # 3 días, para que la alerta llegue antes de que ya sea tarde.
         critical_rows = self.conn.execute(
             """SELECT ct.id, ct.title, ct.due_date, ct.case_id,
-                      ca.title AS case_title, cl.name AS client_name
+                      ca.title AS case_title, cl.name AS client_name,
+                      ct.responsible_username, ca.responsible_username AS case_responsible_username
                FROM case_tasks ct
                JOIN cases ca ON ca.id = ct.case_id
                LEFT JOIN clients cl ON cl.id = ca.client_id
@@ -1948,13 +1957,13 @@ class Repository:
                LIMIT 20""",
         ).fetchall()
         stale_rows = self.conn.execute(
-            """SELECT ca.id, ca.title, ca.status, cl.name AS client_name,
+            """SELECT ca.id, ca.title, ca.status, cl.name AS client_name, ca.responsible_username,
                       MAX(s.session_date) AS last_session
                FROM cases ca
                LEFT JOIN clients cl ON cl.id = ca.client_id
                LEFT JOIN sessions s ON s.case_id = ca.id
                WHERE ca.status NOT IN ('Cerrado') AND ca.archived_at IS NULL
-               GROUP BY ca.id, ca.title, ca.status, cl.name
+               GROUP BY ca.id, ca.title, ca.status, cl.name, ca.responsible_username
                HAVING MAX(s.session_date::date) < (CURRENT_DATE - (%s * INTERVAL '1 day'))
                    OR MAX(s.session_date) IS NULL
                ORDER BY last_session ASC NULLS FIRST
@@ -1967,6 +1976,7 @@ class Repository:
             """
             WITH saldos AS (
                 SELECT cs.id, cs.title, cl.name AS client_name, cs.mes_cobro_esperado, cs.estado_cobro,
+                       cs.responsible_username,
                        (cs.honorarios_contratados_cents - COALESCE(
                            (SELECT SUM(monto_neto_operativo_cents) FROM incomes WHERE case_id = cs.id), 0
                        )) AS saldo_pendiente_cents
@@ -1977,6 +1987,19 @@ class Repository:
             SELECT * FROM saldos WHERE saldo_pendiente_cents > 0 ORDER BY mes_cobro_esperado ASC LIMIT 20
             """,
             (mes_actual,),
+        ).fetchall()
+
+        # Oportunidades cuyo próximo paso ya venció: un embudo sin fecha de seguimiento se
+        # enfría sin que nadie lo note, así que la fecha vencida sube como alerta.
+        seguimiento_rows = self.conn.execute(
+            """SELECT op.id, COALESCE(cl.name, op.prospecto_nombre) AS nombre, op.estado,
+                      op.proxima_accion, op.fecha_proxima_accion, op.responsable_username,
+                      op.honorarios_estimados_cents
+               FROM oportunidades op LEFT JOIN clients cl ON cl.id = op.client_id
+               WHERE op.estado IN ('Prospecto','Cotizado')
+                 AND op.fecha_proxima_accion IS NOT NULL AND op.fecha_proxima_accion < %s
+               ORDER BY op.fecha_proxima_accion ASC LIMIT 20""",
+            (today,),
         ).fetchall()
 
         desviacion_presupuesto: list[dict] = []
@@ -1993,6 +2016,7 @@ class Repository:
             "stale_cases": [dict(r) for r in stale_rows],
             "overdue_billing": [dict(r) for r in overdue_billing_rows],
             "budget_deviation": desviacion_presupuesto,
+            "seguimiento_vencido": [dict(r) for r in seguimiento_rows],
         }
 
     def global_search(self, q: str, *, limit: int = 8) -> dict:
@@ -3759,7 +3783,8 @@ class Repository:
             self.conn.execute(
                 f"""SELECT op.*, cl.name AS client_name,
                            sv.service_code, sv.nombre AS service_nombre,
-                           ca.internal_ref AS case_internal_ref
+                           ca.internal_ref AS case_internal_ref,
+                           (CURRENT_DATE - COALESCE(op.fecha_ultimo_estado, op.fecha_prospecto)::date) AS dias_en_etapa
                     FROM oportunidades op
                     LEFT JOIN clients cl ON cl.id = op.client_id
                     LEFT JOIN servicios sv ON sv.id = op.service_id
@@ -3780,7 +3805,8 @@ class Repository:
     def create_oportunidad(
         self, *, client_id: int | None = None, prospecto_nombre: str = "", prospecto_contacto: str = "",
         service_id: int | None = None, canal_captacion: str, origen_negocio: str, created_at: str,
-        honorarios_estimados_text: str = "",
+        honorarios_estimados_text: str = "", responsable_username: str = "",
+        proxima_accion: str = "", fecha_proxima_accion: str | None = None,
     ) -> int:
         nombre = (prospecto_nombre or "").strip()
         if not client_id and not nombre:
@@ -3797,10 +3823,13 @@ class Repository:
         honorarios_cents = self._to_cents_or_zero(honorarios_estimados_text) or None
         cur = self.conn.execute(
             """INSERT INTO oportunidades(client_id, prospecto_nombre, prospecto_contacto, service_id, canal_captacion,
-                 origen_negocio, estado, honorarios_estimados_cents, fecha_prospecto, created_at, updated_at)
-               VALUES(%s,%s,%s,%s,%s,%s,'Prospecto',%s,%s,%s,%s)""",
+                 origen_negocio, estado, honorarios_estimados_cents, fecha_prospecto, responsable_username,
+                 proxima_accion, fecha_proxima_accion, fecha_ultimo_estado, created_at, updated_at)
+               VALUES(%s,%s,%s,%s,%s,%s,'Prospecto',%s,%s,%s,%s,%s,%s,%s,%s)""",
             (client_id, nombre or None, (prospecto_contacto or "").strip() or None, service_id, canal_captacion,
-             origen_negocio, honorarios_cents, fecha, created_at, created_at),
+             origen_negocio, honorarios_cents, fecha, (responsable_username or "").strip() or None,
+             (proxima_accion or "").strip() or None, (fecha_proxima_accion or "").strip() or None,
+             fecha, created_at, created_at),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -3808,7 +3837,8 @@ class Repository:
     def update_oportunidad(
         self, oportunidad_id: int, *, client_id: int | None = None, prospecto_nombre: str = "", prospecto_contacto: str = "",
         service_id: int | None = None, canal_captacion: str, origen_negocio: str,
-        honorarios_estimados_text: str = "",
+        honorarios_estimados_text: str = "", responsable_username: str = "",
+        proxima_accion: str = "", fecha_proxima_accion: str | None = None,
     ) -> None:
         current = self.get_oportunidad(oportunidad_id)
         if current["estado"] in ("Ganado", "Perdido"):
@@ -3828,14 +3858,20 @@ class Repository:
         honorarios_cents = self._to_cents_or_zero(honorarios_estimados_text) or None
         self.conn.execute(
             """UPDATE oportunidades SET client_id=%s, prospecto_nombre=%s, prospecto_contacto=%s, service_id=%s,
-                 canal_captacion=%s, origen_negocio=%s, honorarios_estimados_cents=%s, updated_at=%s WHERE id=%s""",
+                 canal_captacion=%s, origen_negocio=%s, honorarios_estimados_cents=%s, responsable_username=%s,
+                 proxima_accion=%s, fecha_proxima_accion=%s, updated_at=%s WHERE id=%s""",
             (client_id, nombre or None, (prospecto_contacto or "").strip() or None, service_id, canal_captacion,
-             origen_negocio, honorarios_cents, fecha, int(oportunidad_id)),
+             origen_negocio, honorarios_cents, (responsable_username or "").strip() or None,
+             (proxima_accion or "").strip() or None, (fecha_proxima_accion or "").strip() or None,
+             fecha, int(oportunidad_id)),
         )
         self.conn.commit()
 
     def transition_oportunidad(
         self, oportunidad_id: int, *, nuevo_estado: str, motivo_perdida: str | None = None, usuario_id: int | None = None,
+        motivo_perdida_tipo: str | None = None, crear_cliente: bool = False,
+        cliente_documento: str = "", cliente_telefono: str = "", cliente_email: str = "",
+        responsable_expediente: str = "",
     ) -> int | None:
         """Avanza el estado de una oportunidad. Si nuevo_estado='Ganado', crea el expediente
         automáticamente (heredando cliente, servicio y origen) y devuelve su id."""
@@ -3850,35 +3886,57 @@ class Repository:
         hoy = fecha[:10]
 
         if nuevo_estado == "Perdido":
-            if not (motivo_perdida or "").strip():
+            tipo = (motivo_perdida_tipo or "").strip()
+            if not tipo and not (motivo_perdida or "").strip():
                 raise ValueError("El motivo de pérdida es obligatorio")
+            if tipo and tipo not in MOTIVOS_PERDIDA:
+                raise ValueError("Motivo de pérdida inválido")
             self.conn.execute(
-                "UPDATE oportunidades SET estado='Perdido', motivo_perdida=%s, fecha_cierre=%s, updated_at=%s WHERE id=%s",
-                (motivo_perdida.strip(), hoy, fecha, int(oportunidad_id)),
+                "UPDATE oportunidades SET estado='Perdido', motivo_perdida=%s, motivo_perdida_tipo=%s, "
+                "fecha_cierre=%s, fecha_ultimo_estado=%s, proxima_accion=NULL, fecha_proxima_accion=NULL, "
+                "updated_at=%s WHERE id=%s",
+                ((motivo_perdida or "").strip() or None, tipo or None, hoy, hoy, fecha, int(oportunidad_id)),
             )
             self.conn.commit()
             return None
 
         if nuevo_estado == "Cotizado":
             self.conn.execute(
-                "UPDATE oportunidades SET estado='Cotizado', fecha_cotizado=%s, updated_at=%s WHERE id=%s",
-                (hoy, fecha, int(oportunidad_id)),
+                "UPDATE oportunidades SET estado='Cotizado', fecha_cotizado=%s, fecha_ultimo_estado=%s, "
+                "updated_at=%s WHERE id=%s",
+                (hoy, hoy, fecha, int(oportunidad_id)),
             )
             self.conn.commit()
             return None
 
-        # nuevo_estado == "Ganado" -> crea el expediente automáticamente, sin recapturar datos
-        if not current["client_id"]:
-            raise ValueError("Para marcar Ganado, la oportunidad debe estar ligada a un cliente registrado (no solo un prospecto)")
+        # nuevo_estado == "Ganado" -> el prospecto se vuelve cliente y nace el expediente en el
+        # mismo paso: al aceptar el negocio nadie quiere volver a teclear lo que ya se capturó
+        # en el primer contacto.
+        client_id = current["client_id"]
+        if not client_id:
+            if not crear_cliente:
+                raise ValueError(
+                    "Esta oportunidad es de un prospecto: al ganarla hay que registrarlo como cliente"
+                )
+            contacto = (current["prospecto_contacto"] or "").strip()
+            telefono = (cliente_telefono or "").strip() or ("" if "@" in contacto else contacto)
+            email = (cliente_email or "").strip() or (contacto if "@" in contacto else "")
+            client_id = self.create_client(
+                name=str(current["prospecto_nombre"] or "").strip(),
+                id_number=cliente_documento, phone=telefono, email=email,
+                notes=f"Registrado al ganar la oportunidad #{oportunidad_id} (canal: {current['canal_captacion']}).",
+                created_at=fecha,
+            )
         if not current["service_id"]:
             raise ValueError("Para marcar Ganado, selecciona primero el servicio que se va a contratar")
 
         servicio = self.get_servicio(current["service_id"])
-        client_row = self.conn.execute("SELECT name FROM clients WHERE id=%s", (int(current["client_id"]),)).fetchone()
+        client_row = self.conn.execute("SELECT name FROM clients WHERE id=%s", (int(client_id),)).fetchone()
         client_name = client_row["name"] if client_row else "Cliente"
 
         case_id = self.create_case(
-            client_id=int(current["client_id"]),
+            client_id=int(client_id),
+            responsible_username=(responsable_expediente or current["responsable_username"] or ""),
             title=f"{servicio['nombre']} — {client_name}",
             status="Abierto",
             priority="Media",
@@ -3892,11 +3950,12 @@ class Repository:
             (int(oportunidad_id), int(current["honorarios_estimados_cents"] or 0), case_id),
         )
         self.conn.execute(
-            "UPDATE oportunidades SET estado='Ganado', case_id=%s, fecha_cierre=%s, updated_at=%s WHERE id=%s",
-            (case_id, hoy, fecha, int(oportunidad_id)),
+            "UPDATE oportunidades SET estado='Ganado', client_id=%s, case_id=%s, fecha_cierre=%s, "
+            "fecha_ultimo_estado=%s, proxima_accion=NULL, fecha_proxima_accion=NULL, updated_at=%s WHERE id=%s",
+            (int(client_id), case_id, hoy, hoy, fecha, int(oportunidad_id)),
         )
         self._asignar_originador_desde_origen(case_id, origen_negocio=str(current["origen_negocio"]),
-                                              client_id=int(current["client_id"]), created_at=fecha)
+                                              client_id=int(client_id), created_at=fecha)
         self.conn.commit()
         return case_id
 
@@ -3920,6 +3979,46 @@ class Repository:
                VALUES(%s,%s,100,%s,%s) ON CONFLICT (case_id, personal_id) DO NOTHING""",
             (int(case_id), int(personas[0]["id"]), "Venta cruzada" if cliente_existente else "Cliente nuevo", created_at),
         )
+
+    def buscar_contactos_parecidos(self, *, nombre: str, contacto: str = "") -> dict:
+        """Antes de capturar un prospecto: ¿ya es cliente, ya tiene una oportunidad abierta o
+        aparece como contraparte en otro expediente? Evita registrar dos veces al mismo referido
+        y adelanta la revisión de conflicto de interés al primer contacto, no al abrir el caso."""
+        termino = (nombre or "").strip()
+        if len(termino) < 3:
+            return {"clientes": [], "oportunidades": [], "contrapartes": []}
+        like = f"%{termino}%"
+        contacto_limpio = (contacto or "").strip()
+        contacto_like = f"%{contacto_limpio}%" if contacto_limpio else None
+
+        clientes = self.conn.execute(
+            """SELECT id, name, phone, email, id_number FROM clients
+               WHERE archived_at IS NULL
+                 AND (name ILIKE %s OR (%s IS NOT NULL AND (phone ILIKE %s OR email ILIKE %s)))
+               ORDER BY name LIMIT 5""",
+            (like, contacto_like, contacto_like, contacto_like),
+        ).fetchall()
+        oportunidades = self.conn.execute(
+            """SELECT op.id, op.estado, COALESCE(cl.name, op.prospecto_nombre) AS nombre, op.responsable_username
+               FROM oportunidades op LEFT JOIN clients cl ON cl.id = op.client_id
+               WHERE op.estado IN ('Prospecto','Cotizado')
+                 AND (op.prospecto_nombre ILIKE %s OR cl.name ILIKE %s
+                      OR (%s IS NOT NULL AND op.prospecto_contacto ILIKE %s))
+               ORDER BY op.id DESC LIMIT 5""",
+            (like, like, contacto_like, contacto_like),
+        ).fetchall()
+        contrapartes = self.conn.execute(
+            """SELECT cs.id, cs.title, cs.opposing_party, cl.name AS client_name
+               FROM cases cs LEFT JOIN clients cl ON cl.id = cs.client_id
+               WHERE cs.archived_at IS NULL AND cs.opposing_party ILIKE %s
+               ORDER BY cs.id DESC LIMIT 5""",
+            (like,),
+        ).fetchall()
+        return {
+            "clientes": [dict(r) for r in clientes],
+            "oportunidades": [dict(r) for r in oportunidades],
+            "contrapartes": [dict(r) for r in contrapartes],
+        }
 
     def conversion_comercial(self) -> dict:
         """Ganados / Cotizados — KPI de conversión comercial (solo cuenta lo que de verdad pasó por Cotizado)."""
@@ -4358,6 +4457,383 @@ class Repository:
             "comisiones_cents": comisiones_cents,
             "utilidad_operativa_real_cents": utilidad_operativa_real_cents,
             "margen_operativo_real_pct": margen_operativo_real_pct,
+        }
+
+    # ── Resumen mensual consolidado (17_Resumen_Mensual del Archivo Maestro) ──
+
+    @staticmethod
+    def _meses_rango(desde: str, hasta: str) -> list[str]:
+        """Meses AAAA-MM entre dos extremos, ambos incluidos."""
+        y1, m1 = int(desde[:4]), int(desde[5:7])
+        total = (int(hasta[:4]) - y1) * 12 + (int(hasta[5:7]) - m1)
+        if total < 0:
+            raise ValueError("El mes inicial no puede ser posterior al mes final")
+        if total > 35:
+            raise ValueError("El rango no puede superar 36 meses")
+        return [f"{y1 + (m1 - 1 + i) // 12:04d}-{(m1 - 1 + i) % 12 + 1:02d}" for i in range(total + 1)]
+
+    def _margen_operativo_meta(self, meses: list[str]) -> dict[str, float]:
+        """Margen operativo meta aplicable a cada mes. Los supuestos son por período anual,
+        así que un rango que cruce de año usa los de cada año."""
+        cache: dict[str, float] = {}
+        for periodo in {m[:4] for m in meses}:
+            supuestos = self.get_supuestos_activos(periodo=periodo)
+            if not supuestos:
+                raise ValueError(f"No hay supuestos financieros configurados para {periodo}")
+            cache[periodo] = float(supuestos["margen_operativo_meta_pct"])
+        return {m: cache[m[:4]] for m in meses}
+
+    def resumen_mensual(self, *, desde: str, hasta: str) -> dict:
+        """Meta contra realidad, mes a mes y para todo el despacho: la hoja 17 del Archivo Maestro.
+
+        Junta en una sola tabla lo que hoy hay que pedirle mes por mes a tres endpoints
+        distintos. La utilidad mínima sale del margen operativo meta aplicado a la *meta*
+        de ingresos, no a lo realmente cobrado: es el piso que el mes debía alcanzar."""
+        d = self._clean_mes(desde, "Mes inicial")
+        h = self._clean_mes(hasta, "Mes final")
+        meses = self._meses_rango(d, h)
+        margen_meta = self._margen_operativo_meta(meses)
+
+        # Una consulta por concepto para todo el rango, en lugar de cuatro por cada mes.
+        def _por_mes(sql: str) -> dict[str, int]:
+            return {str(r["mes"]): int(r["total"]) for r in self.conn.execute(sql, (d, h)).fetchall()}
+
+        ingresos = _por_mes(
+            "SELECT substring(income_date,1,7) AS mes, COALESCE(SUM(monto_neto_operativo_cents),0) AS total "
+            "FROM incomes WHERE substring(income_date,1,7) BETWEEN %s AND %s GROUP BY 1"
+        )
+        costos = _por_mes(
+            "SELECT substring(cost_date,1,7) AS mes, COALESCE(SUM(monto_neto_operativo_cents),0) AS total "
+            "FROM costs WHERE substring(cost_date,1,7) BETWEEN %s AND %s GROUP BY 1"
+        )
+        comisiones = _por_mes(
+            "SELECT mes_reconocimiento AS mes, COALESCE(SUM(comision_cents),0) AS total "
+            "FROM comisiones WHERE mes_reconocimiento BETWEEN %s AND %s GROUP BY 1"
+        )
+        metas = {
+            str(r["mes"]): (int(r["ingresos"]), int(r["utilidad"]))
+            for r in self.conn.execute(
+                "SELECT mes, COALESCE(SUM(ingreso_proyectado_cents),0) AS ingresos, "
+                "COALESCE(SUM(ROUND(ingreso_proyectado_cents * margen_directo_objetivo_pct)),0) AS utilidad "
+                "FROM forecast WHERE mes BETWEEN %s AND %s GROUP BY mes",
+                (d, h),
+            ).fetchall()
+        }
+        # Los gastos fijos no están guardados por mes sino por vigencia (mes_inicio/mes_fin),
+        # así que se evalúan en memoria: GF-005 "Marketing" arranca en agosto y no pesa en julio.
+        vigencias = self.conn.execute(
+            "SELECT monto_mensual_cents, mes_inicio, mes_fin FROM gastos_fijos WHERE estado='Activo'"
+        ).fetchall()
+
+        filas = [
+            self._fila_resumen_mensual(
+                mes=m,
+                meta=metas.get(m, (0, 0)),
+                ingresos_cents=ingresos.get(m, 0),
+                costos_cents=costos.get(m, 0),
+                comisiones_cents=comisiones.get(m, 0),
+                gastos_fijos_cents=sum(
+                    int(g["monto_mensual_cents"]) for g in vigencias
+                    if str(g["mes_inicio"]) <= m and (g["mes_fin"] is None or str(g["mes_fin"]) >= m)
+                ),
+                margen_meta_pct=margen_meta[m],
+            )
+            for m in meses
+        ]
+        return {"desde": d, "hasta": h, "meses": filas, "totales": self._totales_resumen_mensual(filas, d, h)}
+
+    def _fila_resumen_mensual(
+        self, *, mes: str, meta: tuple[int, int], ingresos_cents: int, costos_cents: int,
+        comisiones_cents: int, gastos_fijos_cents: int, margen_meta_pct: float,
+    ) -> dict:
+        meta_ingresos_cents, meta_utilidad_cents = meta
+        utilidad_directa_cents = ingresos_cents - costos_cents
+        utilidad_operativa_cents = utilidad_directa_cents - gastos_fijos_cents - comisiones_cents
+        utilidad_minima_cents = round(meta_ingresos_cents * margen_meta_pct)
+        cumpl_ingresos = round(ingresos_cents / meta_ingresos_cents, 4) if meta_ingresos_cents else None
+        return {
+            "mes": mes,
+            "meta_ingresos_cents": meta_ingresos_cents,
+            "ingresos_reales_cents": ingresos_cents,
+            "cumplimiento_ingresos_pct": cumpl_ingresos,
+            "meta_utilidad_directa_cents": meta_utilidad_cents,
+            "utilidad_directa_real_cents": utilidad_directa_cents,
+            "cumplimiento_utilidad_directa_pct": (
+                round(utilidad_directa_cents / meta_utilidad_cents, 4) if meta_utilidad_cents else None
+            ),
+            "gastos_fijos_cents": gastos_fijos_cents,
+            "comisiones_cents": comisiones_cents,
+            "utilidad_operativa_real_cents": utilidad_operativa_cents,
+            "utilidad_operativa_minima_cents": utilidad_minima_cents,
+            "margen_operativo_real_pct": (
+                round(utilidad_operativa_cents / ingresos_cents, 4) if ingresos_cents else None
+            ),
+            "margen_operativo_minimo_pct": margen_meta_pct,
+            "brecha_utilidad_minima_cents": utilidad_operativa_cents - utilidad_minima_cents,
+            "semaforo_general": self._semaforo_general(cumpl_ingresos, utilidad_operativa_cents, utilidad_minima_cents),
+        }
+
+    def _totales_resumen_mensual(self, filas: list[dict], desde: str, hasta: str) -> dict:
+        def _suma(campo: str) -> int:
+            return sum(int(f[campo]) for f in filas)
+
+        meta = _suma("meta_ingresos_cents")
+        ingresos = _suma("ingresos_reales_cents")
+        meta_utilidad = _suma("meta_utilidad_directa_cents")
+        utilidad_directa = _suma("utilidad_directa_real_cents")
+        operativa = _suma("utilidad_operativa_real_cents")
+        minima = _suma("utilidad_operativa_minima_cents")
+        cumplimiento = round(ingresos / meta, 4) if meta else None
+        # El margen mínimo del consolidado es el del último mes del rango: los supuestos son
+        # anuales y un rango que cruce de año no tiene un único porcentaje que lo represente.
+        return {
+            "mes": f"{desde} a {hasta}",
+            "meta_ingresos_cents": meta,
+            "ingresos_reales_cents": ingresos,
+            "cumplimiento_ingresos_pct": cumplimiento,
+            "meta_utilidad_directa_cents": meta_utilidad,
+            "utilidad_directa_real_cents": utilidad_directa,
+            "cumplimiento_utilidad_directa_pct": round(utilidad_directa / meta_utilidad, 4) if meta_utilidad else None,
+            "gastos_fijos_cents": _suma("gastos_fijos_cents"),
+            "comisiones_cents": _suma("comisiones_cents"),
+            "utilidad_operativa_real_cents": operativa,
+            "utilidad_operativa_minima_cents": minima,
+            "margen_operativo_real_pct": round(operativa / ingresos, 4) if ingresos else None,
+            "margen_operativo_minimo_pct": filas[-1]["margen_operativo_minimo_pct"] if filas else 0.0,
+            "brecha_utilidad_minima_cents": operativa - minima,
+            "semaforo_general": self._semaforo_general(cumplimiento, operativa, minima),
+        }
+
+    @staticmethod
+    def _semaforo_general(cumplimiento_ingresos_pct: float | None, utilidad_cents: int, utilidad_minima_cents: int) -> str | None:
+        """Un mes solo está en verde si además de llegar a la meta de ingresos deja la utilidad
+        mínima: cobrar la meta con la utilidad por debajo del piso no es un buen mes."""
+        if cumplimiento_ingresos_pct is None:
+            return None
+        if cumplimiento_ingresos_pct >= 1 and utilidad_cents >= utilidad_minima_cents:
+            return "verde"
+        if cumplimiento_ingresos_pct >= 0.85:
+            return "amarillo"
+        return "rojo"
+
+    # ── KPIs de la hoja 14 que faltaban (009 ticket, 015 origen, 016 días de cobro) ──
+
+    _TICKET_AGRUPACIONES = {
+        "servicio": ("sv.service_code", "sv.nombre"),
+        "categoria": ("ca.category_code", "ca.nombre"),
+        "familia": ("fa.family_code", "fa.nombre"),
+    }
+
+    def ticket_promedio(self, *, desde: str, hasta: str, agrupar_por: str = "servicio") -> dict:
+        """KPI-009 — ingresos cobrados / expedientes cobrados, global y por agrupación.
+
+        Un cobro sin expediente (venta de mostrador) cuenta como un caso propio: es una
+        operación cobrada y descartarla inflaría el ticket del resto."""
+        d = self._clean_mes(desde, "Mes inicial")
+        h = self._clean_mes(hasta, "Mes final")
+        self._meses_rango(d, h)
+        if agrupar_por not in self._TICKET_AGRUPACIONES:
+            raise ValueError(f"Agrupación inválida: use {', '.join(self._TICKET_AGRUPACIONES)}")
+        codigo_col, nombre_col = self._TICKET_AGRUPACIONES[agrupar_por]
+
+        global_row = self.conn.execute(
+            """SELECT COALESCE(SUM(monto_neto_operativo_cents),0) AS ingresos,
+                      COUNT(DISTINCT case_id) + COUNT(*) FILTER (WHERE case_id IS NULL) AS casos
+               FROM incomes WHERE substring(income_date,1,7) BETWEEN %s AND %s""",
+            (d, h),
+        ).fetchone()
+        ingresos_cents, casos = int(global_row["ingresos"]), int(global_row["casos"])
+
+        rows = self.conn.execute(
+            f"""SELECT {codigo_col} AS codigo, {nombre_col} AS nombre,
+                       COALESCE(SUM(i.monto_neto_operativo_cents),0) AS ingresos,
+                       COUNT(DISTINCT i.case_id) + COUNT(*) FILTER (WHERE i.case_id IS NULL) AS casos
+                FROM incomes i
+                LEFT JOIN servicios sv ON sv.id = i.service_id
+                LEFT JOIN subcategorias sb ON sb.id = sv.subcategory_id
+                LEFT JOIN categorias ca ON ca.id = sb.category_id
+                LEFT JOIN plan_cuentas pc ON pc.id = i.account_id
+                LEFT JOIN familias fa ON fa.id = pc.family_id
+                WHERE substring(i.income_date,1,7) BETWEEN %s AND %s AND {codigo_col} IS NOT NULL
+                GROUP BY {codigo_col}, {nombre_col}
+                ORDER BY 3 DESC""",
+            (d, h),
+        ).fetchall()
+
+        return {
+            "desde": d, "hasta": h, "agrupar_por": agrupar_por,
+            "ingresos_cents": ingresos_cents,
+            "casos_cobrados": casos,
+            "ticket_promedio_cents": round(ingresos_cents / casos) if casos else None,
+            "detalle": [
+                {
+                    "codigo": r["codigo"], "nombre": r["nombre"],
+                    "ingresos_cents": int(r["ingresos"]), "casos_cobrados": int(r["casos"]),
+                    "ticket_promedio_cents": round(int(r["ingresos"]) / int(r["casos"])) if r["casos"] else None,
+                }
+                for r in rows
+            ],
+        }
+
+    def ingresos_por_origen(self, *, desde: str, hasta: str) -> list[dict]:
+        """KPI-015 — ingresos y utilidad directa por originador del negocio y tipo de origen.
+
+        El originador vive en `negocio_originadores` (el mismo que gobierna la comisión), no en
+        el expediente, y un expediente puede tener varios: el ingreso se reparte según el
+        porcentaje de participación (0–100, igual que en la comisión) para que la suma de los
+        orígenes cuadre con el total cobrado."""
+        d = self._clean_mes(desde, "Mes inicial")
+        h = self._clean_mes(hasta, "Mes final")
+        self._meses_rango(d, h)
+        rows = self.conn.execute(
+            """WITH cobros AS (
+                   SELECT i.case_id, SUM(i.monto_neto_operativo_cents) AS ingresos_cents
+                   FROM incomes i
+                   WHERE substring(i.income_date,1,7) BETWEEN %s AND %s
+                   GROUP BY i.case_id
+               ), costos_caso AS (
+                   SELECT co.case_id, SUM(co.monto_neto_operativo_cents) AS costos_cents
+                   FROM costs co
+                   WHERE substring(co.cost_date,1,7) BETWEEN %s AND %s
+                   GROUP BY co.case_id
+               )
+               SELECT COALESCE(pe.persona, 'Sin originador') AS origen,
+                      COALESCE(no.tipo_origen, 'Sin clasificar') AS tipo_origen,
+                      COUNT(DISTINCT cb.case_id) AS casos,
+                      SUM(cb.ingresos_cents * COALESCE(no.porcentaje_participacion, 100) / 100.0) AS ingresos_cents,
+                      SUM(COALESCE(cc.costos_cents, 0) * COALESCE(no.porcentaje_participacion, 100) / 100.0) AS costos_cents
+               FROM cobros cb
+               LEFT JOIN negocio_originadores no ON no.case_id = cb.case_id
+               LEFT JOIN personal pe ON pe.id = no.personal_id
+               LEFT JOIN costos_caso cc ON cc.case_id = cb.case_id
+               GROUP BY 1, 2
+               ORDER BY 4 DESC""",
+            (d, h, d, h),
+        ).fetchall()
+        resultado = []
+        for r in rows:
+            ingresos_cents = round(float(r["ingresos_cents"] or 0))
+            costos_cents = round(float(r["costos_cents"] or 0))
+            utilidad_cents = ingresos_cents - costos_cents
+            resultado.append({
+                "origen": r["origen"], "tipo_origen": r["tipo_origen"],
+                "casos": int(r["casos"]),
+                "ingresos_cents": ingresos_cents,
+                "costos_directos_cents": costos_cents,
+                "utilidad_directa_cents": utilidad_cents,
+                "margen_pct": round(utilidad_cents / ingresos_cents, 4) if ingresos_cents else None,
+            })
+        return resultado
+
+    def dias_promedio_cobro(self, *, desde: str, hasta: str) -> dict:
+        """KPI-016 — días entre la facturación (o el cierre del expediente) y el cobro.
+
+        Un cobro sin factura ni fecha de cierre no tiene desde cuándo contar: se informa
+        aparte en `sin_referencia` en vez de asumirle un cero que bajaría el promedio."""
+        d = self._clean_mes(desde, "Mes inicial")
+        h = self._clean_mes(hasta, "Mes final")
+        self._meses_rango(d, h)
+        rows = self.conn.execute(
+            """SELECT i.id,
+                      COALESCE(inv.invoice_date, cs.fecha_cierre_real) AS fecha_referencia,
+                      i.income_date,
+                      sv.service_code, sv.nombre AS service_nombre
+               FROM incomes i
+               LEFT JOIN invoices inv ON inv.id = i.invoice_id
+               LEFT JOIN cases cs ON cs.id = i.case_id
+               LEFT JOIN servicios sv ON sv.id = i.service_id
+               WHERE substring(i.income_date,1,7) BETWEEN %s AND %s""",
+            (d, h),
+        ).fetchall()
+
+        dias: list[int] = []
+        por_servicio: dict[str, dict] = {}
+        sin_referencia = 0
+        for r in rows:
+            if not r["fecha_referencia"]:
+                sin_referencia += 1
+                continue
+            delta = (date.fromisoformat(str(r["income_date"])[:10]) - date.fromisoformat(str(r["fecha_referencia"])[:10])).days
+            if delta < 0:  # cobro anterior a la factura (anticipo): no es tiempo de cobro
+                sin_referencia += 1
+                continue
+            dias.append(delta)
+            if r["service_code"]:
+                acc = por_servicio.setdefault(
+                    str(r["service_code"]), {"codigo": r["service_code"], "nombre": r["service_nombre"], "dias": []}
+                )
+                acc["dias"].append(delta)
+
+        return {
+            "desde": d, "hasta": h,
+            "promedio_dias": round(sum(dias) / len(dias), 1) if dias else None,
+            "maximo_dias": max(dias) if dias else None,
+            "cobros_medidos": len(dias),
+            "sin_referencia": sin_referencia,
+            "detalle": sorted(
+                (
+                    {"codigo": v["codigo"], "nombre": v["nombre"],
+                     "promedio_dias": round(sum(v["dias"]) / len(v["dias"]), 1), "cobros_medidos": len(v["dias"])}
+                    for v in por_servicio.values()
+                ),
+                key=lambda x: x["promedio_dias"], reverse=True,
+            ),
+        }
+
+    _AGING_TRAMOS = ("Por vencer", "1-30", "31-60", "61-90", "Más de 90")
+
+    def aging_cartera(self, *, fecha_corte: str | None = None) -> dict:
+        """Antigüedad del saldo por cobrar de cada expediente.
+
+        La fecha desde la que se mide es el último día del mes de cobro esperado — la promesa
+        que el despacho le hizo al cliente. Si el expediente no tiene mes esperado, se usa su
+        fecha de apertura, que es lo más antiguo que se puede afirmar con certeza."""
+        corte = date.fromisoformat(fecha_corte) if fecha_corte else date.today()
+        rows = self.conn.execute(
+            """SELECT cs.id, cs.title, cs.estado_cobro, cs.mes_cobro_esperado, cs.opened_at,
+                      cl.name AS client_name,
+                      (cs.honorarios_contratados_cents - COALESCE(
+                          (SELECT SUM(monto_neto_operativo_cents) FROM incomes WHERE case_id = cs.id), 0
+                      )) AS saldo_pendiente_cents
+               FROM cases cs
+               LEFT JOIN clients cl ON cl.id = cs.client_id
+               WHERE cs.archived_at IS NULL AND cs.estado_cobro <> 'Cobrado'""",
+        ).fetchall()
+
+        tramos = {t: {"tramo": t, "saldo_cents": 0, "casos": 0} for t in self._AGING_TRAMOS}
+        detalle = []
+        total_cents = 0
+        for r in rows:
+            saldo = int(r["saldo_pendiente_cents"] or 0)
+            if saldo <= 0:
+                continue
+            if r["mes_cobro_esperado"]:
+                y, mth = int(str(r["mes_cobro_esperado"])[:4]), int(str(r["mes_cobro_esperado"])[5:7])
+                referencia = date(y + mth // 12, mth % 12 + 1, 1) - timedelta(days=1)
+            else:
+                referencia = date.fromisoformat(str(r["opened_at"])[:10])
+            atraso = (corte - referencia).days
+            tramo = (
+                "Por vencer" if atraso <= 0 else
+                "1-30" if atraso <= 30 else
+                "31-60" if atraso <= 60 else
+                "61-90" if atraso <= 90 else
+                "Más de 90"
+            )
+            tramos[tramo]["saldo_cents"] += saldo
+            tramos[tramo]["casos"] += 1
+            total_cents += saldo
+            detalle.append({
+                "case_id": r["id"], "title": r["title"], "client_name": r["client_name"],
+                "estado_cobro": r["estado_cobro"], "mes_cobro_esperado": r["mes_cobro_esperado"],
+                "saldo_pendiente_cents": saldo, "dias_atraso": max(atraso, 0), "tramo": tramo,
+            })
+
+        return {
+            "fecha_corte": corte.isoformat(),
+            "total_pendiente_cents": total_cents,
+            "tramos": [tramos[t] for t in self._AGING_TRAMOS],
+            "casos": sorted(detalle, key=lambda c: c["dias_atraso"], reverse=True),
         }
 
     # ── Gobierno del catálogo — solicitudes de alta/cambio (Fase 10) ────────

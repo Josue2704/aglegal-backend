@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from aglegal.db import now_iso
 
 from ..deps import CurrentUser, RepoDep, require_permission
+from aglegal.repositories import MOTIVOS_PERDIDA
 from ..schemas.pipeline import (
     ConversionComercialOut,
     OportunidadIn,
@@ -25,11 +26,26 @@ def list_oportunidades(
     return [OportunidadOut.from_row(row) for row in repo.list_oportunidades(estado=estado, q=q)]
 
 
+@router.get("/motivos-perdida", response_model=list[str])
+def motivos_perdida(current_user: CurrentUser, _: dict = require_permission("pipeline", "ver")) -> list[str]:
+    return MOTIVOS_PERDIDA
+
+
 @router.get("/conversion", response_model=ConversionComercialOut)
 def conversion_comercial(current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("pipeline", "ver")) -> ConversionComercialOut:
     data = repo.conversion_comercial()
     data["valor_pipeline"] = data.pop("valor_pipeline_cents", 0) / 100
     return ConversionComercialOut(**data)
+
+
+@router.get("/contactos-parecidos")
+def contactos_parecidos(
+    nombre: str, current_user: CurrentUser, repo: RepoDep, contacto: str = "",
+    _: dict = require_permission("pipeline", "ver"),
+) -> dict:
+    """¿Ya es cliente, ya tiene oportunidad abierta o es contraparte nuestra? Se consulta
+    mientras se escribe el nombre, antes de registrar el prospecto."""
+    return repo.buscar_contactos_parecidos(nombre=nombre, contacto=contacto)
 
 
 @router.post("", response_model=OportunidadOut, status_code=201)
@@ -38,7 +54,8 @@ def create_oportunidad(body: OportunidadIn, current_user: CurrentUser, repo: Rep
         client_id=body.client_id, prospecto_nombre=body.prospecto_nombre, prospecto_contacto=body.prospecto_contacto,
         service_id=body.service_id, canal_captacion=body.canal_captacion, origen_negocio=body.origen_negocio,
         honorarios_estimados_text=str(body.honorarios_estimados) if body.honorarios_estimados is not None else "",
-        created_at=now_iso(),
+        responsable_username=body.responsable_username, proxima_accion=body.proxima_accion,
+        fecha_proxima_accion=body.fecha_proxima_accion, created_at=now_iso(),
     )
     return OportunidadOut.from_row(repo.get_oportunidad(op_id))
 
@@ -49,6 +66,8 @@ def update_oportunidad(oportunidad_id: int, body: OportunidadUpdate, current_use
         oportunidad_id, client_id=body.client_id, prospecto_nombre=body.prospecto_nombre, prospecto_contacto=body.prospecto_contacto,
         service_id=body.service_id, canal_captacion=body.canal_captacion, origen_negocio=body.origen_negocio,
         honorarios_estimados_text=str(body.honorarios_estimados) if body.honorarios_estimados is not None else "",
+        responsable_username=body.responsable_username, proxima_accion=body.proxima_accion,
+        fecha_proxima_accion=body.fecha_proxima_accion,
     )
     return OportunidadOut.from_row(repo.get_oportunidad(oportunidad_id))
 
@@ -57,6 +76,9 @@ def update_oportunidad(oportunidad_id: int, body: OportunidadUpdate, current_use
 def transicionar_oportunidad(oportunidad_id: int, body: OportunidadTransicion, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("pipeline", "editar")) -> OportunidadTransicionOut:
     case_id = repo.transition_oportunidad(
         oportunidad_id, nuevo_estado=body.estado, motivo_perdida=body.motivo_perdida, usuario_id=current_user["id"],
+        motivo_perdida_tipo=body.motivo_perdida_tipo, crear_cliente=body.crear_cliente,
+        cliente_documento=body.cliente_documento, cliente_telefono=body.cliente_telefono,
+        cliente_email=body.cliente_email, responsable_expediente=body.responsable_expediente,
     )
     row = repo.get_oportunidad(oportunidad_id)
     return OportunidadTransicionOut(oportunidad=OportunidadOut.from_row(row), case_id=case_id, case_internal_ref=row["case_internal_ref"])

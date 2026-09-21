@@ -140,6 +140,7 @@ class GlobalCaseTaskOut(BaseModel):
     notes: str | None = None
     completed_notes: str | None = None
     responsible_username: str | None = None
+    case_responsible_username: str | None = None
     es_critico: bool = False
     origen: str = "manual"
     monto_adicional: float = 0

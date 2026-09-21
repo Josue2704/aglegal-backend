@@ -302,3 +302,59 @@ class ProyeccionCierreMesOut(BaseModel):
             meta_ingresos=d["meta_ingresos_cents"] / 100,
             cumplimiento_proyectado_pct=d["cumplimiento_proyectado_pct"],
         )
+
+
+# --- Resumen mensual consolidado (hoja 17 del Archivo Maestro)
+
+class ResumenMesOut(BaseModel):
+    mes: str
+    meta_ingresos: float
+    ingresos_reales: float
+    cumplimiento_ingresos_pct: float | None
+    meta_utilidad_directa: float
+    utilidad_directa_real: float
+    cumplimiento_utilidad_directa_pct: float | None
+    gastos_fijos: float
+    comisiones: float
+    utilidad_operativa_real: float
+    utilidad_operativa_minima: float
+    margen_operativo_real_pct: float | None
+    margen_operativo_minimo_pct: float
+    brecha_utilidad_minima: float
+    semaforo_general: str | None
+
+    @classmethod
+    def from_calc(cls, d: dict) -> ResumenMesOut:
+        return cls(
+            mes=d["mes"],
+            meta_ingresos=d["meta_ingresos_cents"] / 100,
+            ingresos_reales=d["ingresos_reales_cents"] / 100,
+            cumplimiento_ingresos_pct=d["cumplimiento_ingresos_pct"],
+            meta_utilidad_directa=d["meta_utilidad_directa_cents"] / 100,
+            utilidad_directa_real=d["utilidad_directa_real_cents"] / 100,
+            cumplimiento_utilidad_directa_pct=d["cumplimiento_utilidad_directa_pct"],
+            gastos_fijos=d["gastos_fijos_cents"] / 100,
+            comisiones=d["comisiones_cents"] / 100,
+            utilidad_operativa_real=d["utilidad_operativa_real_cents"] / 100,
+            utilidad_operativa_minima=d["utilidad_operativa_minima_cents"] / 100,
+            margen_operativo_real_pct=d["margen_operativo_real_pct"],
+            margen_operativo_minimo_pct=d["margen_operativo_minimo_pct"],
+            brecha_utilidad_minima=d["brecha_utilidad_minima_cents"] / 100,
+            semaforo_general=d["semaforo_general"],
+        )
+
+
+class ResumenMensualOut(BaseModel):
+    desde: str
+    hasta: str
+    meses: list[ResumenMesOut]
+    totales: ResumenMesOut
+
+    @classmethod
+    def from_calc(cls, d: dict) -> ResumenMensualOut:
+        return cls(
+            desde=d["desde"],
+            hasta=d["hasta"],
+            meses=[ResumenMesOut.from_calc(m) for m in d["meses"]],
+            totales=ResumenMesOut.from_calc(d["totales"]),
+        )

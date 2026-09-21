@@ -1183,6 +1183,22 @@ def _migrate(conn: PgConnection) -> None:
         """)
         _set_schema_version(conn, 38)
 
+    # v39: el embudo comercial se trabaja por fechas, no de memoria. Una oportunidad
+    # abierta necesita saber quién le da seguimiento, cuál es el próximo paso y cuándo;
+    # y al perderse, por qué (de una lista corta, para poder medir el canal después).
+    if v < 39:
+        conn.executescript("""
+            ALTER TABLE oportunidades ADD COLUMN IF NOT EXISTS responsable_username TEXT;
+            ALTER TABLE oportunidades ADD COLUMN IF NOT EXISTS proxima_accion TEXT;
+            ALTER TABLE oportunidades ADD COLUMN IF NOT EXISTS fecha_proxima_accion TEXT;
+            ALTER TABLE oportunidades ADD COLUMN IF NOT EXISTS motivo_perdida_tipo TEXT;
+            ALTER TABLE oportunidades ADD COLUMN IF NOT EXISTS fecha_ultimo_estado TEXT;
+            CREATE INDEX IF NOT EXISTS idx_oportunidades_proxima ON oportunidades(fecha_proxima_accion);
+            UPDATE oportunidades SET fecha_ultimo_estado = COALESCE(fecha_cotizado, fecha_prospecto)
+              WHERE fecha_ultimo_estado IS NULL;
+        """)
+        _set_schema_version(conn, 39)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 
