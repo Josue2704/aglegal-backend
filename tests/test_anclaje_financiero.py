@@ -49,7 +49,7 @@ def test_crear_caso_con_tareas_iniciales_no_altera_honorarios(repo, catalogo):
 def test_tarea_manual_con_monto_sube_honorarios_y_queda_en_bitacora(repo, caso):
     task_id = repo.create_case_task(
         case_id=caso, title="Trámite adicional pedido por el cliente", due_date=None, created_at=now_iso(),
-        monto_adicional_text="150", username="abogada1",
+        monto_adicional_text="150", autorizado_por="Cliente (llamada)", username="abogada1",
     )
     row = repo.get_case(caso)
     assert row["honorarios_contratados_cents"] == 65_000  # 500 + 150

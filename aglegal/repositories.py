@@ -1779,6 +1779,48 @@ class Repository:
             ).fetchall()
         )
 
+    def _validar_cobro_extra(self, monto_cents: int, autorizado_por: str) -> None:
+        """Un aumento de honorarios nunca es un cambio silencioso: queda con nombre y fecha
+        de quien lo autorizó, para responder un "yo no acepté eso" meses después."""
+        if monto_cents > 0 and not (autorizado_por or "").strip():
+            raise ValueError("Para cobrar un monto adicional hay que indicar quién lo autorizó")
+
+    def _sincronizar_costo_tarea(
+        self, *, task_id: int, case_id: int, titulo: str, costo_cents: int, account_id: int | None,
+        es_reembolsable: bool, fecha: str, notas: str = "",
+    ) -> None:
+        """El costo de una diligencia (transporte, tasas, copias) es un costo directo del
+        expediente, no un cobro: se registra en Flujo de caja para que la utilidad, la
+        comisión y la rentabilidad por abogado salgan completas sin doble captura."""
+        row = self.conn.execute("SELECT cost_id FROM case_tasks WHERE id=%s", (int(task_id),)).fetchone()
+        cost_id = row["cost_id"] if row else None
+
+        if costo_cents <= 0:
+            if cost_id:
+                self.conn.execute("DELETE FROM costs WHERE id=%s", (int(cost_id),))
+                self.conn.execute("UPDATE case_tasks SET cost_id=NULL WHERE id=%s", (int(task_id),))
+            return
+
+        if account_id is None:
+            raise ValueError("Indica la cuenta contable del costo de la tarea")
+        caso = self.conn.execute("SELECT client_id FROM cases WHERE id=%s", (int(case_id),)).fetchone()
+        detalle = f"Tarea: {titulo}"
+        monto_texto = _from_cents(costo_cents)
+        reembolsable_texto = monto_texto if es_reembolsable else ""
+        if cost_id:
+            self.update_cost(
+                int(cost_id), client_id=caso["client_id"] if caso else None, case_id=int(case_id), detail=detalle,
+                amount_text=monto_texto, cost_date=fecha, notes=notas, account_id=account_id,
+                monto_reembolsable_text=reembolsable_texto,
+            )
+        else:
+            nuevo = self.create_cost(
+                client_id=caso["client_id"] if caso else None, case_id=int(case_id), detail=detalle,
+                amount_text=monto_texto, cost_date=fecha, notes=notas, created_at=now_iso(),
+                account_id=account_id, monto_reembolsable_text=reembolsable_texto,
+            )
+            self.conn.execute("UPDATE case_tasks SET cost_id=%s WHERE id=%s", (int(nuevo), int(task_id)))
+
     def create_case_task(
         self,
         *,
@@ -1791,6 +1833,11 @@ class Repository:
         es_critico: bool = False,
         origen: str = "manual",
         monto_adicional_text: str = "0",
+        costo_real_text: str = "0",
+        costo_account_id: int | None = None,
+        costo_es_reembolsable: bool = False,
+        autorizado_por: str = "",
+        fecha_autorizacion: str | None = None,
         username: str = "",
     ) -> int:
         t = (title or "").strip()
@@ -1799,17 +1846,24 @@ class Repository:
         if origen not in ("plantilla", "manual"):
             raise ValueError("Origen inválido")
         monto_cents = self._to_cents_or_zero(monto_adicional_text)
+        costo_cents = self._to_cents_or_zero(costo_real_text)
+        self._validar_cobro_extra(monto_cents, autorizado_por)
         cur = self.conn.execute(
             "INSERT INTO case_tasks(case_id, title, done, due_date, notes, responsible_username, es_critico, "
-            "origen, monto_adicional_cents, created_at) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "origen, monto_adicional_cents, costo_real_cents, costo_account_id, costo_es_reembolsable, "
+            "autorizado_por, fecha_autorizacion, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 int(case_id), t, 0,
                 (due_date or "").strip() or None,
                 (notes or "").strip() or None,
                 (responsible_username or "").strip() or None,
                 1 if es_critico else 0,
-                origen, monto_cents,
+                origen, monto_cents, costo_cents,
+                int(costo_account_id) if costo_account_id else None,
+                bool(costo_es_reembolsable),
+                (autorizado_por or "").strip() or None,
+                (fecha_autorizacion or "").strip() or (created_at[:10] if monto_cents > 0 else None),
                 created_at,
             ),
         )
@@ -1819,8 +1873,74 @@ class Repository:
                 case_id=case_id, origen_tipo="tarea", origen_id=task_id, monto_cents=monto_cents,
                 motivo=f"Tarea adicional: {t}", username=username or "sistema",
             )
+        self._sincronizar_costo_tarea(
+            task_id=task_id, case_id=case_id, titulo=t, costo_cents=costo_cents,
+            account_id=costo_account_id, es_reembolsable=costo_es_reembolsable, fecha=created_at[:10],
+        )
         self.conn.commit()
         return task_id
+
+    def update_case_task(
+        self,
+        task_id: int,
+        *,
+        title: str,
+        due_date: str | None = None,
+        notes: str | None = None,
+        responsible_username: str | None = None,
+        es_critico: bool = False,
+        monto_adicional_text: str = "0",
+        costo_real_text: str = "0",
+        costo_account_id: int | None = None,
+        costo_es_reembolsable: bool = False,
+        autorizado_por: str = "",
+        fecha_autorizacion: str | None = None,
+        completed_at: str | None = None,
+        username: str = "",
+    ) -> None:
+        """El costo casi nunca se conoce al crear la tarea, sino al volver de la diligencia:
+        aquí se completa, y la diferencia de honorarios queda en la bitácora del expediente."""
+        anterior = self.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (int(task_id),)).fetchone()
+        if not anterior:
+            raise ValueError("Tarea no encontrada")
+        t = (title or "").strip()
+        if not t:
+            raise ValueError("Título requerido")
+        monto_cents = self._to_cents_or_zero(monto_adicional_text)
+        costo_cents = self._to_cents_or_zero(costo_real_text)
+        self._validar_cobro_extra(monto_cents, autorizado_por or (anterior["autorizado_por"] or ""))
+
+        self.conn.execute(
+            "UPDATE case_tasks SET title=%s, due_date=%s, notes=%s, responsible_username=%s, es_critico=%s, "
+            "monto_adicional_cents=%s, costo_real_cents=%s, costo_account_id=%s, costo_es_reembolsable=%s, "
+            "autorizado_por=%s, fecha_autorizacion=%s, completed_at=%s WHERE id=%s",
+            (
+                t,
+                (due_date or "").strip() or None,
+                (notes or "").strip() or None,
+                (responsible_username or "").strip() or None,
+                1 if es_critico else 0,
+                monto_cents, costo_cents,
+                int(costo_account_id) if costo_account_id else None,
+                bool(costo_es_reembolsable),
+                (autorizado_por or "").strip() or anterior["autorizado_por"],
+                (fecha_autorizacion or "").strip() or anterior["fecha_autorizacion"] or (_iso_today() if monto_cents > 0 else None),
+                (completed_at or "").strip() or anterior["completed_at"],
+                int(task_id),
+            ),
+        )
+        diferencia = monto_cents - int(anterior["monto_adicional_cents"] or 0)
+        if diferencia:
+            self._registrar_honorarios_log(
+                case_id=int(anterior["case_id"]), origen_tipo="tarea", origen_id=int(task_id), monto_cents=diferencia,
+                motivo=f"Ajuste del monto de la tarea: {t}", username=username or "sistema",
+            )
+        self._sincronizar_costo_tarea(
+            task_id=int(task_id), case_id=int(anterior["case_id"]), titulo=t, costo_cents=costo_cents,
+            account_id=costo_account_id, es_reembolsable=costo_es_reembolsable,
+            fecha=(completed_at or anterior["completed_at"] or _iso_today())[:10],
+        )
+        self.conn.commit()
 
     def set_case_task_critico(self, task_id: int, es_critico: bool) -> None:
         self.conn.execute(
@@ -1836,10 +1956,20 @@ class Repository:
         )
         self.conn.commit()
 
-    def set_case_task_done(self, task_id: int, done: bool, completed_notes: str | None = None) -> None:
+    def set_case_task_done(
+        self, task_id: int, done: bool, completed_notes: str | None = None, *, username: str = "",
+    ) -> None:
+        """Al cerrarla se guarda la fecha real de cumplimiento y quién la cerró: la fecha
+        estimada dice cuándo debía hacerse, esta dice cuándo se hizo de verdad."""
         self.conn.execute(
-            "UPDATE case_tasks SET done=%s, completed_notes=%s WHERE id=%s",
-            (1 if done else 0, (completed_notes or "").strip() or None, int(task_id)),
+            "UPDATE case_tasks SET done=%s, completed_notes=%s, completed_at=%s, completed_by=%s WHERE id=%s",
+            (
+                1 if done else 0,
+                (completed_notes or "").strip() or None,
+                _iso_today() if done else None,
+                ((username or "").strip() or None) if done else None,
+                int(task_id),
+            ),
         )
         self.conn.commit()
 
@@ -1852,8 +1982,12 @@ class Repository:
 
     def delete_case_task(self, task_id: int, *, username: str = "") -> None:
         row = self.conn.execute(
-            "SELECT case_id, title, monto_adicional_cents FROM case_tasks WHERE id=%s", (int(task_id),)
+            "SELECT case_id, title, monto_adicional_cents, cost_id FROM case_tasks WHERE id=%s", (int(task_id),)
         ).fetchone()
+        # El costo directo que generó la tarea se va con ella: si no, quedaría un gasto
+        # huérfano en Flujo de caja sin nada que lo explique.
+        if row and row["cost_id"]:
+            self.conn.execute("DELETE FROM costs WHERE id=%s", (int(row["cost_id"]),))
         self.conn.execute("DELETE FROM case_tasks WHERE id=%s", (int(task_id),))
         if row and row["monto_adicional_cents"]:
             self._registrar_honorarios_log(
@@ -2722,7 +2856,9 @@ class Repository:
             (client_id, *sessions_params_extra),
         ).fetchall()
         tasks = self.conn.execute(
-            f"""SELECT ct.id, ct.title, ct.due_date, ca.title AS case_title, ca.id AS case_id
+            f"""SELECT ct.id, ct.title, ct.due_date, ca.title AS case_title, ca.id AS case_id,
+                      ct.monto_adicional_cents, ct.completed_at, ct.completed_notes,
+                      ct.costo_real_cents, ct.costo_es_reembolsable
                FROM case_tasks ct
                JOIN cases ca ON ca.id = ct.case_id
                WHERE ca.client_id=%s AND (ct.invoice_id IS NULL) {case_filter}
@@ -3053,15 +3189,19 @@ class Repository:
     def create_plantilla_tarea(
         self, *, service_id: int, titulo: str, orden: int = 0,
         dias_plazo_relativo: int | None = None, es_critico_default: bool = False, created_at: str,
+        costo_estimado_text: str = "0", honorario_sugerido_text: str = "0",
     ) -> int:
         t = (titulo or "").strip()
         if not t:
             raise ValueError("Título requerido")
         self.get_servicio(service_id)  # 404 si no existe
         cur = self.conn.execute(
-            "INSERT INTO plantillas_tareas(service_id, titulo, orden, dias_plazo_relativo, es_critico_default, created_at, updated_at) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s)",
-            (int(service_id), t, orden, dias_plazo_relativo, 1 if es_critico_default else 0, created_at, created_at),
+            "INSERT INTO plantillas_tareas(service_id, titulo, orden, dias_plazo_relativo, es_critico_default, "
+            "costo_estimado_cents, honorario_sugerido_cents, created_at, updated_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (int(service_id), t, orden, dias_plazo_relativo, 1 if es_critico_default else 0,
+             self._to_cents_or_zero(costo_estimado_text), self._to_cents_or_zero(honorario_sugerido_text),
+             created_at, created_at),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -3069,13 +3209,17 @@ class Repository:
     def update_plantilla_tarea(
         self, plantilla_id: int, *, titulo: str, orden: int = 0,
         dias_plazo_relativo: int | None = None, es_critico_default: bool = False,
+        costo_estimado_text: str = "0", honorario_sugerido_text: str = "0",
     ) -> None:
         t = (titulo or "").strip()
         if not t:
             raise ValueError("Título requerido")
         self.conn.execute(
-            "UPDATE plantillas_tareas SET titulo=%s, orden=%s, dias_plazo_relativo=%s, es_critico_default=%s, updated_at=%s WHERE id=%s",
-            (t, orden, dias_plazo_relativo, 1 if es_critico_default else 0, now_iso(), int(plantilla_id)),
+            "UPDATE plantillas_tareas SET titulo=%s, orden=%s, dias_plazo_relativo=%s, es_critico_default=%s, "
+            "costo_estimado_cents=%s, honorario_sugerido_cents=%s, updated_at=%s WHERE id=%s",
+            (t, orden, dias_plazo_relativo, 1 if es_critico_default else 0,
+             self._to_cents_or_zero(costo_estimado_text), self._to_cents_or_zero(honorario_sugerido_text),
+             now_iso(), int(plantilla_id)),
         )
         self.conn.commit()
 

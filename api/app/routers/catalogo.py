@@ -84,7 +84,10 @@ def create_plantilla_tarea(service_id: int, body: PlantillaTareaIn, current_user
         raise HTTPException(403, "Solo un administrador puede editar plantillas de tareas")
     plantilla_id = repo.create_plantilla_tarea(
         service_id=service_id, titulo=body.titulo, orden=body.orden,
-        dias_plazo_relativo=body.dias_plazo_relativo, es_critico_default=body.es_critico_default, created_at=now_iso(),
+        dias_plazo_relativo=body.dias_plazo_relativo, es_critico_default=body.es_critico_default,
+        costo_estimado_text=str(body.costo_estimado) if body.costo_estimado is not None else "0",
+        honorario_sugerido_text=str(body.honorario_sugerido) if body.honorario_sugerido is not None else "0",
+        created_at=now_iso(),
     )
     row = next(r for r in repo.list_plantilla_tareas(service_id) if r["id"] == plantilla_id)
     return PlantillaTareaOut.from_row(row)
@@ -97,6 +100,8 @@ def update_plantilla_tarea(plantilla_id: int, body: PlantillaTareaIn, current_us
     repo.update_plantilla_tarea(
         plantilla_id, titulo=body.titulo, orden=body.orden,
         dias_plazo_relativo=body.dias_plazo_relativo, es_critico_default=body.es_critico_default,
+        costo_estimado_text=str(body.costo_estimado) if body.costo_estimado is not None else "0",
+        honorario_sugerido_text=str(body.honorario_sugerido) if body.honorario_sugerido is not None else "0",
     )
     row = repo.conn.execute("SELECT * FROM plantillas_tareas WHERE id=%s", (plantilla_id,)).fetchone()
     if not row:

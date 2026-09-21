@@ -7,6 +7,7 @@ from aglegal.db import now_iso
 from ..deps import AdminRequired, CurrentUser, LawyerRequired, RepoDep
 from ..schemas.case import (
     CaseAttachmentOut, CaseHonorariosLogOut, CaseIn, CaseOut, CaseTaskCriticoUpdate, CaseTaskDone, CaseTaskIn,
+    CaseTaskUpdate,
     CaseTaskNotesUpdate, CaseTaskResponsibleUpdate,
     CaseTaskOut, CaseTimeEntryIn, CaseTimeEntryOut, CaseUpdate, ConflictoInteresOut, GlobalCaseTaskOut, TiempoAtencionOut,
 )
@@ -176,8 +177,39 @@ def create_task(case_id: int, body: CaseTaskIn, current_user: CurrentUser, repo:
         responsible_username=body.responsible_username,
         es_critico=body.es_critico,
         monto_adicional_text=str(body.monto_adicional) if body.monto_adicional is not None else "0",
+        costo_real_text=str(body.costo_real) if body.costo_real is not None else "0",
+        costo_account_id=body.costo_account_id,
+        costo_es_reembolsable=body.costo_es_reembolsable,
+        autorizado_por=body.autorizado_por,
+        fecha_autorizacion=body.fecha_autorizacion,
         username=current_user["username"],
         created_at=now_iso(),
+    )
+    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
+    return CaseTaskOut.from_row(row)
+
+
+@router.put("/tasks/{task_id}", response_model=CaseTaskOut)
+def update_task(task_id: int, body: CaseTaskUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
+    """El costo de una diligencia casi nunca se sabe al crear la tarea, sino al volver de
+    hacerla: esta ruta permite completarlo (y corregir el cobro) sin rehacer la tarea."""
+    if not current_user["is_admin"] and "tareas.editar" not in current_user["permissions"]:
+        raise HTTPException(403, "Sin permiso: tareas.editar")
+    repo.update_case_task(
+        task_id,
+        title=body.title,
+        due_date=body.due_date,
+        notes=body.notes,
+        responsible_username=body.responsible_username,
+        es_critico=body.es_critico,
+        monto_adicional_text=str(body.monto_adicional) if body.monto_adicional is not None else "0",
+        costo_real_text=str(body.costo_real) if body.costo_real is not None else "0",
+        costo_account_id=body.costo_account_id,
+        costo_es_reembolsable=body.costo_es_reembolsable,
+        autorizado_por=body.autorizado_por,
+        fecha_autorizacion=body.fecha_autorizacion,
+        completed_at=body.completed_at,
+        username=current_user["username"],
     )
     row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
     return CaseTaskOut.from_row(row)
@@ -205,7 +237,7 @@ def set_task_responsible(task_id: int, body: CaseTaskResponsibleUpdate, current_
 
 @router.patch("/tasks/{task_id}/done", response_model=CaseTaskOut)
 def set_task_done(task_id: int, body: CaseTaskDone, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
-    repo.set_case_task_done(task_id, body.done, body.completed_notes)
+    repo.set_case_task_done(task_id, body.done, body.completed_notes, username=current_user["username"])
     row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Tarea no encontrada")

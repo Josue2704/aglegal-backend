@@ -130,7 +130,8 @@ def test_flujo_completo_expediente_tareas_honorarios_factura(app_client, servici
     assert len(tareas) == 2 and all(t["origen"] == "plantilla" and t["monto_adicional"] == 0 for t in tareas)
 
     # Tarea manual con monto adicional → sube honorarios y queda en bitácora
-    r = app_client.post(f"/cases/{case_id}/tasks", json={"title": "Trámite extra", "monto_adicional": 250})
+    r = app_client.post(f"/cases/{case_id}/tasks", json={"title": "Trámite extra", "monto_adicional": 250,
+                                                         "autorizado_por": "Cliente (correo)"})
     assert r.status_code == 201, r.text
     task_extra = r.json()
     assert task_extra["origen"] == "manual" and task_extra["monto_adicional"] == 250

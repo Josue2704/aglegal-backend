@@ -1199,6 +1199,33 @@ def _migrate(conn: PgConnection) -> None:
         """)
         _set_schema_version(conn, 39)
 
+    # v40: la tarea pasa a ser el registro de lo que de más se hizo en un expediente y de
+    # lo que costó. Hasta ahora solo tenía un monto, que se interpretaba como cobro al
+    # cliente: anotar ahí el transporte de una diligencia subía la factura y además inflaba
+    # la utilidad. Se separan los tres conceptos del Archivo Maestro:
+    #   · monto_adicional_cents  → honorario extra que se le cobra al cliente (ya existía)
+    #   · costo_real_cents       → lo que nos costó hacerla; genera el costo directo del
+    #                              expediente (cost_id) con su cuenta contable
+    #   · costo_es_reembolsable  → ese costo se recupera del cliente y no es utilidad
+    # Más el cierre real (cuándo y quién) y la autorización del cobro extra, para que un
+    # aumento de honorarios nunca sea un cambio sin respaldo.
+    if v < 40:
+        conn.executescript("""
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS completed_at TEXT;
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS completed_by TEXT;
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS costo_real_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS costo_account_id INTEGER REFERENCES plan_cuentas(id);
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS costo_es_reembolsable BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS cost_id INTEGER REFERENCES costs(id) ON DELETE SET NULL;
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS autorizado_por TEXT;
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS fecha_autorizacion TEXT;
+            ALTER TABLE plantillas_tareas ADD COLUMN IF NOT EXISTS costo_estimado_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE plantillas_tareas ADD COLUMN IF NOT EXISTS honorario_sugerido_cents INTEGER NOT NULL DEFAULT 0;
+            CREATE INDEX IF NOT EXISTS idx_case_tasks_cost ON case_tasks(cost_id);
+            UPDATE case_tasks SET completed_at = created_at WHERE done = 1 AND completed_at IS NULL;
+        """)
+        _set_schema_version(conn, 40)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 

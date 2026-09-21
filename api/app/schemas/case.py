@@ -177,7 +177,18 @@ class CaseTaskIn(BaseModel):
     notes: str | None = None
     responsible_username: str = ""
     es_critico: bool = False
+    # Lo que se le cobra de mas al cliente (sube los honorarios del expediente).
     monto_adicional: float | None = None
+    autorizado_por: str = ""
+    fecha_autorizacion: str | None = None
+    # Lo que costo hacerla (genera el costo directo del expediente).
+    costo_real: float | None = None
+    costo_account_id: int | None = None
+    costo_es_reembolsable: bool = False
+
+
+class CaseTaskUpdate(CaseTaskIn):
+    completed_at: str | None = None
 
 
 class CaseTaskDone(BaseModel):
@@ -210,6 +221,15 @@ class CaseTaskOut(BaseModel):
     es_critico: bool = False
     origen: str = "manual"
     monto_adicional: float = 0
+    costo_real: float = 0
+    costo_account_id: int | None = None
+    costo_es_reembolsable: bool = False
+    cost_id: int | None = None
+    autorizado_por: str | None = None
+    fecha_autorizacion: str | None = None
+    completed_at: str | None = None
+    completed_by: str | None = None
+    invoice_id: int | None = None
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -219,8 +239,10 @@ class CaseTaskOut(BaseModel):
         d = dict(row)
         d["done"] = bool(d.get("done", 0))
         d["es_critico"] = bool(d.get("es_critico", 0))
+        d["costo_es_reembolsable"] = bool(d.get("costo_es_reembolsable", False))
         d["monto_adicional"] = (d.pop("monto_adicional_cents", 0) or 0) / 100
-        return cls(**d)
+        d["costo_real"] = (d.pop("costo_real_cents", 0) or 0) / 100
+        return cls(**{k: v for k, v in d.items() if k in cls.model_fields})
 
 
 class PlantillaTareaIn(BaseModel):
@@ -228,6 +250,8 @@ class PlantillaTareaIn(BaseModel):
     orden: int = 0
     dias_plazo_relativo: int | None = None
     es_critico_default: bool = False
+    costo_estimado: float | None = None
+    honorario_sugerido: float | None = None
 
 
 class PlantillaTareaOut(BaseModel):
@@ -237,6 +261,8 @@ class PlantillaTareaOut(BaseModel):
     orden: int
     dias_plazo_relativo: int | None = None
     es_critico_default: bool = False
+    costo_estimado: float = 0
+    honorario_sugerido: float = 0
     created_at: str
     updated_at: str
 
@@ -246,7 +272,9 @@ class PlantillaTareaOut(BaseModel):
     def from_row(cls, row: Any) -> PlantillaTareaOut:
         d = dict(row)
         d["es_critico_default"] = bool(d.get("es_critico_default", 0))
-        return cls(**d)
+        d["costo_estimado"] = (d.pop("costo_estimado_cents", 0) or 0) / 100
+        d["honorario_sugerido"] = (d.pop("honorario_sugerido_cents", 0) or 0) / 100
+        return cls(**{k: v for k, v in d.items() if k in cls.model_fields})
 
 
 class CaseHonorariosLogOut(BaseModel):
