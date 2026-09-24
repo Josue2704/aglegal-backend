@@ -15,6 +15,8 @@ class SessionIn(BaseModel):
     notes: str = ""
     status: str
     monto_adicional: float | None = None
+    # El usuario ya vio el aviso de que choca con otra cita y decidió agendarla igual.
+    permitir_solape: bool = False
 
 
 class SessionOut(BaseModel):

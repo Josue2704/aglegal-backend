@@ -20,6 +20,11 @@ from .security import hash_password, verify_password
 SESSION_STATUSES = ["Pendiente", "En proceso", "Finalizada"]
 ATTACH_ENTITY_TYPES = ["session", "income", "expense", "case", "client", "cost", "user"]
 CASE_STATUSES = ["Abierto", "En trámite", "En pausa", "Cerrado"]
+INVOICE_STATUSES = ["Borrador", "Enviada", "Pagada", "Cancelada"]
+# Lo que una factura puede cobrar. Un tipo fuera de esta lista se rechaza: antes se
+# guardaba tal cual en invoice_items y la partida nunca quedaba marcada como facturada,
+# así que se podía volver a cobrar.
+ENTIDADES_FACTURABLES = {"session", "case_task", "time_entry", "cost"}
 CASE_PRIORITIES = ["Baja", "Media", "Alta"]
 # Ciclo de facturación/cobro del expediente — independiente de `status` (progreso legal).
 ESTADOS_COBRO = ["En ejecución", "Finalizado pendiente de facturar", "Facturado pendiente de cobro", "Cobrado", "Suspendido"]
@@ -426,11 +431,14 @@ class Repository:
         end_time: str | None = None,
         monto_adicional_text: str = "0",
         username: str = "",
+        permitir_solape: bool = False,
     ) -> int:
         if status not in SESSION_STATUSES:
             raise ValueError("Estado inválido")
         if start_time and end_time and end_time <= start_time:
             raise ValueError("La hora de fin debe ser posterior a la hora de inicio")
+        if not permitir_solape:
+            self._avisar_solape_agenda(session_date, start_time, end_time)
         monto_cents = self._to_cents_or_zero(monto_adicional_text)
         if monto_cents > 0 and not case_id:
             raise ValueError("Una sesión con monto adicional debe estar ligada a un expediente")
@@ -459,6 +467,37 @@ class Repository:
             )
         self.conn.commit()
         return session_id
+
+    def _avisar_solape_agenda(self, fecha: str, inicio: str | None, fin: str | None,
+                              excluir_id: int | None = None) -> None:
+        """Dos citas encima no son necesariamente un error (el despacho es más de una persona),
+        pero agendarlas sin darse cuenta sí lo es. Se avisa con cuál choca y quién decide es
+        el usuario, volviendo a guardar con `permitir_solape`."""
+        if not inicio or not fin:
+            return
+        extra, params = "", [fecha, fin, inicio]
+        if excluir_id:
+            extra = " AND s.id <> %s"
+            params.append(int(excluir_id))
+        chocan = self.conn.execute(
+            f"""SELECT s.consult_type, s.start_time, s.end_time, cl.name AS client_name
+                FROM sessions s LEFT JOIN clients cl ON cl.id = s.client_id
+                WHERE s.session_date = %s AND s.status <> 'Finalizada'
+                  AND s.start_time IS NOT NULL AND s.end_time IS NOT NULL
+                  AND s.start_time < %s AND s.end_time > %s{extra}
+                ORDER BY s.start_time LIMIT 3""",
+            tuple(params),
+        ).fetchall()
+        if chocan:
+            detalle = "; ".join(
+                f"{r['start_time']}-{r['end_time']} {r['consult_type']}"
+                + (f" ({r['client_name']})" if r["client_name"] else "")
+                for r in chocan
+            )
+            raise ValueError(
+                f"Ya hay otra cita a esa hora el {fecha}: {detalle}. "
+                "Si aun así quieres agendarla, vuelve a guardar confirmando el cruce."
+            )
 
     def update_session(
         self,
@@ -490,6 +529,12 @@ class Repository:
         self.conn.commit()
 
     def delete_session(self, session_id: int, *, username: str = "") -> None:
+        factura = self._factura_viva_de("sessions", session_id)
+        if factura:
+            raise ValueError(
+                f"Esta cita ya está cobrada en la factura {factura['invoice_number']}. "
+                "Quítala de la factura o cancélala antes de borrar la cita."
+            )
         row = self.conn.execute(
             "SELECT case_id, consult_type, monto_adicional_cents FROM sessions WHERE id=%s", (int(session_id),)
         ).fetchone()
@@ -712,6 +757,13 @@ class Repository:
         # La comisión de un cobro eliminado no desaparece: se revierte con un ajuste negativo y
         # la fila original queda en el historial (income_id pasa a NULL por la FK).
         self._revertir_comisiones_income(int(income_id), motivo=f"Cobro #{income_id} eliminado", created_at=now_iso())
+        # Si el cobro venía de una factura marcada como pagada, la factura vuelve a "Enviada":
+        # no puede seguir diciendo que se cobró cuando ya no hay dinero registrado.
+        fila = self.conn.execute("SELECT invoice_id FROM incomes WHERE id=%s", (int(income_id),)).fetchone()
+        if fila and fila["invoice_id"]:
+            self.conn.execute(
+                "UPDATE invoices SET status='Enviada' WHERE id=%s AND status='Pagada'", (int(fila["invoice_id"]),)
+            )
         self.conn.execute("DELETE FROM incomes WHERE id = %s", (int(income_id),))
         self.conn.commit()
 
@@ -1641,6 +1693,18 @@ class Repository:
 
         honorarios_cents = self._to_cents_or_zero(honorarios_contratados_text)
         costos_cents = self._to_cents_or_zero(costos_directos_estimados_text)
+        # Bajar los honorarios por debajo de lo ya cobrado dejaba el expediente con saldo
+        # negativo y el cliente "debiendo" plata en contra. Se avisa con la cifra exacta.
+        cobrado = int(self.conn.execute(
+            "SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS t FROM incomes WHERE case_id=%s",
+            (int(case_id),),
+        ).fetchone()["t"])
+        if honorarios_cents < cobrado:
+            raise ValueError(
+                f"Los honorarios ({_from_cents(honorarios_cents)}) no pueden quedar por debajo de lo ya "
+                f"cobrado en el expediente ({_from_cents(cobrado)}). Si hubo una devolución, regístrala "
+                "como un cobro negativo o corrige el cobro."
+            )
         self.conn.execute(
             "UPDATE cases SET title=%s, status=%s, priority=%s, opened_at=%s, closed_at=%s, notes=%s, "
             "internal_ref=%s, official_ref=%s, opposing_party=%s, court_entity=%s, responsible_username=%s, "
@@ -1924,6 +1988,16 @@ class Repository:
         monto_cents = self._to_cents_or_zero(monto_adicional_text)
         costo_cents = self._to_cents_or_zero(costo_real_text)
         self._validar_cobro_extra(monto_cents, autorizado_por or (anterior["autorizado_por"] or ""))
+        # Cambiar el cobro de una tarea ya facturada dejaba tarea y factura diciendo cosas
+        # distintas. Lo demás (título, notas, fechas, costo interno) se puede seguir corrigiendo.
+        if monto_cents != int(anterior["monto_adicional_cents"] or 0):
+            factura = self._factura_viva_de("case_tasks", task_id)
+            if factura:
+                raise ValueError(
+                    f"No se puede cambiar el monto: la tarea ya está cobrada en la factura "
+                    f"{factura['invoice_number']} por {_from_cents(int(anterior['monto_adicional_cents'] or 0))}. "
+                    "Corrige la factura si el monto cambió."
+                )
 
         self.conn.execute(
             "UPDATE case_tasks SET title=%s, due_date=%s, notes=%s, responsible_username=%s, es_critico=%s, "
@@ -1996,6 +2070,13 @@ class Repository:
         self.conn.commit()
 
     def delete_case_task(self, task_id: int, *, username: str = "") -> None:
+        # Borrar una tarea ya facturada dejaba a la factura cobrando algo que ya no existe.
+        factura = self._factura_viva_de("case_tasks", task_id)
+        if factura:
+            raise ValueError(
+                f"Esta tarea ya está cobrada en la factura {factura['invoice_number']}. "
+                "Quítala de la factura o cancélala antes de borrar la tarea."
+            )
         row = self.conn.execute(
             "SELECT case_id, title, monto_adicional_cents, cost_id FROM case_tasks WHERE id=%s", (int(task_id),)
         ).fetchone()
@@ -2679,6 +2760,53 @@ class Repository:
     # "no facturado" traía partidas de CUALQUIER expediente del cliente y nada impedía
     # que terminaran en la factura de otro — el `case_id` de la factura era solo
     # metadata decorativa, no un filtro real.
+    _TABLA_POR_ENTIDAD = {
+        "session": ("sessions", "la cita"),
+        "case_task": ("case_tasks", "la tarea"),
+        "time_entry": ("case_time_entries", "el registro de horas"),
+        "cost": ("costs", "el costo"),
+    }
+
+    def _factura_viva_de(self, tabla: str, entidad_id: int) -> Any | None:
+        """La factura no cancelada que ya cobra esta partida, si la hay."""
+        fila = self.conn.execute(f"SELECT invoice_id FROM {tabla} WHERE id=%s", (int(entidad_id),)).fetchone()
+        if not fila or not fila["invoice_id"]:
+            return None
+        factura = self.conn.execute(
+            "SELECT id, invoice_number, status FROM invoices WHERE id=%s", (int(fila["invoice_id"]),)
+        ).fetchone()
+        if factura and str(factura["status"]) != "Cancelada":
+            return factura
+        return None
+
+    def _validate_items_facturables(self, invoice_id: int | None, items: list[dict]) -> None:
+        """Que cada partida exista, sea de un tipo conocido y no esté ya en otra factura viva."""
+        for it in items:
+            et, eid = it.get("entity_type"), it.get("entity_id")
+            if not et and not eid:
+                continue  # partida escrita a mano, sin origen
+            if et not in ENTIDADES_FACTURABLES:
+                raise ValueError(
+                    f"Tipo de partida desconocido: '{et}'. Una factura solo puede cobrar "
+                    f"{', '.join(sorted(ENTIDADES_FACTURABLES))}."
+                )
+            tabla, etiqueta = self._TABLA_POR_ENTIDAD[et]
+            fila = self.conn.execute(
+                f"SELECT invoice_id FROM {tabla} WHERE id=%s", (int(eid),)
+            ).fetchone()
+            if not fila:
+                raise ValueError(f"No se encontró {etiqueta} #{eid} que la factura intenta cobrar.")
+            otra = fila["invoice_id"]
+            if otra and (invoice_id is None or int(otra) != int(invoice_id)):
+                previa = self.conn.execute(
+                    "SELECT invoice_number, status FROM invoices WHERE id=%s", (int(otra),)
+                ).fetchone()
+                if previa and str(previa["status"]) != "Cancelada":
+                    raise ValueError(
+                        f"{etiqueta.capitalize()} #{eid} ya está cobrada en la factura "
+                        f"{previa['invoice_number']}. Cancélala o quítala de esa factura primero."
+                    )
+
     def _validate_items_belong_to_case(self, case_id: int | None, items: list[dict]) -> None:
         if case_id is None:
             return
@@ -2722,6 +2850,9 @@ class Repository:
         created_at: str,
     ) -> int:
         self._validate_items_belong_to_case(case_id, items)
+        self._validate_items_facturables(None, items)
+        if self.conn.execute("SELECT 1 FROM invoices WHERE invoice_number=%s", (invoice_number,)).fetchone():
+            raise ValueError(f"Ya existe una factura con el número {invoice_number}.")
         total_cents = sum(
             round(float(it.get("unit_price", 0)) * float(it.get("quantity", 1)) * 100)
             for it in items
@@ -2785,7 +2916,18 @@ class Repository:
         created_at: str,
     ) -> None:
         existing = self.get_invoice(invoice_id)
+        if status not in INVOICE_STATUSES:
+            raise ValueError(f"Estado de factura inválido: use {', '.join(INVOICE_STATUSES)}")
         self._validate_items_belong_to_case(existing["case_id"] if existing else None, items)
+        self._validate_items_facturables(int(invoice_id), items)
+        repetido = self.conn.execute(
+            "SELECT 1 FROM invoices WHERE invoice_number=%s AND id<>%s", (invoice_number, int(invoice_id))
+        ).fetchone()
+        if repetido:
+            raise ValueError(f"Ya existe otra factura con el número {invoice_number}.")
+        # Dejar de estar pagada devuelve el dinero: el cobro que la factura genero se borra.
+        if existing and str(existing["status"]) == "Pagada" and status != "Pagada":
+            self._revertir_cobro_de_factura(int(invoice_id))
         total_cents = sum(
             round(float(it.get("unit_price", 0)) * float(it.get("quantity", 1)) * 100)
             for it in items
@@ -2811,10 +2953,27 @@ class Repository:
         self.conn.commit()
 
     def update_invoice_status(self, invoice_id: int, status: str) -> None:
+        if status not in INVOICE_STATUSES:
+            raise ValueError(f"Estado de factura inválido: use {', '.join(INVOICE_STATUSES)}")
+        actual = self.conn.execute("SELECT status FROM invoices WHERE id=%s", (int(invoice_id),)).fetchone()
+        if actual and str(actual["status"]) == "Pagada" and status != "Pagada":
+            # Cancelar o volver a borrador una factura cobrada tiene que devolver el dinero:
+            # antes el ingreso seguía contando en la caja y en el cumplimiento del mes.
+            self._revertir_cobro_de_factura(int(invoice_id))
         self.conn.execute(
             "UPDATE invoices SET status=%s WHERE id=%s", (status, invoice_id)
         )
         self.conn.commit()
+
+    def _revertir_cobro_de_factura(self, invoice_id: int) -> None:
+        """Borra el cobro que la factura genero al marcarse pagada (y con el, su comision).
+        Solo toca los ingresos nacidos de la factura, nunca los que alguien registro a mano."""
+        for row in self.conn.execute(
+            "SELECT id FROM incomes WHERE invoice_id=%s", (int(invoice_id),)
+        ).fetchall():
+            self._revertir_comisiones_income(int(row["id"]), motivo=f"Factura #{invoice_id} ya no está pagada",
+                                             created_at=now_iso())
+            self.conn.execute("DELETE FROM incomes WHERE id=%s", (int(row["id"]),))
 
     def auto_income_from_invoice(self, invoice_id: int) -> None:
         existing = self.conn.execute(
@@ -2886,6 +3045,9 @@ class Repository:
         return int(row["id"]) if row else None
 
     def delete_invoice(self, invoice_id: int) -> None:
+        # Borrar una factura cobrada también devuelve su cobro: si no, el dinero se quedaba
+        # registrado sin ninguna factura que lo respaldara.
+        self._revertir_cobro_de_factura(int(invoice_id))
         # sessions/case_tasks.invoice_id no tienen FK real (columnas agregadas sueltas,
         # sin REFERENCES) — sin este UPDATE, borrar una factura dejaba sus partidas con un
         # invoice_id apuntando a una factura inexistente, nunca más elegibles para
@@ -3996,7 +4158,10 @@ class Repository:
                            (SELECT SUM(monto_neto_operativo_cents) FROM incomes WHERE case_id = cs.id), 0
                        )) AS saldo_pendiente_cents
                 FROM cases cs
-                WHERE cs.archived_at IS NULL {mes_filter}
+                WHERE cs.archived_at IS NULL
+                  AND cs.estado_cobro <> 'Suspendido'
+                  AND NOT (cs.status = 'Cerrado' AND cs.estado_cobro = 'En ejecución')
+                  {mes_filter}
             )
             SELECT * FROM saldos WHERE saldo_pendiente_cents > 0 ORDER BY saldo_pendiente_cents DESC
             """,

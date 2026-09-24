@@ -60,11 +60,27 @@ def repo(db_conn):
     return Repository(db_conn)
 
 
+_CODIGOS_USADOS: set[str] = set()
+
+
 @pytest.fixture()
-def codigo_unico() -> str:
-    """3 letras mayúsculas al azar — cumple con el formato de código de categoría/subcategoría
-    (2-4 letras, sin números) y es distinto en cada prueba."""
-    return "".join(random.choices(string.ascii_uppercase, k=3))
+def codigo_unico(db_conn) -> str:
+    """3 letras mayúsculas — cumple con el formato de código de categoría/subcategoría
+    (2-4 letras, sin números) y es distinto en cada prueba.
+
+    Con azar puro dos pruebas sacaban el mismo código de vez en cuando (con ~200 pruebas
+    la colisión deja de ser improbable) y la segunda reventaba con "el código ya existe".
+    Se descartan los ya usados en esta corrida y los que quedaron en el schema."""
+    for _ in range(200):
+        codigo = "".join(random.choices(string.ascii_uppercase, k=3))
+        if codigo in _CODIGOS_USADOS:
+            continue
+        if db_conn.execute("SELECT 1 FROM categorias WHERE category_code=%s", (codigo,)).fetchone():
+            _CODIGOS_USADOS.add(codigo)
+            continue
+        _CODIGOS_USADOS.add(codigo)
+        return codigo
+    raise RuntimeError("No se encontró un código de catálogo libre para la prueba")
 
 
 @pytest.fixture()

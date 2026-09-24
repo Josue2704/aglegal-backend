@@ -1252,6 +1252,20 @@ def _migrate(conn: PgConnection) -> None:
         """)
         _set_schema_version(conn, 42)
 
+    # v43: el número de factura es único. La validación vive en el repositorio, pero dos
+    # usuarios facturando al mismo tiempo pueden pasarla: el índice lo cierra de verdad.
+    # Si ya hay repetidos de antes, se renumeran con sufijo para poder crear el índice.
+    if v < 43:
+        conn.executescript("""
+            UPDATE invoices i SET invoice_number = i.invoice_number || '-DUP' || i.id
+            WHERE EXISTS (
+                SELECT 1 FROM invoices j
+                WHERE j.invoice_number = i.invoice_number AND j.id < i.id
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_numero ON invoices(invoice_number);
+        """)
+        _set_schema_version(conn, 43)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 

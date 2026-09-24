@@ -135,6 +135,7 @@ def create_session(body: SessionIn, current_user: CurrentUser, repo: RepoDep, _:
         status=body.status,
         monto_adicional_text=str(body.monto_adicional) if body.monto_adicional is not None else "0",
         username=current_user["username"],
+        permitir_solape=body.permitir_solape,
         created_at=now_iso(),
     )
     _sync_create(current_user["username"], session_id, repo)
