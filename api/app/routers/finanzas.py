@@ -326,6 +326,34 @@ def utilidad_operativa_real(current_user: CurrentUser, repo: RepoDep, mes: str, 
         "utilidad_directa_real": r["utilidad_directa_real_cents"] / 100,
         "gastos_fijos": r["gastos_fijos_cents"] / 100,
         "comisiones": r["comisiones_cents"] / 100,
+        "gastos_operativos_reales": r["gastos_operativos_reales_cents"] / 100,
+        "brecha_gastos": r["brecha_gastos_cents"] / 100,
         "utilidad_operativa_real": r["utilidad_operativa_real_cents"] / 100,
+        "utilidad_operativa_caja": r["utilidad_operativa_caja_cents"] / 100,
         "margen_operativo_real_pct": r["margen_operativo_real_pct"],
+    }
+
+
+@router.get("/centros-costo")
+def centros_costo(current_user: CurrentUser, repo: RepoDep, desde: str, hasta: str,
+                  _: dict = require_permission("finanzas", "ver")) -> dict:
+    """En qué centro de costo se fue el dinero del período — gastos operativos y costos
+    directos juntos, que es como se lee un estado de resultados por área."""
+    d = repo.gastos_por_centro_costo(desde=desde, hasta=hasta)
+    return {
+        "desde": d["desde"], "hasta": d["hasta"], "total": d["total_cents"] / 100,
+        "centros": [
+            {
+                "centro_costo": c["centro_costo"],
+                "total": c["total_cents"] / 100,
+                "gastos_operativos": c["gastos_operativos_cents"] / 100,
+                "costos_directos": c["costos_directos_cents"] / 100,
+                "porcentaje": c["porcentaje"],
+                "cuentas": [
+                    {"account_code": x["account_code"], "cuenta": x["cuenta"], "total": x["total_cents"] / 100}
+                    for x in c["cuentas"]
+                ],
+            }
+            for c in d["centros"]
+        ],
     }

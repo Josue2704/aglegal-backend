@@ -61,6 +61,9 @@ class PayrollOut(BaseModel):
     afp_patronal: float = 0
     total_devengado: float = 0
     total_descuentos: float = 0
+    # Lo que la planilla le cuesta al despacho: devengado + aporte patronal (el neto es
+    # solo la parte que recibe la persona; lo retenido también lo desembolsa la firma).
+    costo_empresa: float = 0
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -85,6 +88,7 @@ class PayrollOut(BaseModel):
             ("afp_patronal_cents", "afp_patronal"),
             ("total_devengado_cents", "total_devengado"),
             ("total_descuentos_cents", "total_descuentos"),
+            ("costo_empresa_cents", "costo_empresa"),
         ):
             d.pop(campo_cents, None)
             d[campo] = (row[campo_cents] or 0) / 100

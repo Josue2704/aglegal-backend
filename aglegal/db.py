@@ -1226,6 +1226,22 @@ def _migrate(conn: PgConnection) -> None:
         """)
         _set_schema_version(conn, 40)
 
+    # v41: lo que una planilla le cuesta de verdad al despacho. `amount_cents` es el neto
+    # que recibe la persona, pero la salida real de caja incluye lo retenido (ISSS/AFP/renta
+    # que el despacho remite) y el aporte patronal. El gasto que llega a Flujo de caja pasa
+    # a ser ese costo completo; el neto sigue siendo el de la boleta.
+    if v < 41:
+        conn.executescript("""
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS costo_empresa_cents INTEGER NOT NULL DEFAULT 0;
+            UPDATE payrolls SET costo_empresa_cents =
+                COALESCE(total_devengado_cents, amount_cents)
+                + COALESCE(isss_patronal_cents, 0) + COALESCE(afp_patronal_cents, 0)
+            WHERE costo_empresa_cents = 0;
+            UPDATE expenses e SET amount_cents = p.costo_empresa_cents
+            FROM payrolls p WHERE p.expense_id = e.id AND p.costo_empresa_cents > 0;
+        """)
+        _set_schema_version(conn, 41)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 

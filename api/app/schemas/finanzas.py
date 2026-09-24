@@ -195,6 +195,10 @@ class PuntoEquilibrioOut(BaseModel):
     punto_equilibrio: float
     meta_segura: float
     ventas_margen_meta: float | None
+    gastos_reales: float = 0
+    ingresos_reales: float = 0
+    avance_pct: float | None = None
+    falta_para_equilibrio: float = 0
 
     @classmethod
     def from_calc(cls, d: dict) -> PuntoEquilibrioOut:
@@ -207,6 +211,10 @@ class PuntoEquilibrioOut(BaseModel):
             punto_equilibrio=d["punto_equilibrio_cents"] / 100,
             meta_segura=d["meta_segura_cents"] / 100,
             ventas_margen_meta=(d["ventas_margen_meta_cents"] / 100) if d["ventas_margen_meta_cents"] is not None else None,
+            gastos_reales=d["gastos_reales_cents"] / 100,
+            ingresos_reales=d["ingresos_reales_cents"] / 100,
+            avance_pct=d["avance_pct"],
+            falta_para_equilibrio=d["falta_para_equilibrio_cents"] / 100,
         )
 
 
@@ -315,8 +323,11 @@ class ResumenMesOut(BaseModel):
     utilidad_directa_real: float
     cumplimiento_utilidad_directa_pct: float | None
     gastos_fijos: float
+    gastos_reales: float = 0
+    brecha_gastos: float = 0
     comisiones: float
     utilidad_operativa_real: float
+    utilidad_operativa_caja: float = 0
     utilidad_operativa_minima: float
     margen_operativo_real_pct: float | None
     margen_operativo_minimo_pct: float
@@ -334,8 +345,11 @@ class ResumenMesOut(BaseModel):
             utilidad_directa_real=d["utilidad_directa_real_cents"] / 100,
             cumplimiento_utilidad_directa_pct=d["cumplimiento_utilidad_directa_pct"],
             gastos_fijos=d["gastos_fijos_cents"] / 100,
+            gastos_reales=d["gastos_reales_cents"] / 100,
+            brecha_gastos=d["brecha_gastos_cents"] / 100,
             comisiones=d["comisiones_cents"] / 100,
             utilidad_operativa_real=d["utilidad_operativa_real_cents"] / 100,
+            utilidad_operativa_caja=d["utilidad_operativa_caja_cents"] / 100,
             utilidad_operativa_minima=d["utilidad_operativa_minima_cents"] / 100,
             margen_operativo_real_pct=d["margen_operativo_real_pct"],
             margen_operativo_minimo_pct=d["margen_operativo_minimo_pct"],

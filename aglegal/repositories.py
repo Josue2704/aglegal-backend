@@ -563,11 +563,12 @@ class Repository:
     # --- Incomes
     _INCOME_SELECT = (
         "SELECT i.*, c.name AS client_name, "
-        "cs.title AS case_title, "
+        "cs.title AS case_title, inv.invoice_number, "
         "ac.account_code, ac.nombre AS account_nombre, sv.service_code, sv.nombre AS service_nombre "
         "FROM incomes i "
         "LEFT JOIN clients c ON c.id=i.client_id "
         "LEFT JOIN cases cs ON cs.id=i.case_id "
+        "LEFT JOIN invoices inv ON inv.id=i.invoice_id "
         "LEFT JOIN plan_cuentas ac ON ac.id=i.account_id "
         "LEFT JOIN servicios sv ON sv.id=i.service_id "
     )
@@ -1211,10 +1212,18 @@ class Repository:
                 raise ValueError("Monto requerido")
             amount_cents = _to_cents(amount_text)
 
+        # El gasto del mes es lo que la planilla le cuesta al despacho, no el neto de la
+        # boleta: lo retenido (ISSS/AFP/renta) también sale de la caja de la firma, solo
+        # que hacia el Estado, y el aporte patronal encima. En modo manual no hay desglose,
+        # así que el monto tecleado es a la vez el neto y el costo.
+        costo_empresa_cents = (
+            calculo.total_devengado_cents + calculo.isss_patronal_cents + calculo.afp_patronal_cents
+            if calculo is not None else amount_cents
+        )
         detail = f"Nómina - {employee} - {period.strip()}"
         expense_id = self.create_expense(
             detail=detail,
-            amount_text=str(amount_cents / 100),
+            amount_text=str(costo_empresa_cents / 100),
             expense_date=payment_date,
             notes=notes,
             created_at=created_at,
@@ -1227,8 +1236,8 @@ class Repository:
                 "nocturnidad_horas, nocturnidad_monto_cents, bonificaciones_cents, otros_ingresos_cents, "
                 "descuento_faltas_cents, descuento_prestamos_cents, otros_descuentos_cents, isss_empleado_cents, "
                 "afp_empleado_cents, renta_cents, isss_patronal_cents, afp_patronal_cents, total_devengado_cents, "
-                "total_descuentos_cents, payroll_config_id) "
-                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "total_descuentos_cents, payroll_config_id, costo_empresa_cents) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     employee, (role or "").strip(), period.strip(), amount_cents, payment_date.strip(), (notes or "").strip(),
                     expense_id, personal_id, created_at, "calculado", calculo.salario_base_cents,
@@ -1237,15 +1246,15 @@ class Repository:
                     calculo.descuento_faltas_cents, calculo.descuento_prestamos_cents, calculo.otros_descuentos_cents,
                     calculo.isss_empleado_cents, calculo.afp_empleado_cents, calculo.renta_cents,
                     calculo.isss_patronal_cents, calculo.afp_patronal_cents, calculo.total_devengado_cents,
-                    calculo.total_descuentos_cents, int(config_row["id"]),
+                    calculo.total_descuentos_cents, int(config_row["id"]), costo_empresa_cents,
                 ),
             )
         else:
             cur = self.conn.execute(
-                "INSERT INTO payrolls(employee_name, role, period, amount_cents, payment_date, notes, expense_id, personal_id, created_at, modo) "
-                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO payrolls(employee_name, role, period, amount_cents, payment_date, notes, expense_id, personal_id, created_at, modo, costo_empresa_cents) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (employee, (role or "").strip(), period.strip(), amount_cents, payment_date.strip(), (notes or "").strip(),
-                 expense_id, personal_id, created_at, "manual"),
+                 expense_id, personal_id, created_at, "manual", costo_empresa_cents),
             )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -1276,10 +1285,16 @@ class Repository:
             "UPDATE payrolls SET payment_date=%s, notes=%s, amount_cents=%s WHERE id=%s",
             (payment_date.strip(), (notes or "").strip(), amount_cents, int(payroll_id)),
         )
+        # Corregir el neto mueve el costo del despacho en la misma cantidad: lo retenido y
+        # el aporte patronal no se recalculan aquí (para eso hay que rehacer la planilla).
+        costo_empresa_cents = int(row["costo_empresa_cents"] or row["amount_cents"]) + (amount_cents - int(row["amount_cents"]))
+        self.conn.execute(
+            "UPDATE payrolls SET costo_empresa_cents=%s WHERE id=%s", (costo_empresa_cents, int(payroll_id))
+        )
         if row["expense_id"]:
             self.conn.execute(
                 "UPDATE expenses SET amount_cents=%s, expense_date=%s, notes=%s WHERE id=%s",
-                (amount_cents, payment_date.strip(), (notes or "").strip(), int(row["expense_id"])),
+                (costo_empresa_cents, payment_date.strip(), (notes or "").strip(), int(row["expense_id"])),
             )
         for campo, antes, despues in cambios:
             if antes != despues:
@@ -3753,15 +3768,27 @@ class Repository:
         denom = 1 - cv - mo
         ventas_margen_meta_cents = round(gastos_fijos_cents / denom) if denom > 0 else None
 
+        # Cuánto se lleva cobrado del mes: el punto de equilibrio sin esto obliga a ir a
+        # buscar la cifra a otra pantalla para responder "¿ya lo pasé?".
+        ingresos_reales_cents = int(self.conn.execute(
+            "SELECT COALESCE(SUM(monto_neto_operativo_cents), 0) AS total FROM incomes WHERE income_date LIKE %s",
+            (m + "-%",),
+        ).fetchone()["total"])
+        gastos_reales_cents = self._gastos_operativos_reales(m)
+
         return {
             "mes": m,
             "gastos_fijos_cents": gastos_fijos_cents,
+            "gastos_reales_cents": gastos_reales_cents,
             "costo_variable_pct": cv,
             "margen_operativo_meta_pct": mo,
             "margen_seguridad_pct": ms,
             "punto_equilibrio_cents": punto_equilibrio_cents,
             "meta_segura_cents": meta_segura_cents,
             "ventas_margen_meta_cents": ventas_margen_meta_cents,
+            "ingresos_reales_cents": ingresos_reales_cents,
+            "avance_pct": round(ingresos_reales_cents / punto_equilibrio_cents, 4) if punto_equilibrio_cents else None,
+            "falta_para_equilibrio_cents": max(0, punto_equilibrio_cents - ingresos_reales_cents),
         }
 
     # ── Presupuesto por familia y proyección de cierre de mes (Fase 7) ──────
@@ -4563,6 +4590,33 @@ class Repository:
                 "semaforo_utilidad": self._semaforo(cumplimiento_utilidad_pct),
                 "ticket_real_cents": ticket_real_cents,
             })
+
+        # Lo cobrado en cuentas sin familia (ING-OTR-001, y las categorías que el Archivo
+        # Maestro no mapeó: Contratos, Familia y Relocalización) no pertenece a ninguna meta.
+        # Se muestra como una fila aparte en vez de desaparecer del cumplimiento.
+        sin_familia = self.conn.execute(
+            """SELECT COUNT(DISTINCT i.case_id) + COUNT(*) FILTER (WHERE i.case_id IS NULL) AS casos,
+                      COALESCE(SUM(i.monto_neto_operativo_cents), 0) AS ingresos_cents
+               FROM incomes i
+               LEFT JOIN plan_cuentas pc ON pc.id = i.account_id
+               WHERE i.income_date LIKE %s AND pc.family_id IS NULL""",
+            (m + "-%",),
+        ).fetchone()
+        if int(sin_familia["ingresos_cents"]):
+            resultado.append({
+                "family_id": None, "family_code": "(Sin familia)",
+                "family_nombre": "Cobros en cuentas sin familia asignada",
+                "meta_casos": 0, "casos_reales": int(sin_familia["casos"]),
+                "cumplimiento_casos_pct": None, "semaforo_casos": None,
+                "meta_ingresos_cents": 0, "ingresos_reales_cents": int(sin_familia["ingresos_cents"]),
+                "cumplimiento_ingresos_pct": None, "semaforo_ingresos": None,
+                "brecha_ingresos_cents": int(sin_familia["ingresos_cents"]),
+                "costos_directos_reales_cents": 0,
+                "utilidad_directa_meta_cents": 0,
+                "utilidad_directa_real_cents": int(sin_familia["ingresos_cents"]),
+                "cumplimiento_utilidad_pct": None, "semaforo_utilidad": None,
+                "ticket_real_cents": None,
+            })
         return sorted(resultado, key=lambda r: (r["cumplimiento_ingresos_pct"] if r["cumplimiento_ingresos_pct"] is not None else -1))
 
     def utilidad_operativa_real(self, *, mes: str) -> dict:
@@ -4588,8 +4642,11 @@ class Repository:
             (m,),
         ).fetchone()["total"])
 
+        gastos_operativos_reales_cents = self._gastos_operativos_reales(m)
+
         utilidad_directa_real_cents = ingresos_cents - costos_directos_cents
         utilidad_operativa_real_cents = utilidad_directa_real_cents - gastos_fijos_cents - comisiones_cents
+        utilidad_operativa_caja_cents = utilidad_directa_real_cents - gastos_operativos_reales_cents
         margen_operativo_real_pct = round(utilidad_operativa_real_cents / ingresos_cents, 4) if ingresos_cents else None
 
         return {
@@ -4598,10 +4655,76 @@ class Repository:
             "costos_directos_reales_cents": costos_directos_cents,
             "utilidad_directa_real_cents": utilidad_directa_real_cents,
             "gastos_fijos_cents": gastos_fijos_cents,
+            "gastos_operativos_reales_cents": gastos_operativos_reales_cents,
+            "brecha_gastos_cents": gastos_operativos_reales_cents - gastos_fijos_cents,
             "comisiones_cents": comisiones_cents,
             "utilidad_operativa_real_cents": utilidad_operativa_real_cents,
+            "utilidad_operativa_caja_cents": utilidad_operativa_caja_cents,
             "margen_operativo_real_pct": margen_operativo_real_pct,
         }
+
+    def _gastos_operativos_reales(self, mes: str) -> int:
+        """Lo que el despacho pagó de verdad ese mes (tabla `expenses`), neto de IVA,
+        reembolsables y fondos de terceros. Se excluye lo marcado como inversión
+        (`afecta_utilidad = false` en el plan de cuentas): comprar un escritorio sale de la
+        caja pero no es gasto del mes, igual que en 04_Plan_Cuentas."""
+        return int(self.conn.execute(
+            """SELECT COALESCE(SUM(e.monto_neto_operativo_cents), 0) AS total
+               FROM expenses e
+               LEFT JOIN plan_cuentas pc ON pc.id = e.account_id
+               WHERE e.expense_date LIKE %s AND COALESCE(pc.afecta_utilidad, TRUE)""",
+            (mes + "-%",),
+        ).fetchone()["total"])
+
+    def gastos_por_centro_costo(self, *, desde: str, hasta: str) -> dict:
+        """En qué centro de costo se fue la plata: gastos operativos y costos directos del
+        período agrupados por el centro de su cuenta contable (04_Plan_Cuentas). Hasta ahora
+        el centro se capturaba en cada cuenta y no lo sumaba nadie."""
+        d = self._clean_mes(desde, "Mes inicial")
+        h = self._clean_mes(hasta, "Mes final")
+        self._meses_rango(d, h)
+        rows = self.conn.execute(
+            """SELECT COALESCE(pc.centro_costo, '(Sin centro de costo)') AS centro,
+                      COALESCE(pc.account_code, '(Sin cuenta)') AS account_code,
+                      COALESCE(pc.nombre, '(Sin cuenta)') AS cuenta,
+                      SUM(m.monto_neto_operativo_cents) AS total_cents,
+                      SUM(m.gasto_cents) AS gasto_cents,
+                      SUM(m.costo_cents) AS costo_cents
+               FROM (
+                   SELECT account_id, monto_neto_operativo_cents,
+                          monto_neto_operativo_cents AS gasto_cents, 0 AS costo_cents
+                   FROM expenses WHERE substring(expense_date,1,7) BETWEEN %s AND %s
+                   UNION ALL
+                   SELECT account_id, monto_neto_operativo_cents,
+                          0 AS gasto_cents, monto_neto_operativo_cents AS costo_cents
+                   FROM costs WHERE substring(cost_date,1,7) BETWEEN %s AND %s
+               ) m
+               LEFT JOIN plan_cuentas pc ON pc.id = m.account_id
+               GROUP BY centro, account_code, cuenta
+               ORDER BY centro, total_cents DESC""",
+            (d, h, d, h),
+        ).fetchall()
+
+        centros: dict[str, dict] = {}
+        total_cents = 0
+        for r in rows:
+            centro = centros.setdefault(str(r["centro"]), {
+                "centro_costo": str(r["centro"]), "total_cents": 0,
+                "gastos_operativos_cents": 0, "costos_directos_cents": 0, "cuentas": [],
+            })
+            centro["total_cents"] += int(r["total_cents"])
+            centro["gastos_operativos_cents"] += int(r["gasto_cents"])
+            centro["costos_directos_cents"] += int(r["costo_cents"])
+            centro["cuentas"].append({
+                "account_code": str(r["account_code"]), "cuenta": str(r["cuenta"]),
+                "total_cents": int(r["total_cents"]),
+            })
+            total_cents += int(r["total_cents"])
+
+        detalle = sorted(centros.values(), key=lambda c: c["total_cents"], reverse=True)
+        for c in detalle:
+            c["porcentaje"] = round(c["total_cents"] / total_cents, 4) if total_cents else None
+        return {"desde": d, "hasta": h, "total_cents": total_cents, "centros": detalle}
 
     # ── Resumen mensual consolidado (17_Resumen_Mensual del Archivo Maestro) ──
 
@@ -4654,6 +4777,13 @@ class Repository:
             "SELECT mes_reconocimiento AS mes, COALESCE(SUM(comision_cents),0) AS total "
             "FROM comisiones WHERE mes_reconocimiento BETWEEN %s AND %s GROUP BY 1"
         )
+        # Lo realmente pagado, al lado de lo presupuestado: el Archivo Maestro trabaja con
+        # el gasto fijo del plan, pero un mes no se cierra de verdad hasta ver lo que salió.
+        gastos_reales = _por_mes(
+            "SELECT substring(e.expense_date,1,7) AS mes, COALESCE(SUM(e.monto_neto_operativo_cents),0) AS total "
+            "FROM expenses e LEFT JOIN plan_cuentas pc ON pc.id = e.account_id "
+            "WHERE substring(e.expense_date,1,7) BETWEEN %s AND %s AND COALESCE(pc.afecta_utilidad, TRUE) GROUP BY 1"
+        )
         metas = {
             str(r["mes"]): (int(r["ingresos"]), int(r["utilidad"]))
             for r in self.conn.execute(
@@ -4680,6 +4810,7 @@ class Repository:
                     int(g["monto_mensual_cents"]) for g in vigencias
                     if str(g["mes_inicio"]) <= m and (g["mes_fin"] is None or str(g["mes_fin"]) >= m)
                 ),
+                gastos_reales_cents=gastos_reales.get(m, 0),
                 margen_meta_pct=margen_meta[m],
             )
             for m in meses
@@ -4688,11 +4819,14 @@ class Repository:
 
     def _fila_resumen_mensual(
         self, *, mes: str, meta: tuple[int, int], ingresos_cents: int, costos_cents: int,
-        comisiones_cents: int, gastos_fijos_cents: int, margen_meta_pct: float,
+        comisiones_cents: int, gastos_fijos_cents: int, gastos_reales_cents: int, margen_meta_pct: float,
     ) -> dict:
         meta_ingresos_cents, meta_utilidad_cents = meta
         utilidad_directa_cents = ingresos_cents - costos_cents
         utilidad_operativa_cents = utilidad_directa_cents - gastos_fijos_cents - comisiones_cents
+        # Con lo que de verdad salió de la caja. No se le restan las comisiones devengadas:
+        # cuando se pagan quedan registradas como gasto y se contarían dos veces.
+        utilidad_caja_cents = utilidad_directa_cents - gastos_reales_cents
         utilidad_minima_cents = round(meta_ingresos_cents * margen_meta_pct)
         cumpl_ingresos = round(ingresos_cents / meta_ingresos_cents, 4) if meta_ingresos_cents else None
         return {
@@ -4706,8 +4840,11 @@ class Repository:
                 round(utilidad_directa_cents / meta_utilidad_cents, 4) if meta_utilidad_cents else None
             ),
             "gastos_fijos_cents": gastos_fijos_cents,
+            "gastos_reales_cents": gastos_reales_cents,
+            "brecha_gastos_cents": gastos_reales_cents - gastos_fijos_cents,
             "comisiones_cents": comisiones_cents,
             "utilidad_operativa_real_cents": utilidad_operativa_cents,
+            "utilidad_operativa_caja_cents": utilidad_caja_cents,
             "utilidad_operativa_minima_cents": utilidad_minima_cents,
             "margen_operativo_real_pct": (
                 round(utilidad_operativa_cents / ingresos_cents, 4) if ingresos_cents else None
@@ -4723,6 +4860,7 @@ class Repository:
 
         meta = _suma("meta_ingresos_cents")
         ingresos = _suma("ingresos_reales_cents")
+        gastos_reales = _suma("gastos_reales_cents")
         meta_utilidad = _suma("meta_utilidad_directa_cents")
         utilidad_directa = _suma("utilidad_directa_real_cents")
         operativa = _suma("utilidad_operativa_real_cents")
@@ -4739,8 +4877,11 @@ class Repository:
             "utilidad_directa_real_cents": utilidad_directa,
             "cumplimiento_utilidad_directa_pct": round(utilidad_directa / meta_utilidad, 4) if meta_utilidad else None,
             "gastos_fijos_cents": _suma("gastos_fijos_cents"),
+            "gastos_reales_cents": gastos_reales,
+            "brecha_gastos_cents": gastos_reales - _suma("gastos_fijos_cents"),
             "comisiones_cents": _suma("comisiones_cents"),
             "utilidad_operativa_real_cents": operativa,
+            "utilidad_operativa_caja_cents": _suma("utilidad_operativa_caja_cents"),
             "utilidad_operativa_minima_cents": minima,
             "margen_operativo_real_pct": round(operativa / ingresos, 4) if ingresos else None,
             "margen_operativo_minimo_pct": filas[-1]["margen_operativo_minimo_pct"] if filas else 0.0,
