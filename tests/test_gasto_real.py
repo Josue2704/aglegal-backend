@@ -188,3 +188,34 @@ def test_el_cobro_de_una_factura_muestra_su_numero(repo, catalogo, codigo_unico)
 
     cobro = next(i for i in repo.list_incomes() if i["invoice_id"] == inv)
     assert cobro["invoice_number"] == numero
+
+
+def test_la_factura_cobra_en_la_misma_cuenta_que_el_anticipo(repo, catalogo, codigo_unico):
+    """Una compraventa es un servicio notarial pero se cobra en la cuenta de inmobiliario:
+    si la factura elige cuenta por la categoría del servicio, el mismo expediente termina
+    repartido en dos familias distintas."""
+    mes = "2027-10"
+    otra_familia = repo.create_cuenta(
+        account_code=f"ING-{codigo_unico}-007", tipo="Ingreso", grupo="Servicios jurídicos",
+        nombre="Ingresos inmobiliarios", naturaleza="Operativo", centro_costo="Operación jurídica",
+        created_at=now_iso(),
+    )
+    caso = repo.create_case(client_id=catalogo["cliente_id"], title="Compraventa con dos cobros",
+                            status="Abierto", priority="Media", opened_at=f"{mes}-01",
+                            created_at=now_iso(), honorarios_contratados_text="1000",
+                            service_id=catalogo["servicio_id"])
+    # El abogado registra el anticipo eligiendo la cuenta a mano.
+    repo.create_income(amount_text="400", income_date=f"{mes}-05", created_at=now_iso(),
+                       client_id=catalogo["cliente_id"], case_id=caso, account_id=otra_familia)
+
+    inv = repo.create_invoice(
+        client_id=catalogo["cliente_id"], case_id=caso, invoice_number=f"FAC-{codigo_unico}-90",
+        invoice_date=f"{mes}-15", due_date=None, notes="", firm_name=None, firm_phone=None,
+        firm_email=None, firm_address=None, firm_tax_id=None, created_at=now_iso(),
+        items=[{"description": "Saldo", "quantity": 1, "unit_price": 600}],
+    )
+    repo.update_invoice_status(inv, "Pagada")
+    repo.auto_income_from_invoice(inv)
+
+    cobro = next(i for i in repo.list_incomes() if i["invoice_id"] == inv)
+    assert cobro["account_id"] == otra_familia  # sigue al expediente, no a la categoría

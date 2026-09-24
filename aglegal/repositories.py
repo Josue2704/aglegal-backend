@@ -2848,9 +2848,27 @@ class Repository:
         )
 
     def _cuenta_ingreso_sugerida(self, case_id: int | None) -> int | None:
-        """Cuenta de ingreso sugerida (00_PARA_DESARROLLADOR, "Nuevo expediente"): la de la
-        categoría del servicio del expediente; si no hay, ING-OTR-001 u otra cuenta de ingreso activa."""
+        """Cuenta de ingreso sugerida (00_PARA_DESARROLLADOR, "Nuevo expediente"): la misma
+        con la que ya se cobró este expediente; si es el primer cobro, la de la categoría del
+        servicio; y si tampoco hay, ING-OTR-001 u otra cuenta de ingreso activa.
+
+        Lo primero importa: la categoría del servicio y la familia que factura no siempre
+        coinciden —una compraventa es un servicio notarial (NOT) pero se cobra con
+        ING-RAI-001 y cuenta para FAM-03 Inmobiliario, como el ejemplo MOV-2026-0001 del
+        Archivo Maestro—. Sin esto, el anticipo que el abogado registró a mano y el cobro
+        que genera la factura caían en familias distintas y partían el expediente en dos."""
         if case_id:
+            row = self.conn.execute(
+                """SELECT i.account_id AS id FROM incomes i
+                   JOIN plan_cuentas pc ON pc.id = i.account_id AND pc.estado='Activo'
+                   WHERE i.case_id=%s
+                   GROUP BY i.account_id
+                   ORDER BY SUM(i.monto_neto_operativo_cents) DESC, i.account_id
+                   LIMIT 1""",
+                (int(case_id),),
+            ).fetchone()
+            if row:
+                return int(row["id"])
             row = self.conn.execute(
                 """SELECT pc.id FROM cases cs
                    JOIN servicios sv ON sv.id = cs.service_id
