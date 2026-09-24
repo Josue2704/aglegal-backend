@@ -2159,6 +2159,23 @@ class Repository:
         except ValueError:
             pass  # sin metas de presupuesto configuradas para el mes — no hay nada que evaluar
 
+        # Un expediente que ya cobró pero no tiene originadores configurados no genera
+        # comisión, y nadie se entera: el cálculo simplemente no ocurre. Es plata que
+        # alguien dejó de ganar, así que se avisa mientras se puede corregir.
+        sin_originador_rows = self.conn.execute(
+            """SELECT ca.id, ca.title, cl.name AS client_name,
+                      COALESCE(SUM(i.monto_neto_operativo_cents), 0) AS cobrado_cents,
+                      MAX(i.income_date) AS ultimo_cobro
+               FROM cases ca
+               JOIN incomes i ON i.case_id = ca.id
+               LEFT JOIN clients cl ON cl.id = ca.client_id
+               WHERE ca.archived_at IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM negocio_originadores no WHERE no.case_id = ca.id)
+               GROUP BY ca.id, ca.title, cl.name
+               HAVING COALESCE(SUM(i.monto_neto_operativo_cents), 0) > 0
+               ORDER BY cobrado_cents DESC LIMIT 20"""
+        ).fetchall()
+
         return {
             "overdue_tasks": [dict(r) for r in overdue_rows],
             "critical_tasks": [dict(r) for r in critical_rows],
@@ -2166,6 +2183,7 @@ class Repository:
             "overdue_billing": [dict(r) for r in overdue_billing_rows],
             "budget_deviation": desviacion_presupuesto,
             "seguimiento_vencido": [dict(r) for r in seguimiento_rows],
+            "casos_sin_originador": [dict(r) for r in sin_originador_rows],
         }
 
     def global_search(self, q: str, *, limit: int = 8) -> dict:
@@ -3611,11 +3629,22 @@ class Repository:
         if tipo:
             where.append("tipo=%s")
             params.append(tipo)
-        clause = " WHERE " + " AND ".join(where) if where else ""
-        return list(self.conn.execute(f"SELECT * FROM gastos_fijos{clause} ORDER BY expense_code ASC", tuple(params)).fetchall())
+        clause = " WHERE " + " AND ".join(f"gf.{w}" for w in where) if where else ""
+        return list(self.conn.execute(
+            f"""SELECT gf.*, pc.account_code, pc.nombre AS account_nombre
+                FROM gastos_fijos gf LEFT JOIN plan_cuentas pc ON pc.id = gf.account_id
+                {clause}
+                ORDER BY gf.expense_code ASC""",
+            tuple(params),
+        ).fetchall())
 
     def get_gasto_fijo(self, gasto_id: int) -> Any:
-        row = self.conn.execute("SELECT * FROM gastos_fijos WHERE id=%s", (int(gasto_id),)).fetchone()
+        row = self.conn.execute(
+            """SELECT gf.*, pc.account_code, pc.nombre AS account_nombre
+               FROM gastos_fijos gf LEFT JOIN plan_cuentas pc ON pc.id = gf.account_id
+               WHERE gf.id=%s""",
+            (int(gasto_id),),
+        ).fetchone()
         if not row:
             raise ValueError("Gasto fijo no encontrado")
         return row
@@ -3628,7 +3657,8 @@ class Repository:
         return f"GF-{int(row['max_seq']) + 1:03d}"
 
     def create_gasto_fijo(
-        self, *, concepto: str, tipo: str = "Fijo", monto_mensual_text: str = "", mes_inicio: str, mes_fin: str | None = None, created_at: str,
+        self, *, concepto: str, tipo: str = "Fijo", monto_mensual_text: str = "", mes_inicio: str,
+        mes_fin: str | None = None, account_id: int | None = None, created_at: str,
     ) -> int:
         c = (concepto or "").strip()
         if not c:
@@ -3640,12 +3670,14 @@ class Repository:
         if fin and fin < inicio:
             raise ValueError("El mes de fin no puede ser anterior al mes de inicio")
         monto_cents = self._to_cents_or_zero(monto_mensual_text)
+        if account_id is not None:
+            self._validate_movement_account(account_id, expected_tipo="Egreso")
         code = self._next_expense_code()
         try:
             cur = self.conn.execute(
-                """INSERT INTO gastos_fijos(expense_code, concepto, tipo, monto_mensual_cents, mes_inicio, mes_fin, created_at, updated_at)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (code, c, tipo, monto_cents, inicio, fin, created_at, created_at),
+                """INSERT INTO gastos_fijos(expense_code, concepto, tipo, monto_mensual_cents, mes_inicio, mes_fin, account_id, created_at, updated_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (code, c, tipo, monto_cents, inicio, fin, account_id, created_at, created_at),
             )
         except Exception:
             self.conn.rollback()
@@ -3654,7 +3686,8 @@ class Repository:
         return int(cur.lastrowid)
 
     def update_gasto_fijo(
-        self, gasto_id: int, *, concepto: str, tipo: str = "Fijo", monto_mensual_text: str = "", mes_inicio: str, mes_fin: str | None = None, estado: str,
+        self, gasto_id: int, *, concepto: str, tipo: str = "Fijo", monto_mensual_text: str = "", mes_inicio: str,
+        mes_fin: str | None = None, account_id: int | None = None, estado: str,
     ) -> None:
         c = (concepto or "").strip()
         if not c:
@@ -3669,13 +3702,73 @@ class Repository:
             raise ValueError("Estado inválido")
         self.get_gasto_fijo(gasto_id)  # 404 if missing
         monto_cents = self._to_cents_or_zero(monto_mensual_text)
+        if account_id is not None:
+            self._validate_movement_account(account_id, expected_tipo="Egreso")
         fecha = now_iso()
         self.conn.execute(
-            """UPDATE gastos_fijos SET concepto=%s, tipo=%s, monto_mensual_cents=%s, mes_inicio=%s, mes_fin=%s, estado=%s, updated_at=%s
+            """UPDATE gastos_fijos SET concepto=%s, tipo=%s, monto_mensual_cents=%s, mes_inicio=%s, mes_fin=%s,
+                   account_id=%s, estado=%s, updated_at=%s
                WHERE id=%s""",
-            (c, tipo, monto_cents, inicio, fin, estado, fecha, int(gasto_id)),
+            (c, tipo, monto_cents, inicio, fin, account_id, estado, fecha, int(gasto_id)),
         )
         self.conn.commit()
+
+    def comparativo_gastos_fijos(self, *, mes: str) -> dict:
+        """Presupuestado contra pagado, concepto por concepto. Lo que no se puede casar se
+        muestra igual en vez de esconderse: los gastos fijos sin cuenta enlazada (no hay con
+        qué compararlos) y lo pagado en cuentas que nadie presupuesto."""
+        m = self._clean_mes(mes, "Mes")
+        presupuesto = self.conn.execute(
+            """SELECT gf.id, gf.expense_code, gf.concepto, gf.tipo, gf.monto_mensual_cents, gf.account_id,
+                      pc.account_code, pc.nombre AS account_nombre
+               FROM gastos_fijos gf LEFT JOIN plan_cuentas pc ON pc.id = gf.account_id
+               WHERE gf.estado='Activo' AND gf.mes_inicio <= %s AND (gf.mes_fin IS NULL OR gf.mes_fin >= %s)
+               ORDER BY gf.expense_code""",
+            (m, m),
+        ).fetchall()
+        pagado_por_cuenta = {
+            int(r["account_id"]): (int(r["total"]), str(r["account_code"]), str(r["nombre"]))
+            for r in self.conn.execute(
+                """SELECT e.account_id, pc.account_code, pc.nombre,
+                          COALESCE(SUM(e.monto_neto_operativo_cents), 0) AS total
+                   FROM expenses e JOIN plan_cuentas pc ON pc.id = e.account_id
+                   WHERE e.expense_date LIKE %s AND COALESCE(pc.afecta_utilidad, TRUE)
+                   GROUP BY e.account_id, pc.account_code, pc.nombre""",
+                (m + "-%",),
+            ).fetchall()
+        }
+
+        conceptos = []
+        cuentas_presupuestadas: set[int] = set()
+        for r in presupuesto:
+            cuenta_id = int(r["account_id"]) if r["account_id"] else None
+            presupuestado = int(r["monto_mensual_cents"])
+            pagado = pagado_por_cuenta.get(cuenta_id, (0, "", ""))[0] if cuenta_id else None
+            if cuenta_id:
+                cuentas_presupuestadas.add(cuenta_id)
+            conceptos.append({
+                "id": int(r["id"]), "expense_code": str(r["expense_code"]), "concepto": str(r["concepto"]),
+                "tipo": str(r["tipo"]), "presupuestado_cents": presupuestado,
+                "account_code": r["account_code"], "account_nombre": r["account_nombre"],
+                "pagado_cents": pagado,
+                "brecha_cents": (pagado - presupuestado) if pagado is not None else None,
+            })
+
+        no_presupuestado = [
+            {"account_id": cid, "account_code": code, "account_nombre": nombre, "pagado_cents": monto}
+            for cid, (monto, code, nombre) in pagado_por_cuenta.items()
+            if cid not in cuentas_presupuestadas
+        ]
+        total_presupuestado = sum(c["presupuestado_cents"] for c in conceptos)
+        total_pagado = self._gastos_operativos_reales(m)
+        return {
+            "mes": m,
+            "conceptos": conceptos,
+            "no_presupuestado": sorted(no_presupuestado, key=lambda x: -x["pagado_cents"]),
+            "total_presupuestado_cents": total_presupuestado,
+            "total_pagado_cents": total_pagado,
+            "brecha_cents": total_pagado - total_presupuestado,
+        }
 
     # ── Supuestos financieros ────────────────────────────────────────────────
 

@@ -1242,6 +1242,16 @@ def _migrate(conn: PgConnection) -> None:
         """)
         _set_schema_version(conn, 41)
 
+    # v42: cada gasto fijo apunta a la cuenta contable por la que se paga. Sin esto, lo
+    # presupuestado y lo pagado solo se podían comparar como un total del mes: "el alquiler
+    # subió $50" era invisible dentro de la suma.
+    if v < 42:
+        conn.executescript("""
+            ALTER TABLE gastos_fijos ADD COLUMN IF NOT EXISTS account_id INTEGER REFERENCES plan_cuentas(id);
+            CREATE INDEX IF NOT EXISTS idx_gastos_fijos_account ON gastos_fijos(account_id);
+        """)
+        _set_schema_version(conn, 42)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 

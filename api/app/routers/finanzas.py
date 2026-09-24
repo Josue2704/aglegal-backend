@@ -105,7 +105,7 @@ def create_gasto_fijo(body: GastoFijoIn, current_user: CurrentUser, repo: RepoDe
     gasto_id = repo.create_gasto_fijo(
         concepto=body.concepto, tipo=body.tipo,
         monto_mensual_text=str(body.monto_mensual) if body.monto_mensual is not None else "",
-        mes_inicio=body.mes_inicio, mes_fin=body.mes_fin, created_at=now_iso(),
+        mes_inicio=body.mes_inicio, mes_fin=body.mes_fin, account_id=body.account_id, created_at=now_iso(),
     )
     return GastoFijoOut.from_row(repo.get_gasto_fijo(gasto_id))
 
@@ -115,9 +115,37 @@ def update_gasto_fijo(gasto_id: int, body: GastoFijoUpdate, current_user: Curren
     repo.update_gasto_fijo(
         gasto_id, concepto=body.concepto, tipo=body.tipo,
         monto_mensual_text=str(body.monto_mensual) if body.monto_mensual is not None else "",
-        mes_inicio=body.mes_inicio, mes_fin=body.mes_fin, estado=body.estado,
+        mes_inicio=body.mes_inicio, mes_fin=body.mes_fin, account_id=body.account_id, estado=body.estado,
     )
     return GastoFijoOut.from_row(repo.get_gasto_fijo(gasto_id))
+
+
+@router.get("/gastos-fijos-comparativo")
+def comparativo_gastos_fijos(current_user: CurrentUser, repo: RepoDep, mes: str,
+                             _: dict = require_permission("finanzas", "ver")) -> dict:
+    """Lo presupuestado contra lo pagado, concepto por concepto."""
+    d = repo.comparativo_gastos_fijos(mes=mes)
+    return {
+        "mes": d["mes"],
+        "total_presupuestado": d["total_presupuestado_cents"] / 100,
+        "total_pagado": d["total_pagado_cents"] / 100,
+        "brecha": d["brecha_cents"] / 100,
+        "conceptos": [
+            {
+                "id": c["id"], "expense_code": c["expense_code"], "concepto": c["concepto"], "tipo": c["tipo"],
+                "account_code": c["account_code"], "account_nombre": c["account_nombre"],
+                "presupuestado": c["presupuestado_cents"] / 100,
+                "pagado": (c["pagado_cents"] / 100) if c["pagado_cents"] is not None else None,
+                "brecha": (c["brecha_cents"] / 100) if c["brecha_cents"] is not None else None,
+            }
+            for c in d["conceptos"]
+        ],
+        "no_presupuestado": [
+            {"account_code": x["account_code"], "account_nombre": x["account_nombre"],
+             "pagado": x["pagado_cents"] / 100}
+            for x in d["no_presupuestado"]
+        ],
+    }
 
 
 # --- Supuestos financieros

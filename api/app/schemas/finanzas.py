@@ -117,6 +117,8 @@ class GastoFijoIn(BaseModel):
     monto_mensual: float | None = None
     mes_inicio: str
     mes_fin: str | None = None
+    # Cuenta por la que se paga: es lo que permite comparar presupuestado contra pagado.
+    account_id: int | None = None
 
 
 class GastoFijoUpdate(BaseModel):
@@ -125,6 +127,7 @@ class GastoFijoUpdate(BaseModel):
     monto_mensual: float | None = None
     mes_inicio: str
     mes_fin: str | None = None
+    account_id: int | None = None
     estado: str
 
 
@@ -139,6 +142,9 @@ class GastoFijoOut(BaseModel):
     estado: str
     created_at: str
     updated_at: str
+    account_id: int | None = None
+    account_code: str | None = None
+    account_nombre: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -146,7 +152,7 @@ class GastoFijoOut(BaseModel):
     def from_row(cls, row: Any) -> GastoFijoOut:
         d = dict(row)
         d["monto_mensual"] = (d.pop("monto_mensual_cents", 0) or 0) / 100
-        return cls(**d)
+        return cls(**{k: v for k, v in d.items() if k in cls.model_fields})
 
 
 # --- Supuestos financieros
