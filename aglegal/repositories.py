@@ -1882,7 +1882,9 @@ class Repository:
         return list(
             self.conn.execute(
                 f"SELECT ct.*{self._SELECT_TAREA_EXTRAS} FROM case_tasks ct WHERE ct.case_id=%s "
-                "ORDER BY ct.done ASC, ct.id DESC",
+                # Un plan de trabajo se lee en orden: primero lo que va primero. Ordenar por
+                # id descendente mostraba el último paso de la plantilla arriba del todo.
+                "ORDER BY ct.done ASC, ct.due_date ASC NULLS LAST, ct.id ASC",
                 (int(case_id),),
             ).fetchall()
         )
