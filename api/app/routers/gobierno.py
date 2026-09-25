@@ -47,6 +47,20 @@ def create_solicitud(body: SolicitudIn, current_user: CurrentUser, repo: RepoDep
             costo_referencia_propuesta_text=str(body.costo_referencia_propuesta) if body.costo_referencia_propuesta is not None else "",
             horas_estandar_propuesta=body.horas_estandar_propuesta, estado_propuesto=body.estado_propuesto,
         )
+        # Un administrador no necesita que otra persona apruebe su propia solicitud —
+        # el proceso de revisión/aprobación es para cuando quien pide el cambio no es
+        # quien tiene la última palabra sobre el Catálogo Maestro. Se auto-aprueba
+        # encadenando las mismas transiciones que seguiría un aprobador humano, así
+        # que queda la misma trazabilidad (aprobador, fecha, nota de activación).
+        if current_user["is_admin"]:
+            ts = now_iso()
+            repo.transition_solicitud(solicitud_id, estado="En revisión", created_at=ts, usuario_id=current_user["id"])
+            repo.transition_solicitud(
+                solicitud_id, estado="Aprobado", aprobador=current_user["username"],
+                resultado_revision_duplicidad="Auto-aprobado: solicitado y aprobado por un administrador",
+                observaciones="Creado y aprobado automáticamente (administrador)",
+                created_at=now_iso(), usuario_id=current_user["id"],
+            )
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
     return SolicitudOut.from_row(repo.get_solicitud(solicitud_id))
