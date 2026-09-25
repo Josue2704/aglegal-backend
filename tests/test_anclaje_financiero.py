@@ -101,7 +101,7 @@ def test_factura_ligada_a_expediente_no_puede_mezclar_otro_expediente(repo, caso
     )
     tarea_de_otro_caso = repo.create_case_task(case_id=otro_caso, title="Tarea de otro expediente", due_date=None, created_at=now)
 
-    with pytest.raises(ValueError, match="otro expediente"):
+    with pytest.raises(ValueError, match="no pertenece"):
         repo.create_invoice(
             client_id=catalogo["cliente_id"], case_id=caso, invoice_number=f"F-{caso}", invoice_date="2026-02-01",
             due_date=None, notes=None, firm_name=None, firm_phone=None, firm_email=None, firm_address=None,
@@ -117,8 +117,8 @@ def test_get_unbilled_items_filtra_por_case_id(repo, caso, catalogo):
         client_id=catalogo["cliente_id"], title="Otro expediente", status="Abierto", priority="Media",
         opened_at="2026-01-10", created_at=now,
     )
-    repo.create_case_task(case_id=caso, title="Tarea del caso principal", due_date=None, created_at=now)
-    repo.create_case_task(case_id=otro_caso, title="Tarea del otro caso", due_date=None, created_at=now)
+    repo.create_case_task(case_id=caso, title="Tarea del caso principal", due_date=None, created_at=now, monto_adicional_text="20", autorizado_por="Cliente", estado="Hecha")
+    repo.create_case_task(case_id=otro_caso, title="Tarea del otro caso", due_date=None, created_at=now, monto_adicional_text="20", autorizado_por="Cliente", estado="Hecha")
 
     items_filtrados = repo.get_unbilled_items(catalogo["cliente_id"], case_id=caso)
     titulos = [t["title"] for t in items_filtrados["tasks"]]
@@ -127,13 +127,12 @@ def test_get_unbilled_items_filtra_por_case_id(repo, caso, catalogo):
 
     items_sin_filtro = repo.get_unbilled_items(catalogo["cliente_id"])
     titulos_todos = [t["title"] for t in items_sin_filtro["tasks"]]
-    assert "Tarea del caso principal" in titulos_todos
-    assert "Tarea del otro caso" in titulos_todos
+    assert titulos_todos == []  # Sin expediente solo se facturan partidas independientes
 
 
 def test_borrar_factura_libera_las_partidas_para_refacturar(repo, caso, catalogo):
     now = now_iso()
-    task_id = repo.create_case_task(case_id=caso, title="Redacción de contrato", due_date=None, created_at=now)
+    task_id = repo.create_case_task(case_id=caso, title="Redacción de contrato", due_date=None, created_at=now, monto_adicional_text="200", autorizado_por="Cliente", estado="Hecha")
     invoice_id = repo.create_invoice(
         client_id=catalogo["cliente_id"], case_id=caso, invoice_number=f"F-{task_id}", invoice_date="2026-02-01",
         due_date=None, notes=None, firm_name=None, firm_phone=None, firm_email=None, firm_address=None,

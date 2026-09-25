@@ -60,6 +60,15 @@ def repo(db_conn):
     return Repository(db_conn)
 
 
+@pytest.fixture()
+def apertura():
+    from datetime import date
+    return dict(mes_cobro_esperado=date.today().isoformat()[:7], probabilidad_cobro=0.7, honorarios_pactados=900, alcance='Servicio aceptado por el cliente',
+        condiciones_cobro='Al finalizar', revision_confirmada=True,
+        revision_observaciones='Ficha y coincidencias revisadas', responsable_expediente='admin',
+        tareas_iniciales=[dict(titulo='Revisar documentación',due_date=date.today().isoformat())])
+
+
 _CODIGOS_USADOS: set[str] = set()
 
 

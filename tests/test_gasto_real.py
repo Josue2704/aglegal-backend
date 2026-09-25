@@ -10,6 +10,8 @@ movimientos de una prueba se sumarían a los de otra dentro del mismo mes."""
 from __future__ import annotations
 
 import pytest
+from datetime import date
+import uuid
 
 from aglegal.db import now_iso
 
@@ -183,8 +185,9 @@ def test_el_cobro_de_una_factura_muestra_su_numero(repo, catalogo, codigo_unico)
         firm_email=None, firm_address=None, firm_tax_id=None, created_at=now_iso(),
         items=[{"description": "Honorarios", "quantity": 1, "unit_price": 600}],
     )
-    repo.update_invoice_status(inv, "Pagada")
-    repo.auto_income_from_invoice(inv)
+    repo.update_invoice_status(inv, "Enviada")
+    repo.register_invoice_payment(inv, amount=600, income_date=date.today().isoformat(),
+        account_id=repo._cuenta_ingreso_sugerida(caso), request_key=uuid.uuid4().hex)
 
     cobro = next(i for i in repo.list_incomes() if i["invoice_id"] == inv)
     assert cobro["invoice_number"] == numero
@@ -214,8 +217,9 @@ def test_la_factura_cobra_en_la_misma_cuenta_que_el_anticipo(repo, catalogo, cod
         firm_email=None, firm_address=None, firm_tax_id=None, created_at=now_iso(),
         items=[{"description": "Saldo", "quantity": 1, "unit_price": 600}],
     )
-    repo.update_invoice_status(inv, "Pagada")
-    repo.auto_income_from_invoice(inv)
+    repo.update_invoice_status(inv, "Enviada")
+    repo.register_invoice_payment(inv, amount=600, income_date=date.today().isoformat(),
+        account_id=repo._cuenta_ingreso_sugerida(caso), request_key=uuid.uuid4().hex)
 
     cobro = next(i for i in repo.list_incomes() if i["invoice_id"] == inv)
     assert cobro["account_id"] == otra_familia  # sigue al expediente, no a la categoría

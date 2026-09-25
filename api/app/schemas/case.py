@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TareaInicialIn(BaseModel):
@@ -18,6 +18,10 @@ class TareaInicialIn(BaseModel):
 
 
 class CaseIn(BaseModel):
+    alcance: str = ''
+    condiciones_cobro: str = ''
+    revision_confirmada: bool = False
+    revision_observaciones: str = ''
     client_id: int
     title: str
     status: str
@@ -32,6 +36,7 @@ class CaseIn(BaseModel):
     service_id: int | None = None
     honorarios_contratados: float | None = None
     costos_directos_estimados: float | None = None
+    probabilidad_cobro: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     mes_cobro_esperado: str | None = None
     estado_cobro: str = "En ejecución"
     fecha_cierre_estimada: str | None = None
@@ -54,6 +59,7 @@ class CaseUpdate(BaseModel):
     service_id: int | None = None
     honorarios_contratados: float | None = None
     costos_directos_estimados: float | None = None
+    probabilidad_cobro: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     mes_cobro_esperado: str | None = None
     estado_cobro: str = "En ejecución"
     fecha_cierre_estimada: str | None = None
@@ -93,6 +99,7 @@ class CaseOut(BaseModel):
     costos_directos_estimados: float = 0
     costos_directos_reales: float = 0
     saldo_pendiente: float = 0
+    probabilidad_cobro: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     mes_cobro_esperado: str | None = None
     estado_cobro: str = "En ejecución"
     fecha_cierre_estimada: str | None = None
@@ -215,6 +222,7 @@ class CaseTaskIn(BaseModel):
     es_critico: bool = False
     # Lo que se le cobra de mas al cliente (sube los honorarios del expediente).
     monto_adicional: float | None = None
+    cobro_anticipado: bool = False
     autorizado_por: str = ""
     fecha_autorizacion: str | None = None
     # Lo que costo hacerla (genera el costo directo del expediente).
@@ -267,6 +275,7 @@ class CaseTaskOut(BaseModel):
     costo_account_id: int | None = None
     costo_es_reembolsable: bool = False
     cost_id: int | None = None
+    cobro_anticipado: bool = False
     autorizado_por: str | None = None
     fecha_autorizacion: str | None = None
     completed_at: str | None = None

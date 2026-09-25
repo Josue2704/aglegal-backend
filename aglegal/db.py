@@ -4,6 +4,7 @@ import os
 import re
 import secrets
 from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any
 
@@ -71,6 +72,7 @@ class PgConnection:
 
     def __init__(self, pg_conn: Any) -> None:
         self._conn = pg_conn
+        self._transaction_depth = 0
 
     def execute(self, sql: str, params: Any = ()) -> _Cursor:
         cur = self._conn.cursor(cursor_factory=RealDictCursor)
@@ -87,7 +89,23 @@ class PgConnection:
                 cur.execute(stmt)
 
     def commit(self) -> None:
-        self._conn.commit()
+        if not self._transaction_depth:
+            self._conn.commit()
+
+    @contextmanager
+    def transaction(self):
+        outer = self._transaction_depth == 0
+        self._transaction_depth += 1
+        try:
+            yield
+            if outer:
+                self._conn.commit()
+        except Exception:
+            if outer:
+                self._conn.rollback()
+            raise
+        finally:
+            self._transaction_depth -= 1
 
     def close(self) -> None:
         self._conn.close()
@@ -258,6 +276,9 @@ def _seed_admin(conn: PgConnection) -> None:
 
 def _migrate(conn: PgConnection) -> None:
     v = _schema_version(conn)
+    if v < 46:
+        conn.execute('SELECT pg_advisory_xact_lock(74185246)')
+        v = _schema_version(conn)
 
     # v2: categories + link to incomes/expenses
     if v < 2:
@@ -1325,6 +1346,111 @@ def _migrate(conn: PgConnection) -> None:
             )
         _set_schema_version(conn, 44)
 
+    # v45: un pago es dinero real; su aplicación a una factura es independiente.
+    # Conserva los cobros históricos sin volver a generarlos ni cambiar sus importes.
+    if v < 45:
+        conn.executescript("""
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS cobro_anticipado BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS charge_type TEXT NOT NULL DEFAULT 'Honorario';
+            ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS subtotal_cents INTEGER;
+            UPDATE invoice_items SET subtotal_cents = ROUND(quantity::numeric * unit_price_cents)::integer
+                WHERE subtotal_cents IS NULL;
+            UPDATE invoice_items it SET charge_type='Reembolso'
+                FROM costs c WHERE it.entity_type='cost' AND it.entity_id=c.id AND c.monto_reembolsable_cents > 0;
+            CREATE SEQUENCE IF NOT EXISTS invoice_number_seq;
+            CREATE TABLE IF NOT EXISTS invoice_payments (
+                id SERIAL PRIMARY KEY,
+                invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+                income_id INTEGER NOT NULL REFERENCES incomes(id) ON DELETE RESTRICT,
+                amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+                reimbursement_cents INTEGER NOT NULL DEFAULT 0 CHECK (reimbursement_cents >= 0 AND reimbursement_cents <= amount_cents),
+                request_key TEXT NOT NULL UNIQUE,
+                request_payload JSONB NOT NULL DEFAULT '{}',
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                released_at TEXT,
+                release_reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_invoice_payments_invoice ON invoice_payments(invoice_id);
+            CREATE INDEX IF NOT EXISTS idx_invoice_payments_income ON invoice_payments(income_id);
+            INSERT INTO invoice_payments(invoice_id, income_id, amount_cents, reimbursement_cents,
+                request_key, created_by, created_at, released_at, release_reason)
+                SELECT i.invoice_id, i.id, i.amount_cents,
+                    LEAST(i.amount_cents, GREATEST(0, i.monto_reembolsable_cents)),
+                    'legacy-' || i.id, 'migracion', i.created_at,
+                    CASE WHEN f.status='Cancelada' THEN i.created_at ELSE NULL END,
+                    CASE WHEN f.status='Cancelada' THEN 'Factura cancelada antes de la migración' ELSE NULL END
+                FROM incomes i JOIN invoices f ON f.id=i.invoice_id WHERE i.amount_cents > 0
+                    AND NOT EXISTS (SELECT 1 FROM invoice_payments p WHERE p.income_id=i.id)
+                ON CONFLICT(request_key) DO NOTHING;
+            UPDATE sessions SET invoice_id=NULL WHERE invoice_id IN (SELECT id FROM invoices WHERE status='Cancelada');
+            UPDATE case_tasks SET invoice_id=NULL WHERE invoice_id IN (SELECT id FROM invoices WHERE status='Cancelada');
+            UPDATE case_time_entries SET invoice_id=NULL WHERE invoice_id IN (SELECT id FROM invoices WHERE status='Cancelada');
+            UPDATE costs SET invoice_id=NULL WHERE invoice_id IN (SELECT id FROM invoices WHERE status='Cancelada');
+        """)
+        conn.execute("""SELECT setval('invoice_number_seq', GREATEST(1,
+            COALESCE((SELECT MAX(substring(invoice_number from '^FAC-([0-9]+)$')::bigint) FROM invoices), 0) + 1), false)""")
+        conn.execute("""UPDATE case_tasks t SET invoice_id=NULL WHERE invoice_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM invoice_items it WHERE it.invoice_id=t.invoice_id
+                AND it.entity_type='case_task' AND it.entity_id=t.id)""")
+        conn.execute("""UPDATE sessions t SET invoice_id=NULL WHERE invoice_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM invoice_items it WHERE it.invoice_id=t.invoice_id
+                AND it.entity_type='session' AND it.entity_id=t.id)""")
+        conn.execute("""UPDATE case_time_entries t SET invoice_id=NULL WHERE invoice_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM invoice_items it WHERE it.invoice_id=t.invoice_id
+                AND it.entity_type='time_entry' AND it.entity_id=t.id)""")
+        conn.execute("""UPDATE costs t SET invoice_id=NULL WHERE invoice_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM invoice_items it WHERE it.invoice_id=t.invoice_id
+                AND it.entity_type='cost' AND it.entity_id=t.id)""")
+        _set_schema_version(conn, 45)
+
+    if v < 46:
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS opportunity_conversions (
+                id SERIAL PRIMARY KEY,
+                opportunity_id INTEGER NOT NULL UNIQUE REFERENCES oportunidades(id),
+                case_id INTEGER NOT NULL REFERENCES cases(id),
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS workflow_events (
+                id SERIAL PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT '',
+                details JSONB NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS workflow_events_entity ON workflow_events(entity_type,entity_id,id)
+        ''')
+        conn.execute('''INSERT INTO opportunity_conversions(opportunity_id,case_id,created_at)
+            SELECT id,case_id,updated_at FROM oportunidades WHERE case_id IS NOT NULL
+            ON CONFLICT(opportunity_id) DO NOTHING''')
+        _set_schema_version(conn, 46)
+
+    if v < 47:
+        conn.executescript("""
+            ALTER TABLE cases ADD COLUMN IF NOT EXISTS probabilidad_cobro DOUBLE PRECISION
+                CHECK (probabilidad_cobro >= 0 AND probabilidad_cobro <= 1);
+            ALTER TABLE comisiones ADD COLUMN IF NOT EXISTS estado TEXT NOT NULL DEFAULT 'Calculada';
+            ALTER TABLE comisiones ADD COLUMN IF NOT EXISTS evidencia TEXT NOT NULL DEFAULT '';
+            ALTER TABLE comisiones ADD COLUMN IF NOT EXISTS aprobado_por TEXT;
+            ALTER TABLE comisiones ADD COLUMN IF NOT EXISTS aprobado_at TEXT;
+            ALTER TABLE comisiones ADD COLUMN IF NOT EXISTS liquidacion_id INTEGER;
+            CREATE TABLE IF NOT EXISTS commission_settlements (
+                id SERIAL PRIMARY KEY, personal_id INTEGER NOT NULL REFERENCES personal(id),
+                amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0),
+                payment_date TEXT NOT NULL, reference TEXT NOT NULL, actor TEXT NOT NULL,
+                expense_id INTEGER UNIQUE REFERENCES expenses(id), request_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+            UPDATE comisiones c SET estado='Anulada' WHERE c.ajusta_a_commission_id IS NOT NULL
+                OR EXISTS(SELECT 1 FROM comisiones r WHERE r.ajusta_a_commission_id=c.id);
+        """)
+        if not conn.execute("SELECT 1 FROM pg_constraint WHERE conname='comisiones_liquidacion_fk' AND conrelid='comisiones'::regclass").fetchone():
+            conn.execute('ALTER TABLE comisiones ADD CONSTRAINT comisiones_liquidacion_fk FOREIGN KEY (liquidacion_id) REFERENCES commission_settlements(id)')
+        _set_schema_version(conn, 47)
+
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 
@@ -1367,6 +1493,8 @@ ALL_PERMISSIONS: list[tuple[str, str, str]] = [
     ("pipeline",      "ver",      "Ver pipeline comercial"),
     ("pipeline",      "crear",    "Crear oportunidades"),
     ("pipeline",      "editar",   "Editar y transicionar oportunidades"),
+    ("comisiones",    "aprobar", "Aprobar elegibilidad de comisiones"),
+    ("comisiones",    "pagar", "Liquidar comisiones aprobadas"),
     ("comisiones",    "ver",      "Ver comisiones"),
     ("comisiones",    "editar",   "Configurar originadores, reconocer y revertir comisiones"),
     ("gobierno_catalogo", "ver",      "Ver solicitudes de catálogo"),

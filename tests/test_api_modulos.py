@@ -41,6 +41,58 @@ def _as(client: TestClient, user: dict):
     client.app_ref.dependency_overrides[get_current_user] = lambda: user
 
 
+def test_opening_permissions_and_task_routes(app_client,repo,catalogo,apertura):
+    _as(app_client,ADMIN)
+    op=app_client.post('/oportunidades',json=dict(prospecto_nombre='Permisos apertura',service_id=catalogo['servicio_id'],canal_captacion='Referido',origen_negocio='Orgánico')).json()
+    _as(app_client,dict(SIN_PERMISOS,permissions={'pipeline.editar'}))
+    try:
+        response=app_client.post(f"/oportunidades/{op['id']}/transicion",json=dict(apertura,estado='Ganado',crear_cliente=True))
+        assert response.status_code==403
+        assert app_client.get('/users/choices').status_code==200
+        assert app_client.get('/users').status_code==403
+    finally:_as(app_client,ADMIN)
+    opened=app_client.post(f"/oportunidades/{op['id']}/transicion",json=dict(apertura,estado='Ganado',crear_cliente=True))
+    assert opened.status_code==200,opened.text
+    cid=opened.json()['case_id'];tid=repo.list_case_tasks(cid)[0]['id']
+    _as(app_client,SIN_PERMISOS)
+    try:
+        for suffix,payload in [('done',{'done':True,'completed_notes':'Listo'}),('critico',{'es_critico':True}),('notes',{'notes':'Cambio'})]:
+            assert app_client.patch(f'/cases/tasks/{tid}/{suffix}',json=payload).status_code==403
+    finally:_as(app_client,ADMIN)
+    assert app_client.patch(f'/cases/tasks/{tid}/done',json={'done':True}).status_code==422
+    assert app_client.get(f'/cases/{cid}/historial').json()[0]['event']=='Apertura confirmada'
+
+
+def test_commission_review_and_payment_have_separate_permissions(app_client,repo,catalogo):
+    from datetime import date
+    from uuid import uuid4
+    from aglegal.db import now_iso
+    cid=repo.create_case(client_id=catalogo['cliente_id'],title='Permisos comisiones',status='Abierto',priority='Media',
+        opened_at=date.today().isoformat(),created_at=now_iso(),service_id=catalogo['servicio_id'],honorarios_contratados_text='500')
+    repo.set_negocio_originadores(cid,originadores=[dict(personal_id=catalogo['persona_id'],porcentaje_participacion=100,tipo_origen='Cliente nuevo')],created_at=now_iso())
+    repo.create_income(client_id=catalogo['cliente_id'],case_id=cid,amount_text='500',income_date=date.today().isoformat(),created_at=now_iso(),account_id=catalogo['cuenta_id'])
+    c=repo.list_comisiones(case_id=cid)[0]
+    review={'evidencia':'Aceptación y origen verificados','elegible':True}
+    payment={'commission_ids':[c['id']],'payment_date':date.today().isoformat(),'reference':'TX prueba','request_key':uuid4().hex}
+    _as(app_client,dict(SIN_PERMISOS,permissions={'comisiones.editar'}))
+    try:
+        assert app_client.post(f"/comisiones/{c['id']}/revision",json=review).status_code==403
+        assert app_client.post('/comisiones/liquidaciones',json=payment).status_code==403
+        _as(app_client,dict(SIN_PERMISOS,permissions={'comisiones.aprobar'}))
+        r=app_client.post(f"/comisiones/{c['id']}/revision",json=review)
+        assert r.status_code==200,r.text
+        assert r.json()['aprobado_por']==SIN_PERMISOS['username']
+        assert app_client.post('/comisiones/liquidaciones',json=payment).status_code==403
+    finally:_as(app_client,ADMIN)
+    account=repo.create_cuenta(account_code=repo.get_cuenta(catalogo['cuenta_id'])['account_code'].replace('ING-','EGR-'),
+        tipo='Egreso',grupo='Comercial',nombre='Comisiones',naturaleza='Operativo',centro_costo='Comercial',created_at=now_iso())
+    r=app_client.post('/comisiones/liquidaciones',json=dict(payment,account_id=account))
+    assert r.status_code==200,r.text
+    assert r.json()['amount_cents']==5000
+    history=app_client.get('/comisiones/liquidaciones').json()
+    assert any(p['id']==r.json()['id'] and c['id'] in p['commission_ids'] for p in history)
+
+
 # ── 1. Barrido de todos los GET ───────────────────────────────────────────────
 
 # Endpoints que dependen de servicios externos (Google/Outlook OAuth) o de archivos.
@@ -117,8 +169,9 @@ def test_flujo_completo_expediente_tareas_honorarios_factura(app_client, servici
     # Crear expediente con tareas iniciales (las de la plantilla)
     r = app_client.post("/cases", json={
         "client_id": cliente_id, "title": "Caso API", "status": "Abierto", "priority": "Media", "opened_at": "2026-03-01",
-        "service_id": servicio_id, "honorarios_contratados": 1000,
-        "tareas_iniciales": [{"titulo": "Recibir documentos"}, {"titulo": "Presentar demanda", "es_critico": True}],
+        "service_id": servicio_id, "honorarios_contratados": 1000, "responsible_username":"admin",
+        "alcance":"Servicio contratado", "condiciones_cobro":"Al finalizar", "revision_confirmada":True,"mes_cobro_esperado":"2026-12","probabilidad_cobro":0.7,
+        "tareas_iniciales": [{"titulo": "Recibir documentos", "due_date":"2026-03-06"}, {"titulo": "Presentar demanda", "due_date":"2026-03-11", "es_critico": True}],
     })
     assert r.status_code == 201, r.text
     caso = r.json()
@@ -131,7 +184,7 @@ def test_flujo_completo_expediente_tareas_honorarios_factura(app_client, servici
 
     # Tarea manual con monto adicional → sube honorarios y queda en bitácora
     r = app_client.post(f"/cases/{case_id}/tasks", json={"title": "Trámite extra", "monto_adicional": 250,
-                                                         "autorizado_por": "Cliente (correo)"})
+                                                         "autorizado_por": "Cliente (correo)", "cobro_anticipado": True})
     assert r.status_code == 201, r.text
     task_extra = r.json()
     assert task_extra["origen"] == "manual" and task_extra["monto_adicional"] == 250
@@ -149,19 +202,20 @@ def test_flujo_completo_expediente_tareas_honorarios_factura(app_client, servici
     assert next(c for c in app_client.get("/cases").json() if c["id"] == case_id)["honorarios_contratados"] == 1350
 
     # Facturar solo trabajo de este expediente; otro expediente del mismo cliente no debe colarse
-    otro = app_client.post("/cases", json={"client_id": cliente_id, "title": "Otro caso", "status": "Abierto", "priority": "Baja", "opened_at": "2026-03-01"}).json()
+    otro = app_client.post("/cases", json={"client_id": cliente_id, "title": "Otro caso", "status": "Abierto", "priority": "Baja", "opened_at": "2026-03-01", "service_id":servicio_id, "honorarios_contratados":0,"responsible_username":"admin","alcance":"Servicio gratuito", "condiciones_cobro":"Sin cobro", "revision_confirmada":True,"mes_cobro_esperado":"2026-12","probabilidad_cobro":0.7,"tareas_iniciales":[{"titulo":"Revisar", "due_date":"2026-03-02"}]}).json()
     tarea_otro = app_client.post(f"/cases/{otro['id']}/tasks", json={"title": "Tarea del otro caso"}).json()
 
     sin_filtro = app_client.get(f"/invoices/unbilled/{cliente_id}").json()
     con_filtro = app_client.get(f"/invoices/unbilled/{cliente_id}", params={"case_id": case_id}).json()
-    assert tarea_otro["id"] in [t["id"] for t in sin_filtro["tasks"]]
+    assert sin_filtro["tasks"] == []
+    assert con_filtro["tasks"][0]["monto_adicional_cents"] == 25000
     assert tarea_otro["id"] not in [t["id"] for t in con_filtro["tasks"]]
 
     r = app_client.post("/invoices", json={
         "client_id": cliente_id, "case_id": case_id, "invoice_number": f"F-{_uniq(5)}", "invoice_date": "2026-03-15",
         "items": [{"description": "Tarea de otro caso", "unit_price": 50, "entity_type": "case_task", "entity_id": tarea_otro["id"]}],
     })
-    assert r.status_code == 422 and "otro expediente" in r.json()["detail"]
+    assert r.status_code == 422 and "no pertenece" in r.json()["detail"]
 
     r = app_client.post("/invoices", json={
         "client_id": cliente_id, "case_id": case_id, "invoice_number": f"F-{_uniq(5)}", "invoice_date": "2026-03-15",
@@ -295,7 +349,7 @@ def test_dashboard_kpis_y_finanzas_responden_con_datos(app_client):
         assert r.status_code < 500, f"{path}: {r.status_code} {r.text[:200]}"
 
 
-def test_pipeline_comercial_prospecto_a_ganado_y_perdido(app_client, catalogo):
+def test_pipeline_comercial_prospecto_a_ganado_y_perdido(app_client, catalogo, apertura):
     _as(app_client, ADMIN)
     base = {"client_id": catalogo["cliente_id"], "service_id": catalogo["servicio_id"],
             "canal_captacion": "Referido", "origen_negocio": "Orgánico", "honorarios_estimados": 700}
@@ -305,7 +359,7 @@ def test_pipeline_comercial_prospecto_a_ganado_y_perdido(app_client, catalogo):
     assert op.json()["estado"] == "Prospecto"
     r = app_client.post(f"/oportunidades/{oid}/transicion", json={"estado": "Cotizado"})
     assert r.status_code == 200 and r.json()["oportunidad"]["estado"] == "Cotizado", (r.status_code, r.text)
-    r = app_client.post(f"/oportunidades/{oid}/transicion", json={"estado": "Ganado"})
+    r = app_client.post(f"/oportunidades/{oid}/transicion", json={"estado": "Ganado", **dict(apertura,honorarios_pactados=700)})
     assert r.status_code == 200, (r.status_code, r.text)
     # Ganar una oportunidad abre el expediente automáticamente, ligado al cliente y servicio
     assert r.json()["case_id"] is not None and r.json()["case_internal_ref"]
@@ -318,3 +372,25 @@ def test_pipeline_comercial_prospecto_a_ganado_y_perdido(app_client, catalogo):
     r = app_client.post(f"/oportunidades/{perdida}/transicion", json={"estado": "Perdido", "motivo_perdida": "Precio"})
     assert r.status_code == 200 and r.json()["oportunidad"]["estado"] == "Perdido"
     assert app_client.get("/oportunidades/conversion").json()["ganados"] >= 1
+
+
+def test_factura_abonos_api_y_permisos(app_client,repo,catalogo):
+    from tests.test_billing_payments import case, invoice
+    import uuid
+    from datetime import date
+    _as(app_client,ADMIN)
+    inv=invoice(repo,catalogo,case(repo,catalogo))
+    assert app_client.patch(f'/invoices/{inv}/status',json={'status':'Pagada'}).status_code==422
+    assert app_client.patch(f'/invoices/{inv}/status',json={'status':'Enviada'}).status_code==200
+    payload={'amount':40,'income_date':date.today().isoformat(),'account_id':catalogo['cuenta_id'],'detail':'Efectivo','request_key':uuid.uuid4().hex}
+    r=app_client.post(f'/invoices/{inv}/payments',json=payload)
+    assert r.status_code==200,r.text
+    assert r.json()['paid']==40 and r.json()['balance']==60 and r.json()['status']=='Parcial'
+    assert app_client.post(f'/invoices/{inv}/payments',json=payload).json()['paid']==40
+    assert len(app_client.get(f'/invoices/{inv}').json()['payments'])==1
+    restricted=dict(ADMIN,is_admin=False,permissions={'facturas.ver'})
+    _as(app_client,restricted)
+    assert app_client.post(f'/invoices/{inv}/payments',json=dict(payload,request_key=uuid.uuid4().hex)).status_code==403
+    _as(app_client,ADMIN)
+    assert app_client.patch(f'/invoices/{inv}/status',json={'status':'Cancelada'}).status_code==200
+    assert app_client.get(f'/invoices/{inv}/credits').json()[0]['available']==40

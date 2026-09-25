@@ -7,6 +7,7 @@ from aglegal.db import now_iso
 from ..deps import CurrentUser, RepoDep, require_permission
 from ..schemas.invoice import (
     InvoiceIn,
+    InvoicePaymentIn,
     InvoiceItemOut,
     InvoiceOut,
     InvoiceStatusUpdate,
@@ -26,7 +27,9 @@ def _load(repo, invoice_id: int) -> InvoiceOut:
     if not row:
         raise HTTPException(404, "Factura no encontrada")
     items = [InvoiceItemOut.from_row(r) for r in repo.get_invoice_items(invoice_id)]
-    return InvoiceOut.from_row(row, items)
+    result = InvoiceOut.from_row(row, items)
+    result.payments = [dict(p) for p in repo.list_invoice_payments(invoice_id)]
+    return result
 
 
 @router.get("", response_model=list[InvoiceOut])
@@ -34,13 +37,13 @@ def list_invoices(
     current_user: CurrentUser,
     repo: RepoDep,
     client_id: int | None = None,
+    _: dict = require_permission("facturas", "ver"),
 ) -> list[InvoiceOut]:
     rows = repo.list_invoices(client_id=client_id)
     result = []
     for row in rows:
         inv_id = int(row["id"])
-        items = [InvoiceItemOut.from_row(r) for r in repo.get_invoice_items(inv_id)]
-        result.append(InvoiceOut.from_row(row, items))
+        result.append(_load(repo, inv_id))
     return result
 
 
@@ -55,6 +58,7 @@ def unbilled_items(
     current_user: CurrentUser,
     repo: RepoDep,
     case_id: int | None = None,
+    _: dict = require_permission("facturas", "ver"),
 ) -> UnbilledItems:
     data = repo.get_unbilled_items(client_id, case_id=case_id)
     sessions = [
@@ -73,6 +77,12 @@ def unbilled_items(
             due_date=r.get("due_date"),
             case_title=r.get("case_title"),
             case_id=r.get("case_id"),
+            monto_adicional_cents=r['monto_adicional_cents'],
+            costo_real_cents=r['costo_real_cents'],
+            costo_es_reembolsable=r['costo_es_reembolsable'],
+            cobro_anticipado=r['cobro_anticipado'],
+            completed_at=r.get('completed_at'),
+            completed_notes=r.get('completed_notes'),
         )
         for r in data["tasks"]
     ]
@@ -97,11 +107,11 @@ def unbilled_items(
         )
         for r in data.get("time_entries", [])
     ]
-    return UnbilledItems(sessions=sessions, tasks=tasks, costs=costs, time_entries=time_entries)
+    return UnbilledItems(sessions=sessions, tasks=tasks, costs=costs, time_entries=time_entries, summary=data.get("summary"))
 
 
 @router.get("/{invoice_id}", response_model=InvoiceOut)
-def get_invoice(invoice_id: int, current_user: CurrentUser, repo: RepoDep) -> InvoiceOut:
+def get_invoice(invoice_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("facturas", "ver")) -> InvoiceOut:
     return _load(repo, invoice_id)
 
 
@@ -166,8 +176,6 @@ def update_status(
     if not repo.get_invoice(invoice_id):
         raise HTTPException(404, "Factura no encontrada")
     repo.update_invoice_status(invoice_id, body.status)
-    if body.status == "Pagada":
-        repo.auto_income_from_invoice(invoice_id)
     return _load(repo, invoice_id)
 
 
@@ -176,3 +184,17 @@ def delete_invoice(invoice_id: int, current_user: CurrentUser, repo: RepoDep, _:
     if not repo.get_invoice(invoice_id):
         raise HTTPException(404, "Factura no encontrada")
     repo.delete_invoice(invoice_id)
+
+
+@router.get("/{invoice_id}/credits")
+def invoice_credits(invoice_id: int, current_user: CurrentUser, repo: RepoDep,
+                    _: dict = require_permission("facturas", "ver")):
+    return repo.available_invoice_credits(invoice_id)
+
+
+@router.post("/{invoice_id}/payments", response_model=InvoiceOut)
+def register_payment(invoice_id: int, body: InvoicePaymentIn, current_user: CurrentUser, repo: RepoDep,
+                     _: dict = require_permission("facturas", "editar"),
+                     __: dict = require_permission("flujo_caja", "crear")):
+    repo.register_invoice_payment(invoice_id, **body.model_dump(), username=current_user['username'])
+    return _load(repo, invoice_id)

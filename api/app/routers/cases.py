@@ -64,7 +64,12 @@ def case_choices(current_user: CurrentUser, repo: RepoDep, client_id: int | None
 def create_case(body: CaseIn, current_user: CurrentUser, repo: RepoDep) -> CaseOut:
     if not current_user["is_admin"] and "expedientes.crear" not in current_user["permissions"]:
         raise HTTPException(403, "Sin permiso: expedientes.crear")
-    case_id = repo.create_case(
+    if body.tareas_iniciales and not current_user['is_admin'] and 'tareas.crear' not in current_user['permissions']:
+        raise HTTPException(403, 'Sin permiso: tareas.crear')
+    case_id = repo.open_case(
+        alcance=body.alcance, condiciones_cobro=body.condiciones_cobro,
+        revision_confirmada=body.revision_confirmada, revision_observaciones=body.revision_observaciones,
+        username=current_user['username'],
         client_id=body.client_id,
         title=body.title,
         status=body.status,
@@ -81,6 +86,7 @@ def create_case(body: CaseIn, current_user: CurrentUser, repo: RepoDep) -> CaseO
         honorarios_contratados_text=str(body.honorarios_contratados) if body.honorarios_contratados is not None else "",
         costos_directos_estimados_text=str(body.costos_directos_estimados) if body.costos_directos_estimados is not None else "",
         mes_cobro_esperado=body.mes_cobro_esperado,
+        probabilidad_cobro=body.probabilidad_cobro,
         estado_cobro=body.estado_cobro,
         fecha_cierre_estimada=body.fecha_cierre_estimada,
         proxima_accion=body.proxima_accion,
@@ -97,6 +103,12 @@ def create_case(body: CaseIn, current_user: CurrentUser, repo: RepoDep) -> CaseO
 def update_case(case_id: int, body: CaseUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseOut:
     if not current_user["is_admin"] and "expedientes.editar" not in current_user["permissions"]:
         raise HTTPException(403, "Sin permiso: expedientes.editar")
+    repo.validate_collection_plan(body.mes_cobro_esperado, body.probabilidad_cobro, body.opened_at)
+    existing = repo.get_case(case_id)
+    if body.service_id != existing['service_id']:
+        if not body.service_id:
+            raise ValueError('Selecciona un servicio activo')
+        repo.require_active_service(body.service_id)
     repo.update_case(
         case_id,
         title=body.title,
@@ -114,6 +126,7 @@ def update_case(case_id: int, body: CaseUpdate, current_user: CurrentUser, repo:
         honorarios_contratados_text=str(body.honorarios_contratados) if body.honorarios_contratados is not None else "",
         costos_directos_estimados_text=str(body.costos_directos_estimados) if body.costos_directos_estimados is not None else "",
         mes_cobro_esperado=body.mes_cobro_esperado,
+        probabilidad_cobro=body.probabilidad_cobro,
         estado_cobro=body.estado_cobro,
         fecha_cierre_estimada=body.fecha_cierre_estimada,
         fecha_cierre_real=body.fecha_cierre_real,
@@ -179,6 +192,20 @@ def list_all_tasks(
     ]
 
 
+@router.get('/tasks/{task_id}/historial')
+def task_history(task_id: int, current_user: CurrentUser, repo: RepoDep,
+                 _: dict = require_permission('tareas','ver')):
+    _tarea(repo, task_id)
+    return repo.workflow_history('task', task_id)
+
+
+@router.get('/{case_id}/historial')
+def case_history(case_id: int, current_user: CurrentUser, repo: RepoDep,
+                 _: dict = require_permission('expedientes','ver')):
+    repo.get_case(case_id)
+    return repo.workflow_history('case',case_id)
+
+
 @router.get("/{case_id}/tasks", response_model=list[CaseTaskOut])
 def list_tasks(case_id: int, current_user: CurrentUser, repo: RepoDep) -> list[CaseTaskOut]:
     return [CaseTaskOut.from_row(row) for row in repo.list_case_tasks(case_id)]
@@ -200,6 +227,7 @@ def create_task(case_id: int, body: CaseTaskIn, current_user: CurrentUser, repo:
         costo_account_id=body.costo_account_id,
         costo_es_reembolsable=body.costo_es_reembolsable,
         autorizado_por=body.autorizado_por,
+        cobro_anticipado=body.cobro_anticipado,
         fecha_autorizacion=body.fecha_autorizacion,
         costo_estimado_text=str(body.costo_estimado) if body.costo_estimado is not None else "0",
         asignados=body.asignados,
@@ -229,6 +257,7 @@ def update_task(task_id: int, body: CaseTaskUpdate, current_user: CurrentUser, r
         costo_account_id=body.costo_account_id,
         costo_es_reembolsable=body.costo_es_reembolsable,
         autorizado_por=body.autorizado_por,
+        cobro_anticipado=body.cobro_anticipado,
         fecha_autorizacion=body.fecha_autorizacion,
         completed_at=body.completed_at,
         costo_estimado_text=str(body.costo_estimado) if body.costo_estimado is not None else None,
@@ -241,7 +270,8 @@ def update_task(task_id: int, body: CaseTaskUpdate, current_user: CurrentUser, r
 
 
 @router.patch("/tasks/{task_id}/critico", response_model=CaseTaskOut)
-def set_task_critico(task_id: int, body: CaseTaskCriticoUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
+def set_task_critico(task_id: int, body: CaseTaskCriticoUpdate, current_user: CurrentUser, repo: RepoDep,
+                     _: dict = require_permission('tareas','editar')) -> CaseTaskOut:
     repo.set_case_task_critico(task_id, body.es_critico)
     return CaseTaskOut.from_row(_tarea(repo, task_id))
 
@@ -255,7 +285,8 @@ def set_task_responsible(task_id: int, body: CaseTaskResponsibleUpdate, current_
 
 
 @router.patch("/tasks/{task_id}/done", response_model=CaseTaskOut)
-def set_task_done(task_id: int, body: CaseTaskDone, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
+def set_task_done(task_id: int, body: CaseTaskDone, current_user: CurrentUser, repo: RepoDep,
+                  _: dict = require_permission('tareas','editar')) -> CaseTaskOut:
     repo.set_case_task_done(task_id, body.done, body.completed_notes, username=current_user["username"])
     return CaseTaskOut.from_row(_tarea(repo, task_id))
 
@@ -286,8 +317,9 @@ def cerrar_task(task_id: int, body: CaseTaskCierreIn, current_user: CurrentUser,
 
 
 @router.patch("/tasks/{task_id}/notes", response_model=CaseTaskOut)
-def update_task_notes(task_id: int, body: CaseTaskNotesUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
-    repo.update_case_task_notes(task_id, body.notes, body.completed_notes)
+def update_task_notes(task_id: int, body: CaseTaskNotesUpdate, current_user: CurrentUser, repo: RepoDep,
+                      _: dict = require_permission('tareas','editar')) -> CaseTaskOut:
+    repo.update_case_task_notes(task_id, body.notes, body.completed_notes, username=current_user['username'])
     return CaseTaskOut.from_row(_tarea(repo, task_id))
 
 

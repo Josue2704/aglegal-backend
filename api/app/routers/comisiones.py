@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 from aglegal.db import now_iso
 
@@ -60,3 +61,35 @@ def revertir_comision(commission_id: int, current_user: CurrentUser, repo: RepoD
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
     return ComisionOut.from_row(row)
+
+
+class RevisionComisionIn(BaseModel):
+    evidencia: str
+    elegible: bool
+
+
+class LiquidacionComisionIn(BaseModel):
+    commission_ids: list[int]
+    payment_date: str
+    reference: str
+    account_id: int | None = None
+    request_key: str = Field(min_length=1)
+
+
+@router.post('/{commission_id}/revision', response_model=ComisionOut)
+def revisar(commission_id: int, body: RevisionComisionIn, current_user: CurrentUser, repo: RepoDep,
+            _: dict = require_permission('comisiones','aprobar')):
+    return ComisionOut.from_row(repo.approve_commission(commission_id, evidence=body.evidencia,
+        eligible=body.elegible, actor=current_user['username']))
+
+
+@router.get('/liquidaciones')
+def liquidaciones(current_user: CurrentUser, repo: RepoDep,
+                  _: dict = require_permission('comisiones','ver')):
+    return repo.list_commission_settlements()
+
+
+@router.post('/liquidaciones')
+def liquidar(body: LiquidacionComisionIn, current_user: CurrentUser, repo: RepoDep,
+             _: dict = require_permission('comisiones','pagar')):
+    return repo.settle_commissions(**body.model_dump(), actor=current_user['username'])

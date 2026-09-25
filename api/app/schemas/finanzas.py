@@ -299,9 +299,11 @@ class CarteraPonderadaOut(BaseModel):
 
 
 class ProyeccionCierreMesOut(BaseModel):
+    expedientes_sin_plan: list[dict] = []
     mes: str
     cobrado_mes: float
     cartera_ponderada_mes: float
+    proyeccion_comercial: float
     proyeccion_cierre: float
     meta_ingresos: float
     cumplimiento_proyectado_pct: float | None
@@ -313,6 +315,8 @@ class ProyeccionCierreMesOut(BaseModel):
             cobrado_mes=d["cobrado_mes_cents"] / 100,
             cartera_ponderada_mes=d["cartera_ponderada_mes_cents"] / 100,
             proyeccion_cierre=d["proyeccion_cierre_cents"] / 100,
+            proyeccion_comercial=d["proyeccion_comercial_cents"] / 100,
+            expedientes_sin_plan=d['expedientes_sin_plan'],
             meta_ingresos=d["meta_ingresos_cents"] / 100,
             cumplimiento_proyectado_pct=d["cumplimiento_proyectado_pct"],
         )

@@ -124,7 +124,7 @@ def test_borrar_la_tarea_revierte_cobro_y_costo(repo, catalogo, codigo_unico):
 
 def test_la_tarea_llega_a_la_factura_con_su_monto(repo, catalogo):
     cid = _caso(repo, catalogo)
-    _tarea(repo, cid, title="Escrito adicional", monto_adicional_text="120", autorizado_por="Cliente")
+    _tarea(repo, cid, title="Escrito adicional", monto_adicional_text="120", autorizado_por="Cliente", estado="Hecha")
     partidas = repo.get_unbilled_items(catalogo["cliente_id"], cid)
     tarea = next(t for t in partidas["tasks"] if t["title"] == "Escrito adicional")
     assert tarea["monto_adicional_cents"] == 12_000

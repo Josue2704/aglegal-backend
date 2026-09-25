@@ -4,6 +4,8 @@ Cada prueba falla con el comportamiento anterior a la corrección."""
 from __future__ import annotations
 
 import pytest
+from datetime import date
+import uuid
 
 from aglegal.db import now_iso
 
@@ -104,12 +106,12 @@ def test_comision_revertida_no_sube_el_tramo_de_la_siguiente(repo, catalogo):
     assert repo.list_comisiones(income_id=i2)[0]["comision_cents"] == 10_000  # 10%, no 12%
 
 
-def test_oportunidad_ganada_por_andrea_nace_con_originadora_y_honorarios(repo, catalogo, codigo_unico):
+def test_oportunidad_ganada_por_andrea_nace_con_originadora_y_honorarios(repo, catalogo, codigo_unico, apertura):
     repo.create_persona(persona=f"Andrea Auditoria{codigo_unico}", mes_inicio="2026-01", created_at=now_iso())
     op = repo.create_oportunidad(client_id=catalogo["cliente_id"], service_id=catalogo["servicio_id"],
                                  canal_captacion="Referido", origen_negocio="Andrea", created_at=now_iso(),
                                  honorarios_estimados_text="1500")
-    case_id = repo.transition_oportunidad(op, nuevo_estado="Ganado")
+    case_id = repo.transition_oportunidad(op, nuevo_estado="Ganado", **dict(apertura, honorarios_pactados=1500))
     originadores = repo.list_negocio_originadores(case_id)
     assert [o["persona_nombre"] for o in originadores] == [f"Andrea Auditoria{codigo_unico}"]
     assert originadores[0]["tipo_origen"] == "Cliente nuevo"
@@ -203,16 +205,16 @@ def test_expediente_sin_movimientos_si_se_puede_purgar(repo, catalogo):
 
 # ── Factura pagada → cobro ──────────────────────────────────────────────────
 
-def test_factura_pagada_genera_cobro_con_cuenta_y_comision(repo, catalogo):
+def test_registrar_pago_genera_cobro_con_cuenta_y_comision(repo, catalogo):
     cid = _caso(repo, catalogo, honorarios="1000")
     _originadora(repo, catalogo, cid)
     inv = repo.conn.execute(
         "INSERT INTO invoices(invoice_number, client_id, case_id, invoice_date, status, total_cents, created_at) "
-        "VALUES(%s,%s,%s,%s,'Pagada',%s,%s) RETURNING id",
+        "VALUES(%s,%s,%s,%s,'Enviada',%s,%s) RETURNING id",
         (f"AUD-{catalogo['cliente_id']}", catalogo["cliente_id"], cid, f"{MES}-15", 40_000, now_iso()),
     ).fetchone()["id"]
     repo.conn.commit()
-    repo.auto_income_from_invoice(inv)
+    repo.register_invoice_payment(inv,amount=400,income_date=date.today().isoformat(),account_id=catalogo['cuenta_id'],request_key=uuid.uuid4().hex)
     income = repo.conn.execute("SELECT * FROM incomes WHERE invoice_id=%s", (inv,)).fetchone()
     assert income["account_id"] is not None and income["case_id"] == cid
     assert _neto_comisiones(repo, cid) == 4_000

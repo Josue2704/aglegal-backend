@@ -3,6 +3,7 @@
 Antes una tarea era una línea de checklist: título, fecha y listo. Un expediente de
 divorcio nacía vacío y el abogado tecleaba los mismos doce pasos cada vez."""
 from __future__ import annotations
+from datetime import date
 
 import pytest
 
@@ -139,15 +140,15 @@ def test_cerrar_la_tarea_guarda_fecha_real_costo_final_y_resultado(repo, catalog
         account_code=f"EGR-{codigo_unico}-031", tipo="Egreso", grupo="Transporte", nombre="Viáticos",
         naturaleza="Variable", centro_costo="Operación jurídica", created_at=now_iso(),
     )
-    tid = repo.create_case_task(case_id=caso, title="Ir al CNR", due_date=f"{MES}-10",
+    tid = repo.create_case_task(case_id=caso, title="Ir al CNR", due_date=date.today().isoformat(),
                                 created_at=now_iso(), costo_estimado_text="20", username="admin")
 
-    repo.cerrar_case_task(tid, completed_at=f"{MES}-12", completed_notes="Certificación literal obtenida",
+    repo.cerrar_case_task(tid, completed_at=date.today().isoformat(), completed_notes="Certificación literal obtenida",
                           costo_real_text="28", costo_account_id=cuenta, username="gsanchez")
 
     tarea = next(t for t in repo.list_case_tasks(caso) if t["id"] == tid)
     assert tarea["done"] == 1 and tarea["estado"] == "Hecha"
-    assert tarea["completed_at"] == f"{MES}-12" and tarea["completed_by"] == "gsanchez"
+    assert tarea["completed_at"] == date.today().isoformat() and tarea["completed_by"] == "gsanchez"
     assert tarea["completed_notes"] == "Certificación literal obtenida"
     assert tarea["costo_estimado_cents"] == 2_000 and tarea["costo_real_cents"] == 2_800
     # El costo real llega a Flujo de caja con su cuenta, como cualquier gasto del expediente.

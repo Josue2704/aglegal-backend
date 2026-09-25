@@ -42,6 +42,11 @@ class TramoComisionOut(BaseModel):
 
 
 class ComisionOut(BaseModel):
+    estado: str = 'Calculada'
+    evidencia: str = ''
+    aprobado_por: str | None = None
+    aprobado_at: str | None = None
+    liquidacion_id: int | None = None
     id: int
     income_id: int | None  # NULL si el cobro fue eliminado — la comisión queda en el historial
     income_date: str | None

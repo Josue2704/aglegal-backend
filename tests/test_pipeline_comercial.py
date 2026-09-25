@@ -22,14 +22,14 @@ def _oportunidad_prospecto(repo, catalogo, **kw):
     return repo.create_oportunidad(**datos)
 
 
-def test_ganar_un_prospecto_lo_registra_como_cliente_y_abre_el_expediente(repo, catalogo):
+def test_ganar_un_prospecto_lo_registra_como_cliente_y_abre_el_expediente(repo, catalogo, apertura):
     op = _oportunidad_prospecto(repo, catalogo, responsable_username="gsanchez")
 
     # Sin pedirlo explícitamente no se crea a nadie: el alta de cliente es una decisión.
     with pytest.raises(ValueError, match="registrarlo como cliente"):
         repo.transition_oportunidad(op, nuevo_estado="Ganado")
 
-    case_id = repo.transition_oportunidad(op, nuevo_estado="Ganado", crear_cliente=True, cliente_documento="04567890-1")
+    case_id = repo.transition_oportunidad(op, nuevo_estado="Ganado", crear_cliente=True, **apertura, cliente_documento="04567890-1")
     caso = repo.get_case(case_id)
     cliente = repo.conn.execute("SELECT * FROM clients WHERE id=%s", (caso["client_id"],)).fetchone()
 
@@ -37,14 +37,14 @@ def test_ganar_un_prospecto_lo_registra_como_cliente_y_abre_el_expediente(repo, 
     assert cliente["phone"] == "7777-1234"          # el contacto capturado al primer toque
     assert cliente["id_number"] == "04567890-1"
     assert caso["honorarios_contratados_cents"] == 90_000
-    assert caso["responsible_username"] == "gsanchez"
+    assert caso["responsible_username"] == "admin"
     # La oportunidad queda ligada al cliente recién creado, no huérfana como prospecto.
     assert repo.get_oportunidad(op)["client_id"] == cliente["id"]
 
 
-def test_el_email_del_prospecto_no_se_guarda_como_telefono(repo, catalogo):
+def test_el_email_del_prospecto_no_se_guarda_como_telefono(repo, catalogo, apertura):
     op = _oportunidad_prospecto(repo, catalogo, prospecto_nombre="Luis Pineda", prospecto_contacto="luis@correo.sv")
-    case_id = repo.transition_oportunidad(op, nuevo_estado="Ganado", crear_cliente=True)
+    case_id = repo.transition_oportunidad(op, nuevo_estado="Ganado", crear_cliente=True, **apertura)
     cliente = repo.conn.execute(
         "SELECT * FROM clients WHERE id=(SELECT client_id FROM cases WHERE id=%s)", (case_id,)
     ).fetchone()

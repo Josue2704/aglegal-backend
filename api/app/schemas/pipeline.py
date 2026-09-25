@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+from .case import TareaInicialIn
 
 
 class OportunidadIn(BaseModel):
@@ -41,6 +42,17 @@ class OportunidadTransicion(BaseModel):
     cliente_telefono: str = ""
     cliente_email: str = ""
     responsable_expediente: str = ""
+    client_id_existente: int | None = None
+    originador_id: int | None = None
+    honorarios_pactados: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    alcance: str = ""
+    condiciones_cobro: str = ""
+    revision_confirmada: bool = False
+    revision_observaciones: str = ""
+    opposing_party: str = ""
+    mes_cobro_esperado: str | None = None
+    probabilidad_cobro: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    tareas_iniciales: list[TareaInicialIn] = []
 
 
 class OportunidadOut(BaseModel):

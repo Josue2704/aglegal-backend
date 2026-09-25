@@ -296,7 +296,7 @@ def ticket_promedio(
 
 @router.get("/ingresos-por-origen")
 def ingresos_por_origen(
-    current_user: CurrentUser, repo: RepoDep, desde: str, hasta: str,
+    current_user: CurrentUser, repo: RepoDep, desde: str, hasta: str, agrupar_por: str = "originador",
     _: dict = require_permission("finanzas", "ver"),
 ) -> list[dict]:
     """KPI-015 — ingresos y utilidad directa por originador del negocio y tipo de origen."""
@@ -308,7 +308,7 @@ def ingresos_por_origen(
             "utilidad_directa": r["utilidad_directa_cents"] / 100,
             "margen_pct": r["margen_pct"],
         }
-        for r in repo.ingresos_por_origen(desde=desde, hasta=hasta)
+        for r in repo.ingresos_por_origen(desde=desde, hasta=hasta, agrupar_por=agrupar_por)
     ]
 
 

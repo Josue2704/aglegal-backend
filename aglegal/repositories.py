@@ -13,6 +13,9 @@ import uuid
 from psycopg2.extras import Json
 
 from .db import now_iso
+from .billing import BillingRepository
+from .financial_workflow import FinancialWorkflowRepository
+from .workflow import workflow_atomic, record_event
 from .payroll_engine import PayrollConfig, calcular_aguinaldo, calcular_indemnizacion, calcular_planilla, calcular_vacaciones
 from .security import hash_password, verify_password
 
@@ -137,7 +140,7 @@ class DashboardSummary:
         return self.total_incomes_cents - self.total_expenses_cents
 
 
-class Repository:
+class Repository(FinancialWorkflowRepository, BillingRepository):
     def __init__(self, conn: Any):
         self.conn = conn
 
@@ -260,6 +263,7 @@ class Repository:
             (int(case_id), int(case_id)),
         ).fetchall())
 
+    @workflow_atomic
     def create_client(
         self,
         *,
@@ -516,6 +520,7 @@ class Repository:
         start_time: str | None = None,
         end_time: str | None = None,
     ) -> None:
+        self.conn.execute('SELECT pg_advisory_xact_lock(74185245)')
         if status not in SESSION_STATUSES:
             raise ValueError("Estado inválido")
         self.conn.execute(
@@ -534,6 +539,7 @@ class Repository:
         self.conn.commit()
 
     def delete_session(self, session_id: int, *, username: str = "") -> None:
+        self.conn.execute('SELECT pg_advisory_xact_lock(74185245)')
         factura = self._factura_viva_de("sessions", session_id)
         if factura:
             raise ValueError(
@@ -613,12 +619,14 @@ class Repository:
     # --- Incomes
     _INCOME_SELECT = (
         "SELECT i.*, c.name AS client_name, "
-        "cs.title AS case_title, inv.invoice_number, "
+        "cs.title AS case_title, COALESCE(ap.invoice_number,inv.invoice_number) AS invoice_number, "
         "ac.account_code, ac.nombre AS account_nombre, sv.service_code, sv.nombre AS service_nombre "
         "FROM incomes i "
         "LEFT JOIN clients c ON c.id=i.client_id "
         "LEFT JOIN cases cs ON cs.id=i.case_id "
         "LEFT JOIN invoices inv ON inv.id=i.invoice_id "
+        "LEFT JOIN LATERAL (SELECT string_agg(DISTINCT f.invoice_number, ', ') AS invoice_number "
+        "FROM invoice_payments p JOIN invoices f ON f.id=p.invoice_id WHERE p.income_id=i.id AND p.released_at IS NULL) ap ON TRUE "
         "LEFT JOIN plan_cuentas ac ON ac.id=i.account_id "
         "LEFT JOIN servicios sv ON sv.id=i.service_id "
     )
@@ -631,6 +639,7 @@ class Repository:
         sql = f"{self._INCOME_SELECT} {where} ORDER BY i.income_date DESC, i.id DESC"
         return list(self.conn.execute(sql, params).fetchall())
 
+    @workflow_atomic
     def create_income(
         self,
         *,
@@ -648,7 +657,10 @@ class Repository:
         monto_reembolsable_text: str = "",
         monto_fondos_terceros_text: str = "",
         es_ajuste: bool = False,
+        commit: bool = True,
     ) -> int:
+        if invoice_id is not None:
+            raise ValueError('Usa Registrar pago en la factura para aplicar el ingreso con su clasificación')
         amount_cents = _to_cents(amount_text)
         resolved_detail = (detail or concept or "").strip()
         resolved_concept = resolved_detail or "(Sin detalle)"
@@ -685,13 +697,18 @@ class Repository:
         income_id = int(cur.lastrowid)
         # Comisión al cobrarse efectivamente el honorario (12_Reglas_Comision) — en la misma
         # transacción que el cobro, venga de la pantalla de Ingresos o de una factura pagada.
-        self.reconocer_comision_income(income_id, created_at=created_at, commit=False)
-        self.conn.commit()
+        if case_id and self.conn.execute('SELECT 1 FROM incomes WHERE case_id=%s AND (income_date,id)>(%s,%s)',(case_id,income_date,income_id)).fetchone():
+            self._resincronizar_comisiones_caso(case_id, revertir=True, created_at=created_at)
+        else:
+            self.reconocer_comision_income(income_id, created_at=created_at, commit=False)
+        if commit:
+            self.conn.commit()
         return income_id
 
     def get_income(self, income_id: int) -> Any | None:
         return self.conn.execute(f"{self._INCOME_SELECT} WHERE i.id=%s", (int(income_id),)).fetchone()
 
+    @workflow_atomic
     def update_income(
         self,
         income_id: int,
@@ -708,6 +725,7 @@ class Repository:
         monto_fondos_terceros_text: str = "",
         es_ajuste: bool = False,
     ) -> None:
+        self.guard_allocated_income(income_id)
         anterior = self.conn.execute("SELECT * FROM incomes WHERE id=%s", (int(income_id),)).fetchone()
         if not anterior:
             raise ValueError("Ingreso no encontrado")
@@ -751,14 +769,25 @@ class Repository:
             int(anterior["monto_neto_operativo_cents"] or 0) != neto_cents
             or (anterior["case_id"] or None) != (int(case_id) if case_id else None)
             or str(anterior["income_date"])[:7] != str(income_date)[:7]
+            or (str(anterior['income_date']) != str(income_date) and bool(self.conn.execute(
+                'SELECT 1 FROM incomes WHERE case_id=%s AND id<>%s AND income_date BETWEEN %s AND %s',
+                (case_id, income_id, min(str(anterior['income_date']), income_date), max(str(anterior['income_date']), income_date)),
+            ).fetchone()))
         )
         ahora = now_iso()
         if cambio_relevante:
             self._revertir_comisiones_income(int(income_id), motivo=f"Corrección del cobro #{income_id}", created_at=ahora)
-        self.reconocer_comision_income(int(income_id), created_at=ahora, commit=False)
+        if cambio_relevante:
+            for cid in {anterior['case_id'], case_id} - {None}:
+                self._resincronizar_comisiones_caso(cid, revertir=True, created_at=ahora)
+        else:
+            self.reconocer_comision_income(int(income_id), created_at=ahora, commit=False)
         self.conn.commit()
 
+    @workflow_atomic
     def delete_income(self, income_id: int) -> None:
+        previous = self.get_income(income_id)
+        self.guard_allocated_income(income_id)
         # La comisión de un cobro eliminado no desaparece: se revierte con un ajuste negativo y
         # la fila original queda en el historial (income_id pasa a NULL por la FK).
         self._revertir_comisiones_income(int(income_id), motivo=f"Cobro #{income_id} eliminado", created_at=now_iso())
@@ -770,6 +799,8 @@ class Repository:
                 "UPDATE invoices SET status='Enviada' WHERE id=%s AND status='Pagada'", (int(fila["invoice_id"]),)
             )
         self.conn.execute("DELETE FROM incomes WHERE id = %s", (int(income_id),))
+        if previous and previous["case_id"]:
+            self._resincronizar_comisiones_caso(previous["case_id"], revertir=True, created_at=now_iso())
         self.conn.commit()
 
     def _servicio_del_movimiento(self, service_id: int | None, case_id: int | None) -> int | None:
@@ -876,6 +907,7 @@ class Repository:
     def get_expense(self, expense_id: int) -> Any | None:
         return self.conn.execute(f"{self._EXPENSE_SELECT} WHERE e.id=%s", (int(expense_id),)).fetchone()
 
+    @workflow_atomic
     def update_expense(
         self,
         expense_id: int,
@@ -889,6 +921,7 @@ class Repository:
         monto_reembolsable_text: str = "",
         monto_fondos_terceros_text: str = "",
     ) -> None:
+        self.guard_commission_expense(expense_id)
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
         self._validate_movement_account(account_id, expected_tipo="Egreso")
@@ -915,7 +948,9 @@ class Repository:
         )
         self.conn.commit()
 
+    @workflow_atomic
     def delete_expense(self, expense_id: int) -> None:
+        self.guard_commission_expense(expense_id)
         self.conn.execute("DELETE FROM expenses WHERE id = %s", (int(expense_id),))
         self.conn.commit()
 
@@ -935,6 +970,7 @@ class Repository:
         sql = f"{self._COST_SELECT} {where} ORDER BY co.cost_date DESC, co.id DESC"
         return list(self.conn.execute(sql, params).fetchall())
 
+    @workflow_atomic
     def create_cost(
         self,
         *,
@@ -980,12 +1016,15 @@ class Repository:
                 fondos_terceros_cents,
             ),
         )
+        if case_id:
+            self._resincronizar_comisiones_caso(case_id, revertir=True, created_at=now_iso())
         self.conn.commit()
         return int(cur.lastrowid)
 
     def get_cost(self, cost_id: int) -> Any | None:
         return self.conn.execute(f"{self._COST_SELECT} WHERE co.id=%s", (int(cost_id),)).fetchone()
 
+    @workflow_atomic
     def update_cost(
         self,
         cost_id: int,
@@ -1002,6 +1041,10 @@ class Repository:
         monto_reembolsable_text: str = "",
         monto_fondos_terceros_text: str = "",
     ) -> None:
+        previous_case = self.get_cost(cost_id)
+        self.conn.execute('SELECT pg_advisory_xact_lock(74185245)')
+        if self._factura_viva_de('costs', cost_id):
+            raise ValueError('El gasto está reservado o facturado; libera la partida antes de modificarlo')
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
         self._validate_movement_account(account_id, expected_tipo="Egreso")
@@ -1032,10 +1075,21 @@ class Repository:
                 int(cost_id),
             ),
         )
+        if case_id:
+            self._resincronizar_comisiones_caso(case_id, revertir=True, created_at=now_iso())
+        if previous_case and previous_case['case_id'] != case_id:
+            self._resincronizar_comisiones_caso(previous_case['case_id'], revertir=True, created_at=now_iso())
         self.conn.commit()
 
+    @workflow_atomic
     def delete_cost(self, cost_id: int) -> None:
+        previous_case = self.get_cost(cost_id)
+        self.conn.execute('SELECT pg_advisory_xact_lock(74185245)')
+        if self._factura_viva_de('costs', cost_id):
+            raise ValueError('El gasto está reservado o facturado; no se puede eliminar')
         self.conn.execute("DELETE FROM costs WHERE id=%s", (int(cost_id),))
+        if previous_case and previous_case['case_id']:
+            self._resincronizar_comisiones_caso(previous_case['case_id'], revertir=True, created_at=now_iso())
         self.conn.commit()
 
     def cost_totals(self, *, start_date: str | None, end_date: str | None) -> int:
@@ -1564,6 +1618,42 @@ class Repository:
             raise ValueError("Expediente no encontrado")
         return row
 
+    @workflow_atomic
+    def open_case(self, *, alcance: str, condiciones_cobro: str, revision_confirmada: bool,
+                  revision_observaciones: str, username: str, **data) -> int:
+        if not alcance.strip() or not condiciones_cobro.strip() or not revision_confirmada:
+            raise ValueError('Confirma alcance, condiciones de cobro y revisión de apertura')
+        if not data.get('service_id') or data.get('honorarios_contratados_text') in ('',None):
+            raise ValueError('Selecciona servicio y confirma los honorarios contratados')
+        self.validate_collection_plan(data.get('mes_cobro_esperado'), data.get('probabilidad_cobro'), data['opened_at'])
+        self.require_active_service(data['service_id'])
+        from .billing import cents
+        pactado = cents(data['honorarios_contratados_text'])
+        responsable = data.get('responsible_username')
+        if not responsable or not self.conn.execute('SELECT 1 FROM users WHERE username=%s AND active=1',(responsable,)).fetchone():
+            raise ValueError('Selecciona un responsable activo')
+        tareas = data.get('tareas_iniciales') or []
+        if not tareas:
+            raise ValueError('Define al menos una tarea inicial')
+        for tarea in tareas:
+            if not (tarea.get('titulo') or '').strip() or not tarea.get('due_date'):
+                raise ValueError('Cada tarea inicial necesita título y fecha')
+            date.fromisoformat(tarea['due_date'])
+            tarea['responsible_username'] = tarea.get('responsible_username') or responsable
+            if not self.conn.execute('SELECT 1 FROM users WHERE username=%s AND active=1',(tarea['responsible_username'],)).fetchone():
+                raise ValueError('Cada tarea necesita un responsable activo')
+        conflicto = self.check_conflicto_interes(data.get('opposing_party') or '')
+        if (conflicto['clientes'] or conflicto['casos']) and not revision_observaciones.strip():
+            raise ValueError('Documenta la revisión de posibles conflictos')
+        data['proxima_accion'] = data.get('proxima_accion') or tareas[0]['titulo']
+        cid = self.create_case(**data)
+        record_event(self,'case',cid,'Apertura confirmada',username,
+            {'alcance':alcance.strip(),'condiciones_cobro':condiciones_cobro.strip(),
+             'revision':revision_observaciones.strip(),'honorarios_pactados_cents':pactado,
+             'responsable':responsable,'tareas_iniciales':tareas})
+        return cid
+
+    @workflow_atomic
     def create_case(
         self,
         *,
@@ -1583,6 +1673,7 @@ class Repository:
         honorarios_contratados_text: str = "",
         costos_directos_estimados_text: str = "",
         mes_cobro_esperado: str | None = None,
+        probabilidad_cobro: float | None = None,
         estado_cobro: str = "En ejecución",
         fecha_cierre_estimada: str | None = None,
         proxima_accion: str | None = None,
@@ -1634,6 +1725,7 @@ class Repository:
             ),
         )
         case_id = int(cur.lastrowid)
+        self.save_collection_probability(case_id, probabilidad_cobro)
         # Tareas sugeridas por la plantilla del servicio, ya editadas por quien crea el
         # expediente — quedan incluidas en honorarios_contratados_cents sin recargo, por
         # eso origen='plantilla' y no pasan por create_case_task (que sí recargaría).
@@ -1658,6 +1750,7 @@ class Repository:
         self.conn.commit()
         return case_id
 
+    @workflow_atomic
     def update_case(
         self,
         case_id: int,
@@ -1677,6 +1770,7 @@ class Repository:
         honorarios_contratados_text: str = "",
         costos_directos_estimados_text: str = "",
         mes_cobro_esperado: str | None = None,
+        probabilidad_cobro: float | None = None,
         estado_cobro: str = "En ejecución",
         fecha_cierre_estimada: str | None = None,
         fecha_cierre_real: str | None = None,
@@ -1745,6 +1839,7 @@ class Repository:
                 int(case_id),
             ),
         )
+        self.save_collection_probability(case_id, probabilidad_cobro)
         self.conn.commit()
 
     def archive_case(self, case_id: int, *, archived_at: str) -> None:
@@ -1765,6 +1860,8 @@ class Repository:
     def delete_case(self, case_id: int) -> None:
         """Permanent purge — only reachable from the archived (papelera) view. Un expediente con
         movimientos financieros no se purga: se conserva archivado para no perder el histórico."""
+        if self.conn.execute('SELECT 1 FROM opportunity_conversions WHERE case_id=%s',(case_id,)).fetchone():
+            raise ValueError('Este expediente conserva una conversión comercial; archívalo para mantener el historial')
         con_movimientos = self._movimientos_financieros_de_casos("case_id=%s", (int(case_id),))
         if con_movimientos:
             raise ValueError(
@@ -1976,6 +2073,11 @@ class Repository:
         row = self.conn.execute("SELECT cost_id FROM case_tasks WHERE id=%s", (int(task_id),)).fetchone()
         cost_id = row["cost_id"] if row else None
 
+        if cost_id and self._factura_viva_de('costs', cost_id):
+            current = self.get_cost(cost_id)
+            if current['amount_cents'] != costo_cents or bool(current['monto_reembolsable_cents']) != es_reembolsable or current['account_id'] != account_id:
+                raise ValueError('El gasto de esta tarea ya está reservado o facturado')
+            return
         if costo_cents <= 0:
             if cost_id:
                 self.conn.execute("DELETE FROM costs WHERE id=%s", (int(cost_id),))
@@ -2018,6 +2120,7 @@ class Repository:
         costo_account_id: int | None = None,
         costo_es_reembolsable: bool = False,
         autorizado_por: str = "",
+        cobro_anticipado: bool | None = None,
         fecha_autorizacion: str | None = None,
         costo_estimado_text: str = "0",
         asignados: list[str] | None = None,
@@ -2057,6 +2160,7 @@ class Repository:
             ),
         )
         task_id = int(cur.lastrowid)
+        self.conn.execute("UPDATE case_tasks SET cobro_anticipado=%s WHERE id=%s", (bool(cobro_anticipado),task_id))
         self._set_asignados_tarea(task_id, asignados, created_at)
         self._set_etiquetas_tarea(task_id, etiqueta_ids)
         if monto_cents > 0:
@@ -2085,6 +2189,7 @@ class Repository:
         costo_account_id: int | None = None,
         costo_es_reembolsable: bool = False,
         autorizado_por: str = "",
+        cobro_anticipado: bool | None = None,
         fecha_autorizacion: str | None = None,
         completed_at: str | None = None,
         costo_estimado_text: str | None = None,
@@ -2094,6 +2199,7 @@ class Repository:
     ) -> None:
         """El costo casi nunca se conoce al crear la tarea, sino al volver de la diligencia:
         aquí se completa, y la diferencia de honorarios queda en la bitácora del expediente."""
+        self.conn.execute('SELECT pg_advisory_xact_lock(74185245)')
         anterior = self.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (int(task_id),)).fetchone()
         if not anterior:
             raise ValueError("Tarea no encontrada")
@@ -2114,6 +2220,8 @@ class Repository:
                     "Corrige la factura si el monto cambió."
                 )
 
+        if cobro_anticipado is not None:
+            self.conn.execute("UPDATE case_tasks SET cobro_anticipado=%s WHERE id=%s", (cobro_anticipado,task_id))
         if costo_estimado_text is not None:
             self.conn.execute(
                 "UPDATE case_tasks SET costo_estimado_cents=%s WHERE id=%s",
@@ -2167,11 +2275,20 @@ class Repository:
         )
         self.conn.commit()
 
+    @workflow_atomic
     def set_case_task_done(
         self, task_id: int, done: bool, completed_notes: str | None = None, *, username: str = "",
     ) -> None:
         """Al cerrarla se guarda la fecha real de cumplimiento y quién la cerró: la fecha
         estimada dice cuándo debía hacerse, esta dice cuándo se hizo de verdad."""
+        anterior = self.conn.execute('SELECT * FROM case_tasks WHERE id=%s FOR UPDATE',(task_id,)).fetchone()
+        if not anterior:
+            raise ValueError('Tarea no encontrada')
+        if done and not (completed_notes or '').strip():
+            raise ValueError('Escribe qué se obtuvo o cómo se resolvió antes de cerrarla')
+        record_event(self,'task',task_id,'Cerrada' if done else 'Reabierta',username,
+                     {'resultado_anterior':anterior['completed_notes'],'fecha_anterior':anterior['completed_at'],
+                      'cerrada_por':anterior['completed_by'],'resultado':completed_notes})
         self.conn.execute(
             "UPDATE case_tasks SET done=%s, completed_notes=%s, completed_at=%s, completed_by=%s, "
             "estado=CASE WHEN %s THEN 'Hecha' WHEN estado='Hecha' THEN 'Por hacer' ELSE estado END WHERE id=%s",
@@ -2186,6 +2303,7 @@ class Repository:
         )
         self.conn.commit()
 
+    @workflow_atomic
     def cerrar_case_task(
         self, task_id: int, *, completed_at: str | None = None, completed_notes: str = "",
         costo_real_text: str | None = None, costo_account_id: int | None = None,
@@ -2216,6 +2334,10 @@ class Repository:
                 username=username,
             )
         fecha = (completed_at or "").strip() or _iso_today()
+        if date.fromisoformat(fecha) > date.today():
+            raise ValueError('La fecha real de cierre no puede estar en el futuro')
+        record_event(self,'task',task_id,'Cerrada',username,
+                     {'resultado':completed_notes,'fecha':fecha,'resultado_anterior':anterior['completed_notes']})
         self.conn.execute(
             "UPDATE case_tasks SET done=1, estado='Hecha', completed_notes=%s, completed_at=%s, completed_by=%s "
             "WHERE id=%s",
@@ -2223,6 +2345,7 @@ class Repository:
         )
         self.conn.commit()
 
+    @workflow_atomic
     def set_case_task_estado(self, task_id: int, estado: str, *, username: str = "",
                              completed_notes: str | None = None) -> None:
         """Mover la tarjeta de columna. `done` y la fecha real de cierre viajan con el estado:
@@ -2239,7 +2362,20 @@ class Repository:
         self.conn.execute("UPDATE case_tasks SET estado=%s WHERE id=%s", (estado, int(task_id)))
         self.conn.commit()
 
-    def update_case_task_notes(self, task_id: int, notes: str | None, completed_notes: str | None = None) -> None:
+    def workflow_history(self, entity_type: str, entity_id: int) -> list[dict]:
+        return [dict(r) for r in self.conn.execute('SELECT * FROM workflow_events WHERE entity_type=%s AND entity_id=%s ORDER BY id DESC',
+                                                  (entity_type,entity_id)).fetchall()]
+
+    @workflow_atomic
+    def update_case_task_notes(self, task_id: int, notes: str | None, completed_notes: str | None = None, *, username: str = '') -> None:
+        anterior = self.conn.execute('SELECT * FROM case_tasks WHERE id=%s',(task_id,)).fetchone()
+        if not anterior:
+            raise ValueError('Tarea no encontrada')
+        if anterior['done'] and not (completed_notes or '').strip():
+            raise ValueError('Una tarea cerrada debe conservar su resultado')
+        record_event(self,'task',task_id,'Notas actualizadas',username,
+                     {'notas_anteriores':anterior['notes'],'resultado_anterior':anterior['completed_notes'],
+                      'notas':notes,'resultado':completed_notes})
         self.conn.execute(
             "UPDATE case_tasks SET notes=%s, completed_notes=%s WHERE id=%s",
             ((notes or "").strip() or None, (completed_notes or "").strip() or None, int(task_id)),
@@ -2248,6 +2384,7 @@ class Repository:
 
     def delete_case_task(self, task_id: int, *, username: str = "") -> None:
         # Borrar una tarea ya facturada dejaba a la factura cobrando algo que ya no existe.
+        self.conn.execute('SELECT pg_advisory_xact_lock(74185245)')
         factura = self._factura_viva_de("case_tasks", task_id)
         if factura:
             raise ValueError(
@@ -2259,6 +2396,8 @@ class Repository:
         ).fetchone()
         # El costo directo que generó la tarea se va con ella: si no, quedaría un gasto
         # huérfano en Flujo de caja sin nada que lo explique.
+        if row and row["cost_id"] and self._factura_viva_de("costs", row["cost_id"]):
+            raise ValueError("El gasto de esta tarea está reservado o facturado")
         if row and row["cost_id"]:
             self.conn.execute("DELETE FROM costs WHERE id=%s", (int(row["cost_id"]),))
         self.conn.execute("DELETE FROM case_tasks WHERE id=%s", (int(task_id),))
@@ -2303,6 +2442,7 @@ class Repository:
         return int(cur.lastrowid)
 
     def delete_case_time_entry(self, entry_id: int) -> None:
+        self.conn.execute('SELECT pg_advisory_xact_lock(74185245)')
         self.conn.execute("DELETE FROM case_time_entries WHERE id=%s", (int(entry_id),))
         self.conn.commit()
 
@@ -2889,387 +3029,6 @@ class Repository:
         self.conn.commit()
 
     # --- Invoices
-
-    def list_invoices(self, client_id: int | None = None) -> list:
-        if client_id is not None:
-            return self.conn.execute(
-                """SELECT i.*, cl.name AS client_name, ca.title AS case_title,
-                          EXISTS(SELECT 1 FROM incomes WHERE invoice_id = i.id) AS has_income
-                   FROM invoices i
-                   LEFT JOIN clients cl ON cl.id = i.client_id
-                   LEFT JOIN cases ca ON ca.id = i.case_id
-                   WHERE i.client_id = %s
-                   ORDER BY i.id DESC""",
-                (client_id,),
-            ).fetchall()
-        return self.conn.execute(
-            """SELECT i.*, cl.name AS client_name, ca.title AS case_title,
-                      EXISTS(SELECT 1 FROM incomes WHERE invoice_id = i.id) AS has_income
-               FROM invoices i
-               LEFT JOIN clients cl ON cl.id = i.client_id
-               LEFT JOIN cases ca ON ca.id = i.case_id
-               ORDER BY i.id DESC"""
-        ).fetchall()
-
-    def get_invoice(self, invoice_id: int):
-        return self.conn.execute(
-            """SELECT i.*, cl.name AS client_name, ca.title AS case_title,
-                      EXISTS(SELECT 1 FROM incomes WHERE invoice_id = i.id) AS has_income
-               FROM invoices i
-               LEFT JOIN clients cl ON cl.id = i.client_id
-               LEFT JOIN cases ca ON ca.id = i.case_id
-               WHERE i.id = %s""",
-            (invoice_id,),
-        ).fetchone()
-
-    def get_invoice_items(self, invoice_id: int) -> list:
-        return self.conn.execute(
-            "SELECT * FROM invoice_items WHERE invoice_id = %s ORDER BY id",
-            (invoice_id,),
-        ).fetchall()
-
-    def next_invoice_number(self) -> str:
-        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM invoices").fetchone()
-        n = int(row["cnt"]) + 1
-        return f"FAC-{n:04d}"
-
-    # Un expediente puede tener varios en un mismo cliente; sin esto, el selector de
-    # "no facturado" traía partidas de CUALQUIER expediente del cliente y nada impedía
-    # que terminaran en la factura de otro — el `case_id` de la factura era solo
-    # metadata decorativa, no un filtro real.
-    _TABLA_POR_ENTIDAD = {
-        "session": ("sessions", "la cita"),
-        "case_task": ("case_tasks", "la tarea"),
-        "time_entry": ("case_time_entries", "el registro de horas"),
-        "cost": ("costs", "el costo"),
-    }
-
-    def _factura_viva_de(self, tabla: str, entidad_id: int) -> Any | None:
-        """La factura no cancelada que ya cobra esta partida, si la hay."""
-        fila = self.conn.execute(f"SELECT invoice_id FROM {tabla} WHERE id=%s", (int(entidad_id),)).fetchone()
-        if not fila or not fila["invoice_id"]:
-            return None
-        factura = self.conn.execute(
-            "SELECT id, invoice_number, status FROM invoices WHERE id=%s", (int(fila["invoice_id"]),)
-        ).fetchone()
-        if factura and str(factura["status"]) != "Cancelada":
-            return factura
-        return None
-
-    def _validate_items_facturables(self, invoice_id: int | None, items: list[dict]) -> None:
-        """Que cada partida exista, sea de un tipo conocido y no esté ya en otra factura viva."""
-        for it in items:
-            et, eid = it.get("entity_type"), it.get("entity_id")
-            if not et and not eid:
-                continue  # partida escrita a mano, sin origen
-            if et not in ENTIDADES_FACTURABLES:
-                raise ValueError(
-                    f"Tipo de partida desconocido: '{et}'. Una factura solo puede cobrar "
-                    f"{', '.join(sorted(ENTIDADES_FACTURABLES))}."
-                )
-            tabla, etiqueta = self._TABLA_POR_ENTIDAD[et]
-            fila = self.conn.execute(
-                f"SELECT invoice_id FROM {tabla} WHERE id=%s", (int(eid),)
-            ).fetchone()
-            if not fila:
-                raise ValueError(f"No se encontró {etiqueta} #{eid} que la factura intenta cobrar.")
-            otra = fila["invoice_id"]
-            if otra and (invoice_id is None or int(otra) != int(invoice_id)):
-                previa = self.conn.execute(
-                    "SELECT invoice_number, status FROM invoices WHERE id=%s", (int(otra),)
-                ).fetchone()
-                if previa and str(previa["status"]) != "Cancelada":
-                    raise ValueError(
-                        f"{etiqueta.capitalize()} #{eid} ya está cobrada en la factura "
-                        f"{previa['invoice_number']}. Cancélala o quítala de esa factura primero."
-                    )
-
-    def _validate_items_belong_to_case(self, case_id: int | None, items: list[dict]) -> None:
-        if case_id is None:
-            return
-        by_type: dict[str, list[int]] = {}
-        for it in items:
-            et, eid = it.get("entity_type"), it.get("entity_id")
-            if et and eid:
-                by_type.setdefault(et, []).append(int(eid))
-        checks = {
-            "session": "SELECT id FROM sessions WHERE id = ANY(%s) AND case_id = %s",
-            "case_task": "SELECT id FROM case_tasks WHERE id = ANY(%s) AND case_id = %s",
-            "time_entry": "SELECT id FROM case_time_entries WHERE id = ANY(%s) AND case_id = %s",
-            "cost": "SELECT id FROM costs WHERE id = ANY(%s) AND case_id = %s",
-        }
-        for et, ids in by_type.items():
-            sql = checks.get(et)
-            if not sql:
-                continue
-            found = {int(r["id"]) for r in self.conn.execute(sql, (ids, int(case_id))).fetchall()}
-            faltantes = set(ids) - found
-            if faltantes:
-                raise ValueError(
-                    f"La factura está ligada al expediente #{case_id}, pero {et} {sorted(faltantes)} "
-                    "pertenece a otro expediente — no se puede mezclar el trabajo de dos expedientes en una factura."
-                )
-
-    def create_invoice(
-        self,
-        client_id: int,
-        case_id: int | None,
-        invoice_number: str,
-        invoice_date: str,
-        due_date: str | None,
-        notes: str | None,
-        firm_name: str | None,
-        firm_phone: str | None,
-        firm_email: str | None,
-        firm_address: str | None,
-        firm_tax_id: str | None,
-        items: list[dict],
-        created_at: str,
-    ) -> int:
-        self._validate_items_belong_to_case(case_id, items)
-        self._validate_items_facturables(None, items)
-        if self.conn.execute("SELECT 1 FROM invoices WHERE invoice_number=%s", (invoice_number,)).fetchone():
-            raise ValueError(f"Ya existe una factura con el número {invoice_number}.")
-        total_cents = sum(
-            round(float(it.get("unit_price", 0)) * float(it.get("quantity", 1)) * 100)
-            for it in items
-        )
-        cur = self.conn.execute(
-            """INSERT INTO invoices(client_id, case_id, invoice_number, invoice_date, due_date,
-               status, notes, firm_name, firm_phone, firm_email, firm_address, firm_tax_id,
-               total_cents, created_at)
-               VALUES(%s,%s,%s,%s,%s,'Borrador',%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (client_id, case_id, invoice_number, invoice_date, due_date, notes,
-             firm_name, firm_phone, firm_email, firm_address, firm_tax_id,
-             total_cents, created_at),
-        )
-        invoice_id = cur.lastrowid
-        for it in items:
-            price_cents = round(float(it.get("unit_price", 0)) * 100)
-            self.conn.execute(
-                """INSERT INTO invoice_items(invoice_id, description, quantity, unit_price_cents,
-                   entity_type, entity_id, created_at) VALUES(%s,%s,%s,%s,%s,%s,%s)""",
-                (invoice_id, it["description"], float(it.get("quantity", 1)),
-                 price_cents, it.get("entity_type"), it.get("entity_id"), created_at),
-            )
-        self._mark_billed_entities(invoice_id, items)
-        self.conn.commit()
-        return invoice_id
-
-    # Partidas "no facturadas" (sesiones, tareas, horas) se marcan con el invoice_id de
-    # la factura que las incluyó — sin esto, la misma partida seguía apareciendo como
-    # pendiente en cada factura nueva y se podía cobrar dos veces. No existía antes de
-    # esta ronda: `create_invoice`/`update_invoice` guardaban entity_type/entity_id en
-    # invoice_items pero nunca actualizaban la tabla de origen.
-    def _mark_billed_entities(self, invoice_id: int, items: list[dict]) -> None:
-        by_type: dict[str, list[int]] = {}
-        for it in items:
-            et, eid = it.get("entity_type"), it.get("entity_id")
-            if et and eid:
-                by_type.setdefault(et, []).append(int(eid))
-        if by_type.get("session"):
-            self.conn.execute("UPDATE sessions SET invoice_id=%s WHERE id = ANY(%s)", (invoice_id, by_type["session"]))
-        if by_type.get("case_task"):
-            self.conn.execute("UPDATE case_tasks SET invoice_id=%s WHERE id = ANY(%s)", (invoice_id, by_type["case_task"]))
-        if by_type.get("time_entry"):
-            self.conn.execute("UPDATE case_time_entries SET invoice_id=%s WHERE id = ANY(%s)", (invoice_id, by_type["time_entry"]))
-        if by_type.get("cost"):
-            self.conn.execute("UPDATE costs SET invoice_id=%s WHERE id = ANY(%s)", (invoice_id, by_type["cost"]))
-
-    def update_invoice(
-        self,
-        invoice_id: int,
-        invoice_number: str,
-        invoice_date: str,
-        due_date: str | None,
-        status: str,
-        notes: str | None,
-        firm_name: str | None,
-        firm_phone: str | None,
-        firm_email: str | None,
-        firm_address: str | None,
-        firm_tax_id: str | None,
-        items: list[dict],
-        created_at: str,
-    ) -> None:
-        existing = self.get_invoice(invoice_id)
-        if status not in INVOICE_STATUSES:
-            raise ValueError(f"Estado de factura inválido: use {', '.join(INVOICE_STATUSES)}")
-        self._validate_items_belong_to_case(existing["case_id"] if existing else None, items)
-        self._validate_items_facturables(int(invoice_id), items)
-        repetido = self.conn.execute(
-            "SELECT 1 FROM invoices WHERE invoice_number=%s AND id<>%s", (invoice_number, int(invoice_id))
-        ).fetchone()
-        if repetido:
-            raise ValueError(f"Ya existe otra factura con el número {invoice_number}.")
-        # Dejar de estar pagada devuelve el dinero: el cobro que la factura genero se borra.
-        if existing and str(existing["status"]) == "Pagada" and status != "Pagada":
-            self._revertir_cobro_de_factura(int(invoice_id))
-        total_cents = sum(
-            round(float(it.get("unit_price", 0)) * float(it.get("quantity", 1)) * 100)
-            for it in items
-        )
-        self.conn.execute(
-            """UPDATE invoices SET invoice_number=%s, invoice_date=%s, due_date=%s, status=%s,
-               notes=%s, firm_name=%s, firm_phone=%s, firm_email=%s, firm_address=%s,
-               firm_tax_id=%s, total_cents=%s WHERE id=%s""",
-            (invoice_number, invoice_date, due_date, status, notes,
-             firm_name, firm_phone, firm_email, firm_address, firm_tax_id,
-             total_cents, invoice_id),
-        )
-        self.conn.execute("DELETE FROM invoice_items WHERE invoice_id=%s", (invoice_id,))
-        for it in items:
-            price_cents = round(float(it.get("unit_price", 0)) * 100)
-            self.conn.execute(
-                """INSERT INTO invoice_items(invoice_id, description, quantity, unit_price_cents,
-                   entity_type, entity_id, created_at) VALUES(%s,%s,%s,%s,%s,%s,%s)""",
-                (invoice_id, it["description"], float(it.get("quantity", 1)),
-                 price_cents, it.get("entity_type"), it.get("entity_id"), created_at),
-            )
-        self._mark_billed_entities(invoice_id, items)
-        self.conn.commit()
-
-    def update_invoice_status(self, invoice_id: int, status: str) -> None:
-        if status not in INVOICE_STATUSES:
-            raise ValueError(f"Estado de factura inválido: use {', '.join(INVOICE_STATUSES)}")
-        actual = self.conn.execute("SELECT status FROM invoices WHERE id=%s", (int(invoice_id),)).fetchone()
-        if actual and str(actual["status"]) == "Pagada" and status != "Pagada":
-            # Cancelar o volver a borrador una factura cobrada tiene que devolver el dinero:
-            # antes el ingreso seguía contando en la caja y en el cumplimiento del mes.
-            self._revertir_cobro_de_factura(int(invoice_id))
-        self.conn.execute(
-            "UPDATE invoices SET status=%s WHERE id=%s", (status, invoice_id)
-        )
-        self.conn.commit()
-
-    def _revertir_cobro_de_factura(self, invoice_id: int) -> None:
-        """Borra el cobro que la factura genero al marcarse pagada (y con el, su comision).
-        Solo toca los ingresos nacidos de la factura, nunca los que alguien registro a mano."""
-        for row in self.conn.execute(
-            "SELECT id FROM incomes WHERE invoice_id=%s", (int(invoice_id),)
-        ).fetchall():
-            self._revertir_comisiones_income(int(row["id"]), motivo=f"Factura #{invoice_id} ya no está pagada",
-                                             created_at=now_iso())
-            self.conn.execute("DELETE FROM incomes WHERE id=%s", (int(row["id"]),))
-
-    def auto_income_from_invoice(self, invoice_id: int) -> None:
-        existing = self.conn.execute(
-            "SELECT id FROM incomes WHERE invoice_id=%s LIMIT 1", (invoice_id,)
-        ).fetchone()
-        if existing:
-            return
-        inv = self.get_invoice(invoice_id)
-        if not inv or not inv["total_cents"]:
-            return
-        case_id = inv.get("case_id")
-        account_id = self._cuenta_ingreso_sugerida(case_id)
-        if account_id is None:
-            raise ValueError("No hay una cuenta de ingreso activa para registrar el cobro de esta factura")
-        # Pagar la factura es un cobro real; si excede el saldo del expediente se registra
-        # igual (el dinero ya entró) pero queda marcado como ajuste, visible para revisión.
-        es_ajuste = False
-        if case_id:
-            saldo = self.saldo_pendiente_case(int(case_id))
-            es_ajuste = int(inv["total_cents"]) > saldo["saldo_pendiente_cents"]
-        self.create_income(
-            amount_text=_from_cents(int(inv["total_cents"])),
-            income_date=str(inv["invoice_date"]),
-            created_at=now_iso(),
-            client_id=inv["client_id"],
-            case_id=case_id,
-            detail=f"Factura {inv['invoice_number']} — ingreso generado automáticamente desde facturación",
-            invoice_id=invoice_id,
-            account_id=account_id,
-            es_ajuste=es_ajuste,
-        )
-
-    def _cuenta_ingreso_sugerida(self, case_id: int | None) -> int | None:
-        """Cuenta de ingreso sugerida (00_PARA_DESARROLLADOR, "Nuevo expediente"): la misma
-        con la que ya se cobró este expediente; si es el primer cobro, la de la categoría del
-        servicio; y si tampoco hay, ING-OTR-001 u otra cuenta de ingreso activa.
-
-        Lo primero importa: la categoría del servicio y la familia que factura no siempre
-        coinciden —una compraventa es un servicio notarial (NOT) pero se cobra con
-        ING-RAI-001 y cuenta para FAM-03 Inmobiliario, como el ejemplo MOV-2026-0001 del
-        Archivo Maestro—. Sin esto, el anticipo que el abogado registró a mano y el cobro
-        que genera la factura caían en familias distintas y partían el expediente en dos."""
-        if case_id:
-            row = self.conn.execute(
-                """SELECT i.account_id AS id FROM incomes i
-                   JOIN plan_cuentas pc ON pc.id = i.account_id AND pc.estado='Activo'
-                   WHERE i.case_id=%s
-                   GROUP BY i.account_id
-                   ORDER BY SUM(i.monto_neto_operativo_cents) DESC, i.account_id
-                   LIMIT 1""",
-                (int(case_id),),
-            ).fetchone()
-            if row:
-                return int(row["id"])
-            row = self.conn.execute(
-                """SELECT pc.id FROM cases cs
-                   JOIN servicios sv ON sv.id = cs.service_id
-                   JOIN subcategorias sc ON sc.id = sv.subcategory_id
-                   JOIN plan_cuentas pc ON pc.category_id = sc.category_id AND pc.tipo='Ingreso' AND pc.estado='Activo'
-                   WHERE cs.id=%s ORDER BY pc.account_code LIMIT 1""",
-                (int(case_id),),
-            ).fetchone()
-            if row:
-                return int(row["id"])
-        row = self.conn.execute(
-            "SELECT id FROM plan_cuentas WHERE tipo='Ingreso' AND estado='Activo' "
-            "ORDER BY (account_code = 'ING-OTR-001') DESC, account_code LIMIT 1"
-        ).fetchone()
-        return int(row["id"]) if row else None
-
-    def delete_invoice(self, invoice_id: int) -> None:
-        # Borrar una factura cobrada también devuelve su cobro: si no, el dinero se quedaba
-        # registrado sin ninguna factura que lo respaldara.
-        self._revertir_cobro_de_factura(int(invoice_id))
-        # sessions/case_tasks.invoice_id no tienen FK real (columnas agregadas sueltas,
-        # sin REFERENCES) — sin este UPDATE, borrar una factura dejaba sus partidas con un
-        # invoice_id apuntando a una factura inexistente, nunca más elegibles para
-        # re-facturar aunque el "no facturado" las siga buscando con invoice_id IS NULL.
-        self.conn.execute("UPDATE sessions SET invoice_id=NULL WHERE invoice_id=%s", (invoice_id,))
-        self.conn.execute("UPDATE case_tasks SET invoice_id=NULL WHERE invoice_id=%s", (invoice_id,))
-        self.conn.execute("UPDATE case_time_entries SET invoice_id=NULL WHERE invoice_id=%s", (invoice_id,))
-        self.conn.execute("UPDATE costs SET invoice_id=NULL WHERE invoice_id=%s", (invoice_id,))
-        self.conn.execute("DELETE FROM invoices WHERE id=%s", (invoice_id,))
-        self.conn.commit()
-
-    def get_unbilled_items(self, client_id: int, case_id: int | None = None) -> dict:
-        case_filter, params_extra = ("AND ca.id = %s", (int(case_id),)) if case_id else ("", ())
-        sessions_case_filter, sessions_params_extra = ("AND case_id = %s", (int(case_id),)) if case_id else ("", ())
-        sessions = self.conn.execute(
-            f"""SELECT id, session_date, consult_type, notes FROM sessions
-               WHERE client_id=%s AND (invoice_id IS NULL) {sessions_case_filter}
-               ORDER BY session_date DESC""",
-            (client_id, *sessions_params_extra),
-        ).fetchall()
-        tasks = self.conn.execute(
-            f"""SELECT ct.id, ct.title, ct.due_date, ca.title AS case_title, ca.id AS case_id,
-                      ct.monto_adicional_cents, ct.completed_at, ct.completed_notes,
-                      ct.costo_real_cents, ct.costo_es_reembolsable
-               FROM case_tasks ct
-               JOIN cases ca ON ca.id = ct.case_id
-               WHERE ca.client_id=%s AND (ct.invoice_id IS NULL) {case_filter}
-               ORDER BY ct.due_date DESC NULLS LAST""",
-            (client_id, *params_extra),
-        ).fetchall()
-        costs = self.conn.execute(
-            f"""SELECT id, concept, detail, amount_cents, cost_date FROM costs
-               WHERE client_id=%s AND invoice_id IS NULL {sessions_case_filter}
-               ORDER BY cost_date DESC""",
-            (client_id, *sessions_params_extra),
-        ).fetchall()
-        time_entries = self.conn.execute(
-            f"""SELECT te.id, te.work_date, te.hours, te.description, ca.title AS case_title, ca.id AS case_id
-               FROM case_time_entries te
-               JOIN cases ca ON ca.id = te.case_id
-               WHERE ca.client_id=%s AND te.billable=1 AND te.invoice_id IS NULL {case_filter}
-               ORDER BY te.work_date DESC""",
-            (client_id, *params_extra),
-        ).fetchall()
-        return {"sessions": sessions, "tasks": tasks, "costs": costs, "time_entries": time_entries}
 
     # --- Helpers for UI
     def client_choices(self) -> list[tuple[int, str]]:
@@ -4404,7 +4163,7 @@ class Repository:
         rows = self.conn.execute(
             f"""
             WITH saldos AS (
-                SELECT cs.id, cs.title, cs.estado_cobro, cs.mes_cobro_esperado,
+                SELECT cs.id, cs.title, cs.estado_cobro, cs.mes_cobro_esperado, cs.probabilidad_cobro,
                        (cs.honorarios_contratados_cents - COALESCE(
                            (SELECT SUM(monto_neto_operativo_cents) FROM incomes WHERE case_id = cs.id), 0
                        )) AS saldo_pendiente_cents
@@ -4422,7 +4181,7 @@ class Repository:
         ponderado_cents = 0
         detalle = []
         for r in rows:
-            prob = PROBABILIDAD_COBRO_POR_ESTADO.get(r["estado_cobro"], 0.5)
+            prob = r["probabilidad_cobro"] if r["probabilidad_cobro"] is not None else PROBABILIDAD_COBRO_POR_ESTADO.get(r["estado_cobro"], 0.5)
             saldo = int(r["saldo_pendiente_cents"])
             pond = round(saldo * prob)
             total_cents += saldo
@@ -4461,6 +4220,8 @@ class Repository:
             "cobrado_mes_cents": cobrado_cents,
             "cartera_ponderada_mes_cents": ponderado_cents,
             "proyeccion_cierre_cents": proyeccion_cents,
+            "proyeccion_comercial_cents": meta_cents + ponderado_cents,
+            "expedientes_sin_plan": self.incomplete_collection_plans(),
             "meta_ingresos_cents": meta_cents,
             "cumplimiento_proyectado_pct": cumplimiento_pct,
         }
@@ -4500,11 +4261,12 @@ class Repository:
             raise ValueError("Oportunidad no encontrada")
         return row
 
+    @workflow_atomic
     def create_oportunidad(
         self, *, client_id: int | None = None, prospecto_nombre: str = "", prospecto_contacto: str = "",
         service_id: int | None = None, canal_captacion: str, origen_negocio: str, created_at: str,
         honorarios_estimados_text: str = "", responsable_username: str = "",
-        proxima_accion: str = "", fecha_proxima_accion: str | None = None,
+        proxima_accion: str = "", fecha_proxima_accion: str | None = None, username: str = "",
     ) -> int:
         nombre = (prospecto_nombre or "").strip()
         if not client_id and not nombre:
@@ -4529,14 +4291,17 @@ class Repository:
              (proxima_accion or "").strip() or None, (fecha_proxima_accion or "").strip() or None,
              fecha, created_at, created_at),
         )
+        record_event(self,'oportunidad',int(cur.lastrowid),'Contacto registrado',username,
+                     {'proxima_accion':proxima_accion,'fecha_proxima_accion':fecha_proxima_accion,'responsable':responsable_username})
         self.conn.commit()
         return int(cur.lastrowid)
 
+    @workflow_atomic
     def update_oportunidad(
         self, oportunidad_id: int, *, client_id: int | None = None, prospecto_nombre: str = "", prospecto_contacto: str = "",
         service_id: int | None = None, canal_captacion: str, origen_negocio: str,
         honorarios_estimados_text: str = "", responsable_username: str = "",
-        proxima_accion: str = "", fecha_proxima_accion: str | None = None,
+        proxima_accion: str = "", fecha_proxima_accion: str | None = None, username: str = "",
     ) -> None:
         current = self.get_oportunidad(oportunidad_id)
         if current["estado"] in ("Ganado", "Perdido"):
@@ -4563,25 +4328,44 @@ class Repository:
              (proxima_accion or "").strip() or None, (fecha_proxima_accion or "").strip() or None,
              fecha, int(oportunidad_id)),
         )
+        record_event(self,'oportunidad',oportunidad_id,'Seguimiento actualizado',username,
+                     {'proxima_accion':proxima_accion,'fecha_proxima_accion':fecha_proxima_accion,'responsable':responsable_username,
+                      'anterior':dict(current)})
         self.conn.commit()
 
+    @workflow_atomic
     def transition_oportunidad(
         self, oportunidad_id: int, *, nuevo_estado: str, motivo_perdida: str | None = None, usuario_id: int | None = None,
         motivo_perdida_tipo: str | None = None, crear_cliente: bool = False,
         cliente_documento: str = "", cliente_telefono: str = "", cliente_email: str = "",
         responsable_expediente: str = "",
+        client_id_existente: int | None = None, honorarios_pactados: float | None = None,
+        alcance: str = "", condiciones_cobro: str = "", revision_confirmada: bool = False,
+        revision_observaciones: str = "", opposing_party: str = "",
+        tareas_iniciales: list[dict] | None = None,
+        originador_id: int | None = None,
+        mes_cobro_esperado: str | None = None, probabilidad_cobro: float | None = None,
     ) -> int | None:
         """Avanza el estado de una oportunidad. Si nuevo_estado='Ganado', crea el expediente
         automáticamente (heredando cliente, servicio y origen) y devuelve su id."""
         if nuevo_estado not in OPORTUNIDAD_ESTADOS:
             raise ValueError("Estado inválido")
+        self.conn.execute('SELECT id FROM oportunidades WHERE id=%s FOR UPDATE', (oportunidad_id,))
         current = self.get_oportunidad(oportunidad_id)
+        if nuevo_estado == 'Ganado' and current['estado'] == 'Ganado' and current['case_id']:
+            return int(current['case_id'])
         permitidos = _OPORTUNIDAD_TRANSICIONES.get(current["estado"], set())
         if nuevo_estado not in permitidos:
             raise ValueError(f"No se puede pasar de {current['estado']} a {nuevo_estado}")
 
         fecha = now_iso()
         hoy = fecha[:10]
+        record_event(self, 'oportunidad', oportunidad_id, nuevo_estado, usuario_id,
+                     {'anterior': current['estado'], 'seguimiento': current['proxima_accion'],
+                      'fecha_seguimiento': current['fecha_proxima_accion'],
+                      'honorarios_estimados_cents':current['honorarios_estimados_cents'],
+                      'servicio_id':current['service_id'],
+                      'motivo': motivo_perdida, 'motivo_tipo': motivo_perdida_tipo})
 
         if nuevo_estado == "Perdido":
             tipo = (motivo_perdida_tipo or "").strip()
@@ -4610,7 +4394,35 @@ class Repository:
         # nuevo_estado == "Ganado" -> el prospecto se vuelve cliente y nace el expediente en el
         # mismo paso: al aceptar el negocio nadie quiere volver a teclear lo que ya se capturó
         # en el primer contacto.
-        client_id = current["client_id"]
+        if not current['service_id']:
+            raise ValueError('Para marcar Ganado, selecciona primero el servicio que se va a contratar')
+        client_id = current['client_id'] or client_id_existente
+        if current['client_id'] and client_id_existente and current['client_id'] != client_id_existente:
+            raise ValueError('El cliente vinculado no coincide')
+        if not client_id and not crear_cliente:
+            raise ValueError('Esta oportunidad es de un prospecto: al ganarla hay que registrarlo como cliente')
+        if honorarios_pactados is None or not alcance.strip() or not condiciones_cobro.strip() or not revision_confirmada:
+            raise ValueError('Confirma honorarios pactados, alcance, condiciones de cobro y revisión de apertura')
+        from .billing import cents
+        pactado = cents(honorarios_pactados)
+        responsable = (responsable_expediente or current['responsable_username'] or '').strip()
+        if not responsable or not self.conn.execute('SELECT 1 FROM users WHERE username=%s AND active=1', (responsable,)).fetchone():
+            raise ValueError('Selecciona un responsable activo para el expediente')
+        if not tareas_iniciales:
+            raise ValueError('Define al menos una tarea inicial con responsable y fecha')
+        for tarea in tareas_iniciales:
+            if not (tarea.get('titulo') or '').strip() or not tarea.get('due_date'):
+                raise ValueError('Cada tarea inicial necesita título y fecha')
+            date.fromisoformat(tarea['due_date'])
+            tarea['responsible_username'] = tarea.get('responsible_username') or responsable
+            if not self.conn.execute('SELECT 1 FROM users WHERE username=%s AND active=1', (tarea['responsible_username'],)).fetchone():
+                raise ValueError('Cada tarea necesita un responsable activo')
+        if client_id and not self.conn.execute('SELECT 1 FROM clients WHERE id=%s AND archived_at IS NULL',(client_id,)).fetchone():
+            raise ValueError('Selecciona un cliente activo')
+        parecidos = self.buscar_contactos_parecidos(nombre=current['prospecto_nombre'] or current['client_name'] or '', contacto=current['prospecto_contacto'] or '')
+        conflicto = self.check_conflicto_interes(opposing_party)
+        if (parecidos['clientes'] or parecidos['contrapartes'] or conflicto['clientes'] or conflicto['casos']) and not revision_observaciones.strip():
+            raise ValueError('Documenta cómo resolviste las coincidencias o posibles conflictos')
         if not client_id:
             if not crear_cliente:
                 raise ValueError(
@@ -4628,13 +4440,15 @@ class Repository:
         if not current["service_id"]:
             raise ValueError("Para marcar Ganado, selecciona primero el servicio que se va a contratar")
 
+        self.validate_collection_plan(mes_cobro_esperado, probabilidad_cobro, hoy)
+        self.require_active_service(current["service_id"])
         servicio = self.get_servicio(current["service_id"])
         client_row = self.conn.execute("SELECT name FROM clients WHERE id=%s", (int(client_id),)).fetchone()
         client_name = client_row["name"] if client_row else "Cliente"
 
         case_id = self.create_case(
             client_id=int(client_id),
-            responsible_username=(responsable_expediente or current["responsable_username"] or ""),
+            responsible_username=responsable,
             title=f"{servicio['nombre']} — {client_name}",
             status="Abierto",
             priority="Media",
@@ -4642,10 +4456,15 @@ class Repository:
             notes=f"Generado automáticamente desde la oportunidad #{oportunidad_id} (origen: {current['origen_negocio']}, canal: {current['canal_captacion']}).",
             created_at=fecha,
             service_id=int(current["service_id"]),
+            honorarios_contratados_text=str(honorarios_pactados),
+            mes_cobro_esperado=mes_cobro_esperado, probabilidad_cobro=probabilidad_cobro,
+            opposing_party=opposing_party,
+            tareas_iniciales=tareas_iniciales,
+            proxima_accion=tareas_iniciales[0]['titulo'],
         )
         self.conn.execute(
             "UPDATE cases SET opportunity_id=%s, honorarios_contratados_cents=%s WHERE id=%s",
-            (int(oportunidad_id), int(current["honorarios_estimados_cents"] or 0), case_id),
+            (int(oportunidad_id), pactado, case_id),
         )
         self.conn.execute(
             "UPDATE oportunidades SET estado='Ganado', client_id=%s, case_id=%s, fecha_cierre=%s, "
@@ -4654,6 +4473,24 @@ class Repository:
         )
         self._asignar_originador_desde_origen(case_id, origen_negocio=str(current["origen_negocio"]),
                                               client_id=int(client_id), created_at=fecha)
+        if originador_id is not None:
+            if not self.conn.execute("SELECT 1 FROM personal WHERE id=%s AND estado='Activo'",(originador_id,)).fetchone():
+                raise ValueError('Selecciona un originador activo')
+            self.conn.execute('DELETE FROM negocio_originadores WHERE case_id=%s',(case_id,))
+            existente = self.conn.execute('SELECT 1 FROM cases WHERE client_id=%s AND id<>%s',(client_id,case_id)).fetchone()
+            self.conn.execute('''INSERT INTO negocio_originadores(case_id,personal_id,porcentaje_participacion,tipo_origen,created_at)
+                VALUES(%s,%s,100,%s,%s)''',(case_id,originador_id,'Venta cruzada' if existente else 'Cliente nuevo',fecha))
+        if current['origen_negocio'] in ORIGENES_CON_COMISION and not self.list_negocio_originadores(case_id):
+            record_event(self,'case',case_id,'Originador pendiente de asignación',usuario_id,
+                         {'notas':'Revisar la atribución comercial en los originadores del expediente.'})
+        self.conn.execute('INSERT INTO opportunity_conversions(opportunity_id,case_id,created_at) VALUES(%s,%s,%s)',
+                          (oportunidad_id,case_id,fecha))
+        record_event(self,'case',case_id,'Apertura confirmada',usuario_id,
+                     {'oportunidad_id':oportunidad_id,'honorarios_pactados_cents':pactado,
+                      'alcance':alcance.strip(),'condiciones_cobro':condiciones_cobro.strip(),
+                      'revision':revision_observaciones.strip(),'contraparte':opposing_party,
+                      'responsable':responsable,'tareas_iniciales':tareas_iniciales,
+                      'coincidencias':parecidos,'posibles_conflictos':conflicto})
         self.conn.commit()
         return case_id
 
@@ -4718,16 +4555,27 @@ class Repository:
             "contrapartes": [dict(r) for r in contrapartes],
         }
 
-    def conversion_comercial(self) -> dict:
+    def conversion_comercial(self, *, mes: str | None = None, origen: str | None = None, service_id: int | None = None) -> dict:
         """Ganados / Cotizados — KPI de conversión comercial (solo cuenta lo que de verdad pasó por Cotizado)."""
+        filters, params = [], []
+        if mes:
+            filters.append("substring(COALESCE(fecha_cotizado,fecha_prospecto),1,7)=%s")
+            params.append(self._clean_mes(mes, 'Mes'))
+        if origen:
+            filters.append('origen_negocio=%s')
+            params.append(origen)
+        if service_id:
+            filters.append('service_id=%s')
+            params.append(service_id)
+        where = ' WHERE ' + ' AND '.join(filters) if filters else ''
         row = self.conn.execute(
-            """SELECT
+            f"""SELECT
                  COUNT(*) FILTER (WHERE fecha_cotizado IS NOT NULL) AS cotizados,
                  COUNT(*) FILTER (WHERE estado = 'Ganado') AS ganados,
                  COUNT(*) FILTER (WHERE estado = 'Perdido') AS perdidos,
                  COUNT(*) FILTER (WHERE estado = 'Prospecto') AS prospectos,
                  COALESCE(SUM(honorarios_estimados_cents) FILTER (WHERE estado IN ('Prospecto','Cotizado')), 0) AS valor_pipeline_cents
-               FROM oportunidades"""
+               FROM oportunidades{where}""", tuple(params)
         ).fetchone()
         cotizados = int(row["cotizados"])
         ganados = int(row["ganados"])
@@ -4750,6 +4598,7 @@ class Repository:
             (int(case_id),),
         ).fetchall())
 
+    @workflow_atomic
     def set_negocio_originadores(self, case_id: int, *, originadores: list[dict], created_at: str) -> None:
         """Reemplaza por completo la lista de originadores de un expediente. Vacía = sin comisión configurada."""
         if not self.conn.execute("SELECT 1 FROM cases WHERE id=%s", (int(case_id),)).fetchone():
@@ -4796,9 +4645,10 @@ class Repository:
         incomes = self.conn.execute(
             "SELECT id FROM incomes WHERE case_id=%s ORDER BY income_date ASC, id ASC", (int(case_id),)
         ).fetchall()
+        if revertir:
+            for inc in incomes:
+                self._revertir_comisiones_income(int(inc["id"]), motivo="Recálculo de cobros, costos u originadores", created_at=created_at)
         for inc in incomes:
-            if revertir:
-                self._revertir_comisiones_income(int(inc["id"]), motivo="Cambio de originadores del expediente", created_at=created_at)
             self.reconocer_comision_income(int(inc["id"]), created_at=created_at, commit=False)
 
     @staticmethod
@@ -4849,6 +4699,7 @@ class Repository:
                 tramos.append({"tasa": tasa, "monto_cents": round(ancho * tasa)})
         return tramos
 
+    @workflow_atomic
     def reconocer_comision_income(self, income_id: int, *, created_at: str, commit: bool = True) -> list[Any]:
         """Punto de entrada: al cobrarse efectivamente un honorario, reconoce la comisión de cada originador
         del expediente. Idempotente — si este cobro ya tiene comisión vigente (no revertida), la devuelve sin duplicar."""
@@ -4873,11 +4724,19 @@ class Repository:
         ).fetchone()
         honorarios = int(caso["honorarios_contratados_cents"] or 0)
         costos = int(caso["costos_directos_reales_cents"] or 0)
-        # [por defecto] ratio de margen directo del expediente completo, aplicado proporcionalmente a cada cobro
-        # — evita depender del orden de llegada de los cobros para atribuir costos directos.
-        ratio = 1.0 if honorarios <= 0 else max(0.0, min(1.0, 1 - (costos / honorarios)))
-        utilidad_directa_total_cents = round(int(income["monto_neto_operativo_cents"]) * ratio)
+        # Se recuperan primero los costos reales: cada abono solo aporta la utilidad
+        # incremental que queda después de cubrirlos. Orden estable por fecha e id.
+        prior = int(self.conn.execute("""SELECT COALESCE(SUM(monto_neto_operativo_cents),0) AS total
+            FROM incomes WHERE case_id=%s AND (income_date,id) < (%s,%s)""",
+            (income['case_id'],income['income_date'],income_id)).fetchone()['total'])
+        collected = int(income['monto_neto_operativo_cents'])
+        utilidad_directa_total_cents = max(0, prior + collected - costos) - max(0, prior - costos)
         mes = str(income["income_date"])[:7]
+        adjustment_period = self.conn.execute("""SELECT MAX(r.mes_reconocimiento) AS mes
+            FROM comisiones r JOIN comisiones original ON original.id=r.ajusta_a_commission_id
+            WHERE original.income_id=%s AND original.liquidacion_id IS NOT NULL""", (income_id,)).fetchone()['mes']
+        if adjustment_period:
+            mes = max(mes, adjustment_period)
 
         ids: list[int] = []
         for orig in originadores:
@@ -4951,15 +4810,21 @@ class Repository:
             tuple(params),
         ).fetchall())
 
+    @workflow_atomic
     def revertir_comision(self, commission_id: int, *, created_at: str, motivo: str = "Reversión manual", commit: bool = True) -> Any:
         """Reversión trazable: crea un movimiento nuevo negativo referenciando el original — nunca edita el histórico.
-        Se reconoce en el mes en curso, no en el mes original (regla del Excel: 'se corrige en el siguiente período')."""
+        Si fue pagada, se compensa desde el siguiente período; si no, se anula el devengo original."""
         original = self.get_comision(commission_id)
         if original["ajusta_a_commission_id"] is not None:
             raise ValueError("No se puede revertir un ajuste — revierte la comisión original")
         if self.conn.execute("SELECT 1 FROM comisiones WHERE ajusta_a_commission_id=%s", (int(commission_id),)).fetchone():
             raise ValueError("Esta comisión ya fue revertida")
-        mes_ajuste = _iso_today()[:7]
+        original_month = date.fromisoformat(original['mes_reconocimiento'] + '-01')
+        following = (original_month.replace(day=28) + timedelta(days=4)).replace(day=1).isoformat()[:7]
+        paid = original['liquidacion_id'] is not None
+        mes_ajuste = max(_iso_today()[:7], following) if paid else original['mes_reconocimiento']
+        if not paid:
+            self.conn.execute("UPDATE comisiones SET estado='Anulada' WHERE id=%s", (commission_id,))
         cur = self.conn.execute(
             """INSERT INTO comisiones(income_id, case_id, personal_id, tipo_origen, porcentaje_participacion,
                    base_utilidad_directa_cents, comision_cents, mes_reconocimiento, ajusta_a_commission_id,
@@ -4969,9 +4834,13 @@ class Repository:
              original["porcentaje_participacion"], 0, -int(original["comision_cents"]), mes_ajuste, int(commission_id),
              original["income_date"], original["case_title"], (motivo or "").strip() or None, created_at),
         )
+        adjustment_id = int(cur.lastrowid)
+        if not paid:
+            self.conn.execute("UPDATE comisiones SET estado='Anulada' WHERE id=%s", (adjustment_id,))
+        record_event(self, 'comision', commission_id, 'Reversión', '', {'ajuste_id': adjustment_id, 'motivo': motivo})
         if commit:
             self.conn.commit()
-        return self.get_comision(int(cur.lastrowid))
+        return self.get_comision(adjustment_id)
 
     def resumen_comisiones_mes(self, mes: str) -> list[Any]:
         m = self._clean_mes(mes, "Mes")
@@ -5487,7 +5356,7 @@ class Repository:
             ],
         }
 
-    def ingresos_por_origen(self, *, desde: str, hasta: str) -> list[dict]:
+    def ingresos_por_origen(self, *, desde: str, hasta: str, agrupar_por: str = 'originador') -> list[dict]:
         """KPI-015 — ingresos y utilidad directa por originador del negocio y tipo de origen.
 
         El originador vive en `negocio_originadores` (el mismo que gobierna la comisión), no en
@@ -5497,8 +5366,11 @@ class Repository:
         d = self._clean_mes(desde, "Mes inicial")
         h = self._clean_mes(hasta, "Mes final")
         self._meses_rango(d, h)
+        if agrupar_por not in ('originador','canal'):
+            raise ValueError('Agrupación inválida')
+        origin_expression = "COALESCE(op.canal_captacion, 'Sin canal')" if agrupar_por == 'canal' else "COALESCE(pe.persona, 'Sin originador')"
         rows = self.conn.execute(
-            """WITH cobros AS (
+            f"""WITH cobros AS (
                    SELECT i.case_id, SUM(i.monto_neto_operativo_cents) AS ingresos_cents
                    FROM incomes i
                    WHERE substring(i.income_date,1,7) BETWEEN %s AND %s
@@ -5509,12 +5381,14 @@ class Repository:
                    WHERE substring(co.cost_date,1,7) BETWEEN %s AND %s
                    GROUP BY co.case_id
                )
-               SELECT COALESCE(pe.persona, 'Sin originador') AS origen,
+               SELECT {origin_expression} AS origen,
                       COALESCE(no.tipo_origen, 'Sin clasificar') AS tipo_origen,
                       COUNT(DISTINCT cb.case_id) AS casos,
                       SUM(cb.ingresos_cents * COALESCE(no.porcentaje_participacion, 100) / 100.0) AS ingresos_cents,
                       SUM(COALESCE(cc.costos_cents, 0) * COALESCE(no.porcentaje_participacion, 100) / 100.0) AS costos_cents
                FROM cobros cb
+               LEFT JOIN cases cs ON cs.id=cb.case_id
+               LEFT JOIN oportunidades op ON op.id=cs.opportunity_id
                LEFT JOIN negocio_originadores no ON no.case_id = cb.case_id
                LEFT JOIN personal pe ON pe.id = no.personal_id
                LEFT JOIN costos_caso cc ON cc.case_id = cb.case_id
@@ -5551,9 +5425,10 @@ class Repository:
                       i.income_date,
                       sv.service_code, sv.nombre AS service_nombre
                FROM incomes i
-               LEFT JOIN invoices inv ON inv.id = i.invoice_id
+               LEFT JOIN invoice_payments payment ON payment.income_id=i.id AND payment.released_at IS NULL
+               LEFT JOIN invoices inv ON inv.id = payment.invoice_id AND inv.status <> 'Cancelada'
                LEFT JOIN cases cs ON cs.id = i.case_id
-               LEFT JOIN servicios sv ON sv.id = i.service_id
+               LEFT JOIN servicios sv ON sv.id = COALESCE(i.service_id,cs.service_id)
                WHERE substring(i.income_date,1,7) BETWEEN %s AND %s""",
             (d, h),
         ).fetchall()

@@ -6,6 +6,8 @@ dejaba un descuadre silencioso entre la factura, el expediente y la caja."""
 from __future__ import annotations
 
 import pytest
+from datetime import date
+import uuid
 
 from aglegal.db import now_iso
 
@@ -32,7 +34,7 @@ def _tarea(repo, caso, titulo, monto="0"):
     return repo.create_case_task(
         case_id=caso, title=titulo, due_date=None, created_at=now_iso(),
         monto_adicional_text=monto, autorizado_por="Cliente" if monto != "0" else "",
-        username="admin",
+        username="admin", estado="Hecha",
     )
 
 
@@ -86,7 +88,7 @@ def test_la_misma_tarea_no_se_factura_dos_veces(repo, catalogo, codigo_unico):
     item = [{"description": "Tarea", "quantity": 1, "unit_price": 70,
              "entity_type": "case_task", "entity_id": tid}]
     _factura(repo, catalogo, caso, f"FAC-{codigo_unico}-04", item)
-    with pytest.raises(ValueError, match="ya está cobrada"):
+    with pytest.raises(ValueError, match="reservada o facturada"):
         _factura(repo, catalogo, caso, f"FAC-{codigo_unico}-05", item)
 
 
@@ -108,18 +110,20 @@ def test_no_hay_dos_facturas_con_el_mismo_numero(repo, catalogo, codigo_unico):
         _factura(repo, catalogo, caso, numero, [{"description": "B", "quantity": 1, "unit_price": 10}])
 
 
-# ── Una factura pagada que deja de estarlo devuelve el dinero ───────────────
+# ── Cambiar el documento conserva el dinero recibido ───────────────
 
-def test_cancelar_una_factura_pagada_devuelve_el_cobro(repo, catalogo, codigo_unico):
+def test_cancelar_una_factura_pagada_conserva_el_cobro(repo, catalogo, codigo_unico):
     caso = _caso(repo, catalogo, honorarios="400")
     inv = _factura(repo, catalogo, caso, f"FAC-{codigo_unico}-08",
                    [{"description": "Honorarios", "quantity": 1, "unit_price": 400}])
-    repo.update_invoice_status(inv, "Pagada")
-    repo.auto_income_from_invoice(inv)
+    repo.update_invoice_status(inv, "Enviada")
+    repo.register_invoice_payment(inv, amount=repo.get_invoice(inv)['total_cents']/100,
+        income_date=date.today().isoformat(), account_id=catalogo['cuenta_id'],request_key=uuid.uuid4().hex)
     assert [i for i in repo.list_incomes() if i["invoice_id"] == inv]
 
     repo.update_invoice_status(inv, "Cancelada")
-    assert not [i for i in repo.list_incomes() if i["invoice_id"] == inv]
+    assert [i for i in repo.list_incomes() if i["invoice_id"] == inv]
+    assert repo.list_invoice_payments(inv)[0]["released_at"]
     assert repo.get_case(caso)["honorarios_contratados_cents"] == 40_000  # el acuerdo no cambia
 
 
@@ -127,22 +131,26 @@ def test_borrar_una_factura_pagada_no_deja_el_cobro_huerfano(repo, catalogo, cod
     caso = _caso(repo, catalogo, honorarios="300")
     inv = _factura(repo, catalogo, caso, f"FAC-{codigo_unico}-09",
                    [{"description": "Honorarios", "quantity": 1, "unit_price": 300}])
-    repo.update_invoice_status(inv, "Pagada")
-    repo.auto_income_from_invoice(inv)
-    repo.delete_invoice(inv)
-    assert not [i for i in repo.list_incomes() if i["case_id"] == caso]
+    repo.update_invoice_status(inv, "Enviada")
+    repo.register_invoice_payment(inv, amount=repo.get_invoice(inv)['total_cents']/100,
+        income_date=date.today().isoformat(), account_id=catalogo['cuenta_id'],request_key=uuid.uuid4().hex)
+    with pytest.raises(ValueError, match="Solo se eliminan borradores"):
+        repo.delete_invoice(inv)
+    assert [i for i in repo.list_incomes() if i["case_id"] == caso]
 
 
-def test_borrar_el_cobro_saca_a_la_factura_de_pagada(repo, catalogo, codigo_unico):
+def test_no_se_borra_un_cobro_aplicado_a_factura(repo, catalogo, codigo_unico):
     caso = _caso(repo, catalogo, honorarios="200")
     inv = _factura(repo, catalogo, caso, f"FAC-{codigo_unico}-10",
                    [{"description": "Honorarios", "quantity": 1, "unit_price": 200}])
-    repo.update_invoice_status(inv, "Pagada")
-    repo.auto_income_from_invoice(inv)
+    repo.update_invoice_status(inv, "Enviada")
+    repo.register_invoice_payment(inv, amount=repo.get_invoice(inv)['total_cents']/100,
+        income_date=date.today().isoformat(), account_id=catalogo['cuenta_id'],request_key=uuid.uuid4().hex)
     cobro = next(i for i in repo.list_incomes() if i["invoice_id"] == inv)
 
-    repo.delete_income(cobro["id"])
-    assert repo.get_invoice(inv)["status"] == "Enviada"
+    with pytest.raises(ValueError,match="historial"):
+        repo.delete_income(cobro["id"])
+    assert repo.get_invoice(inv)["status"] == "Pagada"
 
 
 def test_un_estado_de_factura_inventado_se_rechaza(repo, catalogo, codigo_unico):
