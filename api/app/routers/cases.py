@@ -4,8 +4,10 @@ from fastapi import APIRouter, HTTPException
 
 from aglegal.db import now_iso
 
-from ..deps import AdminRequired, CurrentUser, LawyerRequired, RepoDep
+from ..deps import AdminRequired, CurrentUser, LawyerRequired, RepoDep, require_permission
 from ..schemas.case import (
+    CaseTaskCierreIn,
+    CaseTaskEstadoIn,
     CaseAttachmentOut, CaseHonorariosLogOut, CaseIn, CaseOut, CaseTaskCriticoUpdate, CaseTaskDone, CaseTaskIn,
     CaseTaskUpdate,
     CaseTaskNotesUpdate, CaseTaskResponsibleUpdate,
@@ -149,6 +151,16 @@ def purge_case(case_id: int, current_user: AdminRequired, repo: RepoDep):
 
 # --- Tasks ---
 
+def _tarea(repo, task_id: int):
+    """Releer la tarea con sus etiquetas y asignados — un SELECT * se los deja fuera."""
+    row = repo.conn.execute(
+        f"SELECT ct.*{repo._SELECT_TAREA_EXTRAS} FROM case_tasks ct WHERE ct.id=%s", (int(task_id),)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Tarea no encontrada")
+    return row
+
+
 @router.get("/tasks", response_model=list[GlobalCaseTaskOut])
 def list_all_tasks(
     current_user: CurrentUser,
@@ -156,8 +168,15 @@ def list_all_tasks(
     done: bool | None = None,
     search: str | None = None,
     case_id: int | None = None,
+    estado: str | None = None,
+    etiqueta_id: int | None = None,
+    asignado: str | None = None,
 ) -> list[GlobalCaseTaskOut]:
-    return [GlobalCaseTaskOut.from_row(r) for r in repo.list_all_case_tasks(done=done, search=search, case_id=case_id)]
+    return [
+        GlobalCaseTaskOut.from_row(r)
+        for r in repo.list_all_case_tasks(done=done, search=search, case_id=case_id, estado=estado,
+                                          etiqueta_id=etiqueta_id, asignado=asignado)
+    ]
 
 
 @router.get("/{case_id}/tasks", response_model=list[CaseTaskOut])
@@ -182,11 +201,14 @@ def create_task(case_id: int, body: CaseTaskIn, current_user: CurrentUser, repo:
         costo_es_reembolsable=body.costo_es_reembolsable,
         autorizado_por=body.autorizado_por,
         fecha_autorizacion=body.fecha_autorizacion,
+        costo_estimado_text=str(body.costo_estimado) if body.costo_estimado is not None else "0",
+        asignados=body.asignados,
+        etiqueta_ids=body.etiqueta_ids,
+        estado=body.estado,
         username=current_user["username"],
         created_at=now_iso(),
     )
-    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
-    return CaseTaskOut.from_row(row)
+    return CaseTaskOut.from_row(_tarea(repo, task_id))
 
 
 @router.put("/tasks/{task_id}", response_model=CaseTaskOut)
@@ -209,6 +231,9 @@ def update_task(task_id: int, body: CaseTaskUpdate, current_user: CurrentUser, r
         autorizado_por=body.autorizado_por,
         fecha_autorizacion=body.fecha_autorizacion,
         completed_at=body.completed_at,
+        costo_estimado_text=str(body.costo_estimado) if body.costo_estimado is not None else None,
+        asignados=body.asignados,
+        etiqueta_ids=body.etiqueta_ids,
         username=current_user["username"],
     )
     row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
@@ -218,10 +243,7 @@ def update_task(task_id: int, body: CaseTaskUpdate, current_user: CurrentUser, r
 @router.patch("/tasks/{task_id}/critico", response_model=CaseTaskOut)
 def set_task_critico(task_id: int, body: CaseTaskCriticoUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
     repo.set_case_task_critico(task_id, body.es_critico)
-    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Tarea no encontrada")
-    return CaseTaskOut.from_row(row)
+    return CaseTaskOut.from_row(_tarea(repo, task_id))
 
 
 @router.patch("/tasks/{task_id}/responsible", response_model=CaseTaskOut)
@@ -229,28 +251,44 @@ def set_task_responsible(task_id: int, body: CaseTaskResponsibleUpdate, current_
     if not current_user["is_admin"] and "tareas.editar" not in current_user["permissions"]:
         raise HTTPException(403, "Sin permiso: tareas.editar")
     repo.set_case_task_responsible(task_id, body.responsible_username)
-    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Tarea no encontrada")
-    return CaseTaskOut.from_row(row)
+    return CaseTaskOut.from_row(_tarea(repo, task_id))
 
 
 @router.patch("/tasks/{task_id}/done", response_model=CaseTaskOut)
 def set_task_done(task_id: int, body: CaseTaskDone, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
     repo.set_case_task_done(task_id, body.done, body.completed_notes, username=current_user["username"])
-    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Tarea no encontrada")
-    return CaseTaskOut.from_row(row)
+    return CaseTaskOut.from_row(_tarea(repo, task_id))
+
+
+@router.patch("/tasks/{task_id}/estado", response_model=CaseTaskOut)
+def set_task_estado(task_id: int, body: CaseTaskEstadoIn, current_user: CurrentUser, repo: RepoDep,
+                    _: dict = require_permission("tareas", "editar")) -> CaseTaskOut:
+    """Mover la tarjeta de columna en el tablero."""
+    repo.set_case_task_estado(task_id, body.estado, username=current_user["username"],
+                              completed_notes=body.completed_notes)
+    return CaseTaskOut.from_row(_tarea(repo, task_id))
+
+
+@router.post("/tasks/{task_id}/cerrar", response_model=CaseTaskOut)
+def cerrar_task(task_id: int, body: CaseTaskCierreIn, current_user: CurrentUser, repo: RepoDep,
+                _: dict = require_permission("tareas", "editar")) -> CaseTaskOut:
+    """Cerrar la tarea con la fecha real, el costo final y lo que se obtuvo."""
+    repo.cerrar_case_task(
+        task_id,
+        completed_at=body.completed_at,
+        completed_notes=body.completed_notes,
+        costo_real_text=str(body.costo_real) if body.costo_real is not None else None,
+        costo_account_id=body.costo_account_id,
+        costo_es_reembolsable=body.costo_es_reembolsable,
+        username=current_user["username"],
+    )
+    return CaseTaskOut.from_row(_tarea(repo, task_id))
 
 
 @router.patch("/tasks/{task_id}/notes", response_model=CaseTaskOut)
 def update_task_notes(task_id: int, body: CaseTaskNotesUpdate, current_user: CurrentUser, repo: RepoDep) -> CaseTaskOut:
     repo.update_case_task_notes(task_id, body.notes, body.completed_notes)
-    row = repo.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (task_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Tarea no encontrada")
-    return CaseTaskOut.from_row(row)
+    return CaseTaskOut.from_row(_tarea(repo, task_id))
 
 
 @router.delete("/tasks/{task_id}", status_code=204)

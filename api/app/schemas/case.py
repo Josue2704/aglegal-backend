@@ -6,10 +6,15 @@ from pydantic import BaseModel, ConfigDict
 
 
 class TareaInicialIn(BaseModel):
+    """Una tarea de la plantilla, ya ajustada por quien crea el expediente."""
     titulo: str
     due_date: str | None = None
     notes: str | None = None
     es_critico: bool = False
+    responsible_username: str = ""
+    costo_estimado: float | None = None
+    asignados: list[str] = []
+    etiqueta_ids: list[int] = []
 
 
 class CaseIn(BaseModel):
@@ -144,6 +149,15 @@ class GlobalCaseTaskOut(BaseModel):
     es_critico: bool = False
     origen: str = "manual"
     monto_adicional: float = 0
+    # Lo que el tablero necesita para pintar la tarjeta sin pedir cada tarea por separado.
+    estado: str = "Por hacer"
+    costo_estimado: float = 0
+    costo_real: float = 0
+    completed_at: str | None = None
+    completed_by: str | None = None
+    invoice_id: int | None = None
+    asignados: list[str] = []
+    etiquetas: list[EtiquetaTareaOut] = []
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -154,7 +168,11 @@ class GlobalCaseTaskOut(BaseModel):
         d["done"] = bool(d.get("done", 0))
         d["es_critico"] = bool(d.get("es_critico", 0))
         d["monto_adicional"] = (d.pop("monto_adicional_cents", 0) or 0) / 100
-        return cls(**d)
+        d["costo_estimado"] = (d.pop("costo_estimado_cents", 0) or 0) / 100
+        d["costo_real"] = (d.pop("costo_real_cents", 0) or 0) / 100
+        d["asignados"] = list(d.get("asignados") or [])
+        d["etiquetas"] = [EtiquetaTareaOut(**e) for e in (d.get("etiquetas") or [])]
+        return cls(**{k: v for k, v in d.items() if k in cls.model_fields})
 
 
 class CaseAttachmentOut(BaseModel):
@@ -171,6 +189,24 @@ class CaseAttachmentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class EtiquetaTareaIn(BaseModel):
+    nombre: str
+    color: str = "slate"
+
+
+class EtiquetaTareaOut(BaseModel):
+    id: int
+    nombre: str
+    color: str
+    usos: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @classmethod
+    def from_row(cls, row: Any) -> EtiquetaTareaOut:
+        return cls(**{k: v for k, v in dict(row).items() if k in cls.model_fields})
+
+
 class CaseTaskIn(BaseModel):
     title: str
     due_date: str | None = None
@@ -185,6 +221,12 @@ class CaseTaskIn(BaseModel):
     costo_real: float | None = None
     costo_account_id: int | None = None
     costo_es_reembolsable: bool = False
+    # Lo que se calcula que va a costar, al planearla: al cerrarla se compara con el real.
+    costo_estimado: float | None = None
+    # Quienes la trabajan, ademas del responsable que responde por ella.
+    asignados: list[str] = []
+    etiqueta_ids: list[int] = []
+    estado: str = "Por hacer"
 
 
 class CaseTaskUpdate(CaseTaskIn):
@@ -230,6 +272,10 @@ class CaseTaskOut(BaseModel):
     completed_at: str | None = None
     completed_by: str | None = None
     invoice_id: int | None = None
+    estado: str = "Por hacer"
+    costo_estimado: float = 0
+    asignados: list[str] = []
+    etiquetas: list[EtiquetaTareaOut] = []
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -242,7 +288,33 @@ class CaseTaskOut(BaseModel):
         d["costo_es_reembolsable"] = bool(d.get("costo_es_reembolsable", False))
         d["monto_adicional"] = (d.pop("monto_adicional_cents", 0) or 0) / 100
         d["costo_real"] = (d.pop("costo_real_cents", 0) or 0) / 100
+        d["costo_estimado"] = (d.pop("costo_estimado_cents", 0) or 0) / 100
+        d["asignados"] = list(d.get("asignados") or [])
+        d["etiquetas"] = [EtiquetaTareaOut(**e) for e in (d.get("etiquetas") or [])]
         return cls(**{k: v for k, v in d.items() if k in cls.model_fields})
+
+
+class CaseTaskEstadoIn(BaseModel):
+    estado: str
+    completed_notes: str | None = None
+
+
+class CaseTaskCierreIn(BaseModel):
+    """Cerrar la tarea con todo lo que hay que dejar por escrito."""
+    completed_at: str | None = None
+    completed_notes: str
+    costo_real: float | None = None
+    costo_account_id: int | None = None
+    costo_es_reembolsable: bool | None = None
+
+
+class CopiarPlantillaIn(BaseModel):
+    origen_service_id: int
+    reemplazar: bool = False
+
+
+class ReordenarPlantillaIn(BaseModel):
+    orden_ids: list[int]
 
 
 class PlantillaTareaIn(BaseModel):
@@ -252,6 +324,9 @@ class PlantillaTareaIn(BaseModel):
     es_critico_default: bool = False
     costo_estimado: float | None = None
     honorario_sugerido: float | None = None
+    descripcion: str = ""
+    responsable_sugerido: str = ""
+    etiqueta_ids: list[int] = []
 
 
 class PlantillaTareaOut(BaseModel):
@@ -263,6 +338,9 @@ class PlantillaTareaOut(BaseModel):
     es_critico_default: bool = False
     costo_estimado: float = 0
     honorario_sugerido: float = 0
+    descripcion: str | None = None
+    responsable_sugerido: str | None = None
+    etiquetas: list[EtiquetaTareaOut] = []
     created_at: str
     updated_at: str
 
@@ -274,6 +352,7 @@ class PlantillaTareaOut(BaseModel):
         d["es_critico_default"] = bool(d.get("es_critico_default", 0))
         d["costo_estimado"] = (d.pop("costo_estimado_cents", 0) or 0) / 100
         d["honorario_sugerido"] = (d.pop("honorario_sugerido_cents", 0) or 0) / 100
+        d["etiquetas"] = [EtiquetaTareaOut(**e) for e in (d.get("etiquetas") or [])]
         return cls(**{k: v for k, v in d.items() if k in cls.model_fields})
 
 

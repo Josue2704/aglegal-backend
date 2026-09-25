@@ -28,7 +28,8 @@ def _database_url() -> str:
 # Gives psycopg2 connections the same .execute() / .commit() / .close() surface
 # that the rest of the codebase expects from sqlite3, including .lastrowid.
 
-_TABLES_WITHOUT_ID = {"meta", "role_permissions", "google_tokens", "outlook_tokens"}
+_TABLES_WITHOUT_ID = {"meta", "role_permissions", "google_tokens", "outlook_tokens",
+                      "case_task_asignados", "case_task_etiquetas", "plantilla_tarea_etiquetas"}
 
 
 class _Cursor:
@@ -1265,6 +1266,64 @@ def _migrate(conn: PgConnection) -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_numero ON invoices(invoice_number);
         """)
         _set_schema_version(conn, 43)
+
+    # v44: la tarea deja de ser una línea de checklist y pasa a ser una tarjeta de trabajo.
+    #   · estado      → columna del tablero. `done` se mantiene sincronizado porque de él
+    #                   dependen la facturación, las alertas y el avance del expediente.
+    #   · costo estimado al planearla, contra el costo real al cerrarla.
+    #   · varios asignados (responsable + apoyos) y etiquetas de color compartidas.
+    # Las plantillas del servicio pasan a traer también descripción, responsable sugerido
+    # y etiquetas, para que un expediente nazca con el plan de trabajo completo.
+    if v < 44:
+        conn.executescript("""
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS estado TEXT NOT NULL DEFAULT 'Por hacer';
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS costo_estimado_cents INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE case_tasks ADD COLUMN IF NOT EXISTS orden_tablero INTEGER NOT NULL DEFAULT 0;
+            UPDATE case_tasks SET estado = 'Hecha' WHERE done = 1 AND estado = 'Por hacer';
+
+            CREATE TABLE IF NOT EXISTS case_task_asignados (
+              task_id INTEGER NOT NULL REFERENCES case_tasks(id) ON DELETE CASCADE,
+              username TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (task_id, username)
+            );
+
+            CREATE TABLE IF NOT EXISTS etiquetas_tarea (
+              id SERIAL PRIMARY KEY,
+              nombre TEXT NOT NULL UNIQUE,
+              color TEXT NOT NULL DEFAULT 'slate',
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS case_task_etiquetas (
+              task_id INTEGER NOT NULL REFERENCES case_tasks(id) ON DELETE CASCADE,
+              etiqueta_id INTEGER NOT NULL REFERENCES etiquetas_tarea(id) ON DELETE CASCADE,
+              PRIMARY KEY (task_id, etiqueta_id)
+            );
+
+            ALTER TABLE plantillas_tareas ADD COLUMN IF NOT EXISTS descripcion TEXT;
+            ALTER TABLE plantillas_tareas ADD COLUMN IF NOT EXISTS responsable_sugerido TEXT;
+
+            CREATE TABLE IF NOT EXISTS plantilla_tarea_etiquetas (
+              plantilla_id INTEGER NOT NULL REFERENCES plantillas_tareas(id) ON DELETE CASCADE,
+              etiqueta_id INTEGER NOT NULL REFERENCES etiquetas_tarea(id) ON DELETE CASCADE,
+              PRIMARY KEY (plantilla_id, etiqueta_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_case_tasks_estado ON case_tasks(estado, orden_tablero);
+            CREATE INDEX IF NOT EXISTS idx_case_task_asignados_user ON case_task_asignados(username);
+        """)
+        # Etiquetas iniciales: las razones por las que una tarea de un despacho se detiene.
+        for nombre, color in (
+            ("Urgente", "red"), ("Espera cliente", "amber"), ("Espera tribunal", "violet"),
+            ("Plazo legal", "rose"), ("Trámite externo", "blue"), ("Revisión interna", "slate"),
+        ):
+            conn.execute(
+                "INSERT INTO etiquetas_tarea(nombre, color, created_at) VALUES(%s,%s,%s) "
+                "ON CONFLICT (nombre) DO NOTHING",
+                (nombre, color, now_iso()),
+            )
+        _set_schema_version(conn, 44)
 
 
 # ── Seeds ─────────────────────────────────────────────────────────────────────

@@ -20,6 +20,11 @@ from .security import hash_password, verify_password
 SESSION_STATUSES = ["Pendiente", "En proceso", "Finalizada"]
 ATTACH_ENTITY_TYPES = ["session", "income", "expense", "case", "client", "cost", "user"]
 CASE_STATUSES = ["Abierto", "En trámite", "En pausa", "Cerrado"]
+# Columnas del tablero de tareas. "En espera" es la que más importa en un despacho:
+# separa lo que nadie está trabajando porque depende de un tercero (cliente, tribunal,
+# registro) de lo que simplemente no se ha empezado.
+TASK_ESTADOS = ["Por hacer", "En curso", "En espera", "Hecha"]
+ETIQUETA_COLORES = ["red", "amber", "green", "blue", "violet", "rose", "slate"]
 INVOICE_STATUSES = ["Borrador", "Enviada", "Pagada", "Cancelada"]
 # Lo que una factura puede cobrar. Un tipo fuera de esta lista se rechaza: antes se
 # guardaba tal cual en invoice_items y la partida nunca quedaba marcada como facturada,
@@ -1636,14 +1641,20 @@ class Repository:
             titulo_tarea = (tarea.get("titulo") or "").strip()
             if not titulo_tarea:
                 continue
-            self.conn.execute(
-                "INSERT INTO case_tasks(case_id, title, done, due_date, notes, es_critico, origen, created_at) "
-                "VALUES(%s,%s,0,%s,%s,%s,'plantilla',%s)",
+            cur_tarea = self.conn.execute(
+                "INSERT INTO case_tasks(case_id, title, done, due_date, notes, es_critico, origen, "
+                "responsible_username, costo_estimado_cents, estado, created_at) "
+                "VALUES(%s,%s,0,%s,%s,%s,'plantilla',%s,%s,'Por hacer',%s)",
                 (
                     case_id, titulo_tarea, (tarea.get("due_date") or "").strip() or None,
-                    (tarea.get("notes") or "").strip() or None, 1 if tarea.get("es_critico") else 0, created_at,
+                    (tarea.get("notes") or "").strip() or None, 1 if tarea.get("es_critico") else 0,
+                    (tarea.get("responsible_username") or "").strip() or None,
+                    self._to_cents_or_zero(str(tarea.get("costo_estimado") or "0")),
+                    created_at,
                 ),
             )
+            self._set_etiquetas_tarea(int(cur_tarea.lastrowid), tarea.get("etiqueta_ids"))
+            self._set_asignados_tarea(int(cur_tarea.lastrowid), tarea.get("asignados"), created_at)
         self.conn.commit()
         return case_id
 
@@ -1795,10 +1806,83 @@ class Repository:
             rows = self.conn.execute("SELECT id, title FROM cases ORDER BY id DESC").fetchall()
         return [(int(r["id"]), str(r["title"])) for r in rows]
 
+    # ── Etiquetas de tarea (las "banderas" del tablero) ─────────────────────
+
+    def list_etiquetas_tarea(self) -> list[Any]:
+        return list(self.conn.execute(
+            """SELECT e.*, (SELECT COUNT(*) FROM case_task_etiquetas ce WHERE ce.etiqueta_id = e.id) AS usos
+               FROM etiquetas_tarea e ORDER BY e.nombre"""
+        ).fetchall())
+
+    def create_etiqueta_tarea(self, *, nombre: str, color: str, created_at: str) -> int:
+        n = (nombre or "").strip()
+        if not n:
+            raise ValueError("Nombre de etiqueta requerido")
+        if color not in ETIQUETA_COLORES:
+            raise ValueError(f"Color inválido: use {', '.join(ETIQUETA_COLORES)}")
+        if self.conn.execute("SELECT 1 FROM etiquetas_tarea WHERE lower(nombre)=lower(%s)", (n,)).fetchone():
+            raise ValueError(f"Ya existe una etiqueta llamada {n}")
+        cur = self.conn.execute(
+            "INSERT INTO etiquetas_tarea(nombre, color, created_at) VALUES(%s,%s,%s)", (n, color, created_at)
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def update_etiqueta_tarea(self, etiqueta_id: int, *, nombre: str, color: str) -> None:
+        n = (nombre or "").strip()
+        if not n:
+            raise ValueError("Nombre de etiqueta requerido")
+        if color not in ETIQUETA_COLORES:
+            raise ValueError(f"Color inválido: use {', '.join(ETIQUETA_COLORES)}")
+        if self.conn.execute(
+            "SELECT 1 FROM etiquetas_tarea WHERE lower(nombre)=lower(%s) AND id<>%s", (n, int(etiqueta_id))
+        ).fetchone():
+            raise ValueError(f"Ya existe otra etiqueta llamada {n}")
+        self.conn.execute(
+            "UPDATE etiquetas_tarea SET nombre=%s, color=%s WHERE id=%s", (n, color, int(etiqueta_id))
+        )
+        self.conn.commit()
+
+    def delete_etiqueta_tarea(self, etiqueta_id: int) -> None:
+        """Se puede borrar aunque esté en uso: desaparece de las tareas, que no pierden nada más."""
+        self.conn.execute("DELETE FROM etiquetas_tarea WHERE id=%s", (int(etiqueta_id),))
+        self.conn.commit()
+
+    def _set_etiquetas_tarea(self, task_id: int, etiqueta_ids: list[int] | None) -> None:
+        if etiqueta_ids is None:
+            return
+        self.conn.execute("DELETE FROM case_task_etiquetas WHERE task_id=%s", (int(task_id),))
+        for eid in dict.fromkeys(int(e) for e in etiqueta_ids):
+            self.conn.execute(
+                "INSERT INTO case_task_etiquetas(task_id, etiqueta_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                (int(task_id), eid),
+            )
+
+    def _set_asignados_tarea(self, task_id: int, asignados: list[str] | None, created_at: str) -> None:
+        """El responsable responde por la tarea; los asignados son quienes la trabajan."""
+        if asignados is None:
+            return
+        self.conn.execute("DELETE FROM case_task_asignados WHERE task_id=%s", (int(task_id),))
+        for username in dict.fromkeys((u or "").strip() for u in asignados if (u or "").strip()):
+            self.conn.execute(
+                "INSERT INTO case_task_asignados(task_id, username, created_at) VALUES(%s,%s,%s) "
+                "ON CONFLICT DO NOTHING",
+                (int(task_id), username, created_at),
+            )
+
+    _SELECT_TAREA_EXTRAS = """,
+               COALESCE((SELECT array_agg(a.username ORDER BY a.username)
+                         FROM case_task_asignados a WHERE a.task_id = ct.id), '{}') AS asignados,
+               COALESCE((SELECT json_agg(json_build_object('id', e.id, 'nombre', e.nombre, 'color', e.color)
+                                         ORDER BY e.nombre)
+                         FROM case_task_etiquetas cte JOIN etiquetas_tarea e ON e.id = cte.etiqueta_id
+                         WHERE cte.task_id = ct.id), '[]') AS etiquetas"""
+
     def list_case_tasks(self, case_id: int) -> list[Any]:
         return list(
             self.conn.execute(
-                "SELECT * FROM case_tasks WHERE case_id=%s ORDER BY done ASC, id DESC",
+                f"SELECT ct.*{self._SELECT_TAREA_EXTRAS} FROM case_tasks ct WHERE ct.case_id=%s "
+                "ORDER BY ct.done ASC, ct.id DESC",
                 (int(case_id),),
             ).fetchall()
         )
@@ -1808,12 +1892,28 @@ class Repository:
         done: bool | None = None,
         search: str | None = None,
         case_id: int | None = None,
+        estado: str | None = None,
+        etiqueta_id: int | None = None,
+        asignado: str | None = None,
     ) -> list[Any]:
         conditions: list[str] = []
         params: list[Any] = []
         if done is not None:
             conditions.append("ct.done = %s")
             params.append(1 if done else 0)
+        if estado:
+            conditions.append("ct.estado = %s")
+            params.append(estado)
+        if etiqueta_id:
+            conditions.append("EXISTS (SELECT 1 FROM case_task_etiquetas x WHERE x.task_id=ct.id AND x.etiqueta_id=%s)")
+            params.append(int(etiqueta_id))
+        if asignado:
+            # "Lo mío" incluye lo que respondo y lo que trabajo con alguien más.
+            conditions.append(
+                "(ct.responsible_username = %s OR EXISTS "
+                "(SELECT 1 FROM case_task_asignados a WHERE a.task_id=ct.id AND a.username=%s))"
+            )
+            params.extend([asignado, asignado])
         if case_id is not None:
             conditions.append("ct.case_id = %s")
             params.append(int(case_id))
@@ -1824,7 +1924,7 @@ class Repository:
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         return list(
             self.conn.execute(
-                f"SELECT ct.*, cs.title AS case_title, cs.status AS case_status, "
+                f"SELECT ct.*{self._SELECT_TAREA_EXTRAS}, cs.title AS case_title, cs.status AS case_status, "
                 f"cs.client_id, cl.name AS client_name, "
                 f"cs.responsible_username AS case_responsible_username "
                 f"FROM case_tasks ct "
@@ -1917,6 +2017,10 @@ class Repository:
         costo_es_reembolsable: bool = False,
         autorizado_por: str = "",
         fecha_autorizacion: str | None = None,
+        costo_estimado_text: str = "0",
+        asignados: list[str] | None = None,
+        etiqueta_ids: list[int] | None = None,
+        estado: str = "Por hacer",
         username: str = "",
     ) -> int:
         t = (title or "").strip()
@@ -1924,16 +2028,19 @@ class Repository:
             raise ValueError("Título requerido")
         if origen not in ("plantilla", "manual"):
             raise ValueError("Origen inválido")
+        if estado not in TASK_ESTADOS:
+            raise ValueError(f"Estado de tarea inválido: use {', '.join(TASK_ESTADOS)}")
+        estimado_cents = self._to_cents_or_zero(costo_estimado_text)
         monto_cents = self._to_cents_or_zero(monto_adicional_text)
         costo_cents = self._to_cents_or_zero(costo_real_text)
         self._validar_cobro_extra(monto_cents, autorizado_por)
         cur = self.conn.execute(
             "INSERT INTO case_tasks(case_id, title, done, due_date, notes, responsible_username, es_critico, "
             "origen, monto_adicional_cents, costo_real_cents, costo_account_id, costo_es_reembolsable, "
-            "autorizado_por, fecha_autorizacion, created_at) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "autorizado_por, fecha_autorizacion, costo_estimado_cents, estado, created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
-                int(case_id), t, 0,
+                int(case_id), t, 1 if estado == "Hecha" else 0,
                 (due_date or "").strip() or None,
                 (notes or "").strip() or None,
                 (responsible_username or "").strip() or None,
@@ -1943,10 +2050,13 @@ class Repository:
                 bool(costo_es_reembolsable),
                 (autorizado_por or "").strip() or None,
                 (fecha_autorizacion or "").strip() or (created_at[:10] if monto_cents > 0 else None),
+                estimado_cents, estado,
                 created_at,
             ),
         )
         task_id = int(cur.lastrowid)
+        self._set_asignados_tarea(task_id, asignados, created_at)
+        self._set_etiquetas_tarea(task_id, etiqueta_ids)
         if monto_cents > 0:
             self._registrar_honorarios_log(
                 case_id=case_id, origen_tipo="tarea", origen_id=task_id, monto_cents=monto_cents,
@@ -1975,6 +2085,9 @@ class Repository:
         autorizado_por: str = "",
         fecha_autorizacion: str | None = None,
         completed_at: str | None = None,
+        costo_estimado_text: str | None = None,
+        asignados: list[str] | None = None,
+        etiqueta_ids: list[int] | None = None,
         username: str = "",
     ) -> None:
         """El costo casi nunca se conoce al crear la tarea, sino al volver de la diligencia:
@@ -1999,6 +2112,13 @@ class Repository:
                     "Corrige la factura si el monto cambió."
                 )
 
+        if costo_estimado_text is not None:
+            self.conn.execute(
+                "UPDATE case_tasks SET costo_estimado_cents=%s WHERE id=%s",
+                (self._to_cents_or_zero(costo_estimado_text), int(task_id)),
+            )
+        self._set_asignados_tarea(task_id, asignados, now_iso())
+        self._set_etiquetas_tarea(task_id, etiqueta_ids)
         self.conn.execute(
             "UPDATE case_tasks SET title=%s, due_date=%s, notes=%s, responsible_username=%s, es_critico=%s, "
             "monto_adicional_cents=%s, costo_real_cents=%s, costo_account_id=%s, costo_es_reembolsable=%s, "
@@ -2051,15 +2171,70 @@ class Repository:
         """Al cerrarla se guarda la fecha real de cumplimiento y quién la cerró: la fecha
         estimada dice cuándo debía hacerse, esta dice cuándo se hizo de verdad."""
         self.conn.execute(
-            "UPDATE case_tasks SET done=%s, completed_notes=%s, completed_at=%s, completed_by=%s WHERE id=%s",
+            "UPDATE case_tasks SET done=%s, completed_notes=%s, completed_at=%s, completed_by=%s, "
+            "estado=CASE WHEN %s THEN 'Hecha' WHEN estado='Hecha' THEN 'Por hacer' ELSE estado END WHERE id=%s",
             (
                 1 if done else 0,
                 (completed_notes or "").strip() or None,
                 _iso_today() if done else None,
                 ((username or "").strip() or None) if done else None,
+                bool(done),
                 int(task_id),
             ),
         )
+        self.conn.commit()
+
+    def cerrar_case_task(
+        self, task_id: int, *, completed_at: str | None = None, completed_notes: str = "",
+        costo_real_text: str | None = None, costo_account_id: int | None = None,
+        costo_es_reembolsable: bool | None = None, username: str = "",
+    ) -> None:
+        """Cerrar una tarea en un solo paso: cuándo se terminó de verdad, qué costó al final
+        y qué se obtuvo. Antes había que abrir la fila y llenar cada cosa por separado."""
+        anterior = self.conn.execute("SELECT * FROM case_tasks WHERE id=%s", (int(task_id),)).fetchone()
+        if not anterior:
+            raise ValueError("Tarea no encontrada")
+        if not (completed_notes or "").strip():
+            raise ValueError("Escribe qué se obtuvo o cómo se resolvió antes de cerrarla")
+        if costo_real_text is not None:
+            self.update_case_task(
+                task_id,
+                title=str(anterior["title"]),
+                due_date=anterior["due_date"],
+                notes=anterior["notes"],
+                responsible_username=anterior["responsible_username"],
+                es_critico=bool(anterior["es_critico"]),
+                monto_adicional_text=_from_cents(int(anterior["monto_adicional_cents"] or 0)),
+                costo_real_text=costo_real_text,
+                costo_account_id=costo_account_id if costo_account_id is not None else anterior["costo_account_id"],
+                costo_es_reembolsable=(costo_es_reembolsable if costo_es_reembolsable is not None
+                                       else bool(anterior["costo_es_reembolsable"])),
+                autorizado_por=anterior["autorizado_por"] or "",
+                fecha_autorizacion=anterior["fecha_autorizacion"],
+                username=username,
+            )
+        fecha = (completed_at or "").strip() or _iso_today()
+        self.conn.execute(
+            "UPDATE case_tasks SET done=1, estado='Hecha', completed_notes=%s, completed_at=%s, completed_by=%s "
+            "WHERE id=%s",
+            ((completed_notes or "").strip(), fecha, (username or "").strip() or None, int(task_id)),
+        )
+        self.conn.commit()
+
+    def set_case_task_estado(self, task_id: int, estado: str, *, username: str = "",
+                             completed_notes: str | None = None) -> None:
+        """Mover la tarjeta de columna. `done` y la fecha real de cierre viajan con el estado:
+        arrastrarla a 'Hecha' es cerrarla, y sacarla de ahí es reabrirla."""
+        if estado not in TASK_ESTADOS:
+            raise ValueError(f"Estado de tarea inválido: use {', '.join(TASK_ESTADOS)}")
+        actual = self.conn.execute("SELECT done FROM case_tasks WHERE id=%s", (int(task_id),)).fetchone()
+        if not actual:
+            raise ValueError("Tarea no encontrada")
+        if estado == "Hecha":
+            self.set_case_task_done(task_id, True, completed_notes, username=username)
+        elif int(actual["done"] or 0) == 1:
+            self.set_case_task_done(task_id, False, None, username=username)
+        self.conn.execute("UPDATE case_tasks SET estado=%s WHERE id=%s", (estado, int(task_id)))
         self.conn.commit()
 
     def update_case_task_notes(self, task_id: int, notes: str | None, completed_notes: str | None = None) -> None:
@@ -3394,15 +3569,82 @@ class Repository:
     def list_plantilla_tareas(self, service_id: int) -> list[Any]:
         return list(
             self.conn.execute(
-                "SELECT * FROM plantillas_tareas WHERE service_id=%s ORDER BY orden ASC, id ASC",
+                """SELECT p.*,
+                          COALESCE((SELECT json_agg(json_build_object('id', e.id, 'nombre', e.nombre, 'color', e.color)
+                                                    ORDER BY e.nombre)
+                                    FROM plantilla_tarea_etiquetas pe JOIN etiquetas_tarea e ON e.id = pe.etiqueta_id
+                                    WHERE pe.plantilla_id = p.id), '[]') AS etiquetas
+                   FROM plantillas_tareas p WHERE p.service_id=%s ORDER BY p.orden ASC, p.id ASC""",
                 (int(service_id),),
             ).fetchall()
         )
+
+    def _set_etiquetas_plantilla(self, plantilla_id: int, etiqueta_ids: list[int] | None) -> None:
+        if etiqueta_ids is None:
+            return
+        self.conn.execute("DELETE FROM plantilla_tarea_etiquetas WHERE plantilla_id=%s", (int(plantilla_id),))
+        for eid in dict.fromkeys(int(e) for e in etiqueta_ids):
+            self.conn.execute(
+                "INSERT INTO plantilla_tarea_etiquetas(plantilla_id, etiqueta_id) VALUES(%s,%s) "
+                "ON CONFLICT DO NOTHING",
+                (int(plantilla_id), eid),
+            )
+
+    def reordenar_plantilla_tareas(self, service_id: int, orden_ids: list[int]) -> None:
+        """El orden de la plantilla es el orden en que se trabaja el caso: primero el estudio
+        registral, después la escritura. Se guarda tal como quedó al arrastrar."""
+        for posicion, plantilla_id in enumerate(orden_ids):
+            self.conn.execute(
+                "UPDATE plantillas_tareas SET orden=%s, updated_at=%s WHERE id=%s AND service_id=%s",
+                (posicion, now_iso(), int(plantilla_id), int(service_id)),
+            )
+        self.conn.commit()
+
+    def copiar_plantilla_tareas(self, *, origen_service_id: int, destino_service_id: int,
+                                created_at: str, reemplazar: bool = False) -> int:
+        """Dos servicios parecidos comparten casi todos los pasos (un divorcio por mutuo
+        consentimiento y uno contencioso). Copiar y ajustar es más rápido que teclear doce
+        tareas de nuevo."""
+        self.get_servicio(origen_service_id)
+        self.get_servicio(destino_service_id)
+        if int(origen_service_id) == int(destino_service_id):
+            raise ValueError("El servicio de origen y el de destino son el mismo")
+        origen = self.list_plantilla_tareas(origen_service_id)
+        if not origen:
+            raise ValueError("El servicio de origen no tiene plantilla de tareas que copiar")
+        if reemplazar:
+            self.conn.execute("DELETE FROM plantillas_tareas WHERE service_id=%s", (int(destino_service_id),))
+            base = 0
+        else:
+            fila = self.conn.execute(
+                "SELECT COALESCE(MAX(orden), -1) AS m FROM plantillas_tareas WHERE service_id=%s",
+                (int(destino_service_id),),
+            ).fetchone()
+            base = int(fila["m"]) + 1
+        for i, p in enumerate(origen):
+            cur = self.conn.execute(
+                "INSERT INTO plantillas_tareas(service_id, titulo, orden, dias_plazo_relativo, es_critico_default, "
+                "costo_estimado_cents, honorario_sugerido_cents, descripcion, responsable_sugerido, "
+                "created_at, updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (int(destino_service_id), p["titulo"], base + i, p["dias_plazo_relativo"],
+                 p["es_critico_default"], p["costo_estimado_cents"], p["honorario_sugerido_cents"],
+                 p["descripcion"], p["responsable_sugerido"], created_at, created_at),
+            )
+            nueva_id = int(cur.lastrowid)
+            for et in (p["etiquetas"] or []):
+                self.conn.execute(
+                    "INSERT INTO plantilla_tarea_etiquetas(plantilla_id, etiqueta_id) VALUES(%s,%s) "
+                    "ON CONFLICT DO NOTHING",
+                    (nueva_id, int(et["id"])),
+                )
+        self.conn.commit()
+        return len(origen)
 
     def create_plantilla_tarea(
         self, *, service_id: int, titulo: str, orden: int = 0,
         dias_plazo_relativo: int | None = None, es_critico_default: bool = False, created_at: str,
         costo_estimado_text: str = "0", honorario_sugerido_text: str = "0",
+        descripcion: str = "", responsable_sugerido: str = "", etiqueta_ids: list[int] | None = None,
     ) -> int:
         t = (titulo or "").strip()
         if not t:
@@ -3410,28 +3652,35 @@ class Repository:
         self.get_servicio(service_id)  # 404 si no existe
         cur = self.conn.execute(
             "INSERT INTO plantillas_tareas(service_id, titulo, orden, dias_plazo_relativo, es_critico_default, "
-            "costo_estimado_cents, honorario_sugerido_cents, created_at, updated_at) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "costo_estimado_cents, honorario_sugerido_cents, descripcion, responsable_sugerido, "
+            "created_at, updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (int(service_id), t, orden, dias_plazo_relativo, 1 if es_critico_default else 0,
              self._to_cents_or_zero(costo_estimado_text), self._to_cents_or_zero(honorario_sugerido_text),
+             (descripcion or "").strip() or None, (responsable_sugerido or "").strip() or None,
              created_at, created_at),
         )
+        plantilla_id = int(cur.lastrowid)
+        self._set_etiquetas_plantilla(plantilla_id, etiqueta_ids)
         self.conn.commit()
-        return int(cur.lastrowid)
+        return plantilla_id
 
     def update_plantilla_tarea(
         self, plantilla_id: int, *, titulo: str, orden: int = 0,
         dias_plazo_relativo: int | None = None, es_critico_default: bool = False,
         costo_estimado_text: str = "0", honorario_sugerido_text: str = "0",
+        descripcion: str = "", responsable_sugerido: str = "", etiqueta_ids: list[int] | None = None,
     ) -> None:
         t = (titulo or "").strip()
         if not t:
             raise ValueError("Título requerido")
+        self._set_etiquetas_plantilla(plantilla_id, etiqueta_ids)
         self.conn.execute(
             "UPDATE plantillas_tareas SET titulo=%s, orden=%s, dias_plazo_relativo=%s, es_critico_default=%s, "
-            "costo_estimado_cents=%s, honorario_sugerido_cents=%s, updated_at=%s WHERE id=%s",
+            "costo_estimado_cents=%s, honorario_sugerido_cents=%s, descripcion=%s, responsable_sugerido=%s, "
+            "updated_at=%s WHERE id=%s",
             (t, orden, dias_plazo_relativo, 1 if es_critico_default else 0,
              self._to_cents_or_zero(costo_estimado_text), self._to_cents_or_zero(honorario_sugerido_text),
+             (descripcion or "").strip() or None, (responsable_sugerido or "").strip() or None,
              now_iso(), int(plantilla_id)),
         )
         self.conn.commit()

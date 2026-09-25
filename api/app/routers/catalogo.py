@@ -5,7 +5,14 @@ from fastapi import APIRouter, HTTPException, Query
 from aglegal.db import now_iso
 
 from ..deps import CurrentUser, RepoDep, require_permission
-from ..schemas.case import PlantillaTareaIn, PlantillaTareaOut
+from ..schemas.case import (
+    CopiarPlantillaIn,
+    EtiquetaTareaIn,
+    EtiquetaTareaOut,
+    PlantillaTareaIn,
+    PlantillaTareaOut,
+    ReordenarPlantillaIn,
+)
 from ..schemas.catalogo import (
     CategoriaOut,
     FamiliaOut,
@@ -87,6 +94,8 @@ def create_plantilla_tarea(service_id: int, body: PlantillaTareaIn, current_user
         dias_plazo_relativo=body.dias_plazo_relativo, es_critico_default=body.es_critico_default,
         costo_estimado_text=str(body.costo_estimado) if body.costo_estimado is not None else "0",
         honorario_sugerido_text=str(body.honorario_sugerido) if body.honorario_sugerido is not None else "0",
+        descripcion=body.descripcion, responsable_sugerido=body.responsable_sugerido,
+        etiqueta_ids=body.etiqueta_ids,
         created_at=now_iso(),
     )
     row = next(r for r in repo.list_plantilla_tareas(service_id) if r["id"] == plantilla_id)
@@ -102,6 +111,8 @@ def update_plantilla_tarea(plantilla_id: int, body: PlantillaTareaIn, current_us
         dias_plazo_relativo=body.dias_plazo_relativo, es_critico_default=body.es_critico_default,
         costo_estimado_text=str(body.costo_estimado) if body.costo_estimado is not None else "0",
         honorario_sugerido_text=str(body.honorario_sugerido) if body.honorario_sugerido is not None else "0",
+        descripcion=body.descripcion, responsable_sugerido=body.responsable_sugerido,
+        etiqueta_ids=body.etiqueta_ids,
     )
     row = repo.conn.execute("SELECT * FROM plantillas_tareas WHERE id=%s", (plantilla_id,)).fetchone()
     if not row:
@@ -114,6 +125,56 @@ def delete_plantilla_tarea(plantilla_id: int, current_user: CurrentUser, repo: R
     if not current_user["is_admin"]:
         raise HTTPException(403, "Solo un administrador puede editar plantillas de tareas")
     repo.delete_plantilla_tarea(plantilla_id)
+
+
+@router.put("/servicios/{service_id}/plantilla-tareas/orden", response_model=list[PlantillaTareaOut])
+def reordenar_plantilla(service_id: int, body: ReordenarPlantillaIn, current_user: CurrentUser,
+                        repo: RepoDep) -> list[PlantillaTareaOut]:
+    """El orden de la plantilla es el orden en que se trabaja el caso."""
+    if not current_user["is_admin"]:
+        raise HTTPException(403, "Solo un administrador puede editar plantillas de tareas")
+    repo.reordenar_plantilla_tareas(service_id, body.orden_ids)
+    return [PlantillaTareaOut.from_row(r) for r in repo.list_plantilla_tareas(service_id)]
+
+
+@router.post("/servicios/{service_id}/plantilla-tareas/copiar", response_model=list[PlantillaTareaOut])
+def copiar_plantilla(service_id: int, body: CopiarPlantillaIn, current_user: CurrentUser,
+                     repo: RepoDep) -> list[PlantillaTareaOut]:
+    """Copiar la plantilla de otro servicio parecido y ajustarla."""
+    if not current_user["is_admin"]:
+        raise HTTPException(403, "Solo un administrador puede editar plantillas de tareas")
+    repo.copiar_plantilla_tareas(origen_service_id=body.origen_service_id, destino_service_id=service_id,
+                                 reemplazar=body.reemplazar, created_at=now_iso())
+    return [PlantillaTareaOut.from_row(r) for r in repo.list_plantilla_tareas(service_id)]
+
+
+# ── Etiquetas de tarea (las del tablero) ───────────────────────────────────
+
+@router.get("/etiquetas-tarea", response_model=list[EtiquetaTareaOut])
+def list_etiquetas(current_user: CurrentUser, repo: RepoDep) -> list[EtiquetaTareaOut]:
+    return [EtiquetaTareaOut.from_row(r) for r in repo.list_etiquetas_tarea()]
+
+
+@router.post("/etiquetas-tarea", response_model=EtiquetaTareaOut, status_code=201)
+def create_etiqueta(body: EtiquetaTareaIn, current_user: CurrentUser, repo: RepoDep,
+                    _: dict = require_permission("tareas", "editar")) -> EtiquetaTareaOut:
+    etiqueta_id = repo.create_etiqueta_tarea(nombre=body.nombre, color=body.color, created_at=now_iso())
+    row = next(r for r in repo.list_etiquetas_tarea() if int(r["id"]) == etiqueta_id)
+    return EtiquetaTareaOut.from_row(row)
+
+
+@router.put("/etiquetas-tarea/{etiqueta_id}", response_model=EtiquetaTareaOut)
+def update_etiqueta(etiqueta_id: int, body: EtiquetaTareaIn, current_user: CurrentUser, repo: RepoDep,
+                    _: dict = require_permission("tareas", "editar")) -> EtiquetaTareaOut:
+    repo.update_etiqueta_tarea(etiqueta_id, nombre=body.nombre, color=body.color)
+    row = next(r for r in repo.list_etiquetas_tarea() if int(r["id"]) == etiqueta_id)
+    return EtiquetaTareaOut.from_row(row)
+
+
+@router.delete("/etiquetas-tarea/{etiqueta_id}", status_code=204)
+def delete_etiqueta(etiqueta_id: int, current_user: CurrentUser, repo: RepoDep,
+                    _: dict = require_permission("tareas", "editar")):
+    repo.delete_etiqueta_tarea(etiqueta_id)
 
 
 @router.get("/historial", response_model=list[HistorialEntryOut])
