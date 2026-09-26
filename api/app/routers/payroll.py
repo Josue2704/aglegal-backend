@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from fastapi import APIRouter
+from pydantic import BaseModel
+from ..access import require_any
 
 from aglegal.db import now_iso
 
@@ -59,6 +61,45 @@ def calcular_indemnizacion(body: IndemnizacionIn, current_user: CurrentUser, rep
     return IndemnizacionOut.from_resultado(resultado)
 
 
+@router.get('/cuentas', dependencies=[require_permission('nominas','crear')])
+def payroll_accounts(current_user: CurrentUser, repo: RepoDep):
+    return [dict(id=r['id'],account_code=r['account_code'],nombre=r['nombre'])
+            for r in repo.list_plan_cuentas(tipo='Egreso',estado='Activo')]
+
+
+@router.get('/personal', dependencies=[require_any('nominas.ver','nominas.crear','nominas.editar')])
+def payroll_personal(current_user: CurrentUser, repo: RepoDep):
+    return [dict(id=r['id'],persona=r['persona'],cargo=r['cargo'],
+                 monto_mensual=(r['monto_mensual_cents'] or 0)/100,account_id=r['account_id'],
+                 estado=r['estado'],mes_inicio=r['mes_inicio'],mes_fin=r['mes_fin'])
+            for r in repo.list_personal()]
+
+
+class ObligationPayment(BaseModel):
+    payment_date: str
+    reference: str
+
+
+class ReversalIn(BaseModel):
+    reason: str
+
+
+@router.get('/obligaciones', dependencies=[require_permission('nominas','ver')])
+def payroll_obligations(current_user: CurrentUser, repo: RepoDep):
+    return [dict(r,amount=r['amount_cents']/100) for r in repo.list_payroll_obligations()]
+
+
+@router.post('/obligaciones/{obligation_id}/pagar', dependencies=[require_permission('nominas','crear')])
+def pay_obligation(obligation_id: int, body: ObligationPayment, current_user: CurrentUser, repo: RepoDep):
+    return dict(expense_id=repo.pay_payroll_obligation(obligation_id,**body.model_dump(),actor=current_user['username']))
+
+
+@router.post('/obligaciones/{obligation_id}/anular', dependencies=[require_permission('nominas','eliminar')])
+def reverse_obligation(obligation_id: int, body: ReversalIn, current_user: CurrentUser, repo: RepoDep):
+    repo.reverse_payroll_obligation(obligation_id,reason=body.reason,actor=current_user['username'])
+    return dict(ok=True)
+
+
 @router.get("", response_model=list[PayrollOut])
 def list_payroll(current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("nominas", "ver")) -> list[PayrollOut]:
     return [PayrollOut.from_row(row) for row in repo.list_payrolls()]
@@ -83,6 +124,7 @@ def preview_payroll(body: PayrollPreviewIn, current_user: CurrentUser, repo: Rep
 @router.post("", response_model=PayrollOut, status_code=201)
 def create_payroll(body: PayrollIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("nominas", "crear")) -> PayrollOut:
     payroll_id = repo.create_payroll(
+        account_id=body.account_id,
         employee_name=body.employee_name,
         role=body.role,
         period=body.period,
@@ -99,6 +141,7 @@ def create_payroll(body: PayrollIn, current_user: CurrentUser, repo: RepoDep, _:
         descuento_faltas_text=str(body.descuento_faltas),
         descuento_prestamos_text=str(body.descuento_prestamos),
         otros_descuentos_text=str(body.otros_descuentos),
+        username=current_user["username"],
         created_at=now_iso(),
     )
     return PayrollOut.from_row(repo.get_payroll(payroll_id))
@@ -123,7 +166,7 @@ def get_payroll_audit_log(payroll_id: int, current_user: CurrentUser, repo: Repo
 
 @router.delete("/{payroll_id}", status_code=204)
 def delete_payroll(payroll_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("nominas", "eliminar")):
-    repo.delete_payroll(payroll_id)
+    repo.delete_payroll(payroll_id, username=current_user["username"])
 
 
 @router.get("/config/historial", response_model=list[PayrollConfigOut])

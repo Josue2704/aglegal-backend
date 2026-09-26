@@ -4,7 +4,10 @@ from fastapi import APIRouter
 
 from aglegal.db import now_iso
 
-from ..deps import CurrentUser, RepoDep, require_permission
+from ..deps import AdminRequired, CurrentUser, RepoDep, require_permission
+from aglegal.governance import propose, decide
+from pydantic import BaseModel
+from ..access import require_any
 from ..schemas.finanzas import (
     CarteraPonderadaOut,
     CuentaIn,
@@ -40,28 +43,22 @@ def list_cuentas(
     return [CuentaOut.from_row(row) for row in repo.list_plan_cuentas(tipo=tipo, estado=estado)]
 
 
-@router.post("/cuentas", response_model=CuentaOut, status_code=201)
-def create_cuenta(body: CuentaIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("finanzas", "crear")) -> CuentaOut:
-    cuenta_id = repo.create_cuenta(
-        account_code=body.account_code, tipo=body.tipo, grupo=body.grupo, subgrupo=body.subgrupo,
-        nombre=body.nombre, naturaleza=body.naturaleza, category_id=body.category_id, family_id=body.family_id,
-        centro_costo=body.centro_costo, afecta_utilidad=body.afecta_utilidad, regla_de_uso=body.regla_de_uso,
-        created_at=now_iso(),
-    )
-    return CuentaOut.from_row(repo.get_cuenta(cuenta_id))
+@router.post("/cuentas", status_code=201)
+def create_cuenta(body: CuentaIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("finanzas", "crear")) -> dict:
+    return propose(repo,entity='cuenta',entity_id=None,action='crear',payload=body.model_dump(exclude={'motivo'}),reason=body.motivo,actor=current_user['username'])
 
 
-@router.put("/cuentas/{cuenta_id}", response_model=CuentaOut)
-def update_cuenta(cuenta_id: int, body: CuentaUpdate, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("finanzas", "editar")) -> CuentaOut:
-    repo.update_cuenta(
-        cuenta_id, grupo=body.grupo, subgrupo=body.subgrupo, nombre=body.nombre, naturaleza=body.naturaleza,
-        category_id=body.category_id, family_id=body.family_id, centro_costo=body.centro_costo,
-        afecta_utilidad=body.afecta_utilidad, regla_de_uso=body.regla_de_uso, estado=body.estado,
-    )
-    return CuentaOut.from_row(repo.get_cuenta(cuenta_id))
+@router.put("/cuentas/{cuenta_id}")
+def update_cuenta(cuenta_id: int, body: CuentaUpdate, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("finanzas", "editar")) -> dict:
+    return propose(repo,entity='cuenta',entity_id=cuenta_id,action='editar',payload=body.model_dump(exclude={'motivo'}),reason=body.motivo,actor=current_user['username'])
 
 
 # --- Personal
+
+@router.get('/personal/choices', dependencies=[require_any('expedientes.crear','expedientes.editar','pipeline.editar','comisiones.ver','comisiones.editar')])
+def personal_choices(current_user: CurrentUser, repo: RepoDep):
+    return [dict(id=r['id'],persona=r['persona']) for r in repo.list_personal(estado='Activo')]
+
 
 @router.get("/personal", response_model=list[PersonaOut])
 def list_personal(
@@ -193,32 +190,20 @@ def list_forecast(
     return [ForecastOut.from_row(row) for row in repo.list_forecast(mes=mes, family_id=family_id)]
 
 
-@router.post("/forecast", response_model=ForecastOut, status_code=201)
-def create_forecast(body: ForecastIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("finanzas", "crear")) -> ForecastOut:
-    forecast_id = repo.create_forecast(
-        family_id=body.family_id, mes=body.mes,
-        volumen_meta_text=str(body.volumen_meta) if body.volumen_meta is not None else "",
-        ticket_objetivo_text=str(body.ticket_objetivo) if body.ticket_objetivo is not None else "",
-        margen_directo_objetivo_pct=body.margen_directo_objetivo_pct,
-        created_at=now_iso(),
-    )
-    return ForecastOut.from_row(repo.get_forecast(forecast_id))
+@router.post("/forecast", status_code=201)
+def create_forecast(body: ForecastIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("finanzas", "crear")) -> dict:
+    return propose(repo,entity='forecast',entity_id=None,action='crear',payload=body.model_dump(exclude={'motivo'}),reason=body.motivo,actor=current_user['username'])
 
 
-@router.put("/forecast/{forecast_id}", response_model=ForecastOut)
-def update_forecast(forecast_id: int, body: ForecastUpdate, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("finanzas", "editar")) -> ForecastOut:
-    repo.update_forecast(
-        forecast_id,
-        volumen_meta_text=str(body.volumen_meta) if body.volumen_meta is not None else "",
-        ticket_objetivo_text=str(body.ticket_objetivo) if body.ticket_objetivo is not None else "",
-        margen_directo_objetivo_pct=body.margen_directo_objetivo_pct,
-    )
-    return ForecastOut.from_row(repo.get_forecast(forecast_id))
+@router.put("/forecast/{forecast_id}")
+def update_forecast(forecast_id: int, body: ForecastUpdate, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("finanzas", "editar")) -> dict:
+    return propose(repo,entity='forecast',entity_id=forecast_id,action='editar',payload=body.model_dump(exclude={'motivo'}),reason=body.motivo,actor=current_user['username'])
 
 
-@router.delete("/forecast/{forecast_id}", status_code=204)
-def delete_forecast(forecast_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("finanzas", "eliminar")):
-    repo.delete_forecast(forecast_id)
+@router.delete("/forecast/{forecast_id}")
+def delete_forecast(forecast_id: int, current_user: CurrentUser, repo: RepoDep, motivo: str = '', _: dict = require_permission("finanzas", "eliminar")):
+    return propose(repo,entity='forecast',entity_id=forecast_id,action='eliminar',payload={},reason=motivo,actor=current_user['username'])
+
 
 
 # --- Cartera ponderada y proyección de cierre de mes
@@ -306,7 +291,7 @@ def ingresos_por_origen(
             "ingresos": r["ingresos_cents"] / 100,
             "costos_directos": r["costos_directos_cents"] / 100,
             "utilidad_directa": r["utilidad_directa_cents"] / 100,
-            "margen_pct": r["margen_pct"],
+            "margen_pct": r["margen_pct"], "expedientes": r["expedientes"],
         }
         for r in repo.ingresos_por_origen(desde=desde, hasta=hasta, agrupar_por=agrupar_por)
     ]
@@ -314,11 +299,11 @@ def ingresos_por_origen(
 
 @router.get("/dias-cobro")
 def dias_cobro(
-    current_user: CurrentUser, repo: RepoDep, desde: str, hasta: str,
+    current_user: CurrentUser, repo: RepoDep, desde: str, hasta: str, service_id: int | None = None, client_id: int | None = None,
     _: dict = require_permission("finanzas", "ver"),
 ) -> dict:
     """KPI-016 — dias promedio entre la facturacion (o el cierre) y el cobro."""
-    return repo.dias_promedio_cobro(desde=desde, hasta=hasta)
+    return repo.dias_promedio_cobro(desde=desde, hasta=hasta,service_id=service_id,client_id=client_id)
 
 
 @router.get("/aging-cartera")
@@ -385,3 +370,31 @@ def centros_costo(current_user: CurrentUser, repo: RepoDep, desde: str, hasta: s
             for c in d["centros"]
         ],
     }
+
+
+class FinancialDecision(BaseModel):
+    approve: bool
+    evidence: str
+
+
+@router.get('/propuestas', dependencies=[require_permission('finanzas','ver')])
+def financial_proposals(current_user: CurrentUser, repo: RepoDep):
+    labels={}
+    for field,table,code in [('category_id','categorias','category_code'),('family_id','familias','family_code')]:
+        for row in repo.conn.execute(f'SELECT id,nombre,{code} AS code FROM {table}').fetchall():
+            labels[f"{field}:{row['id']}"]=f"{row['code']} · {row['nombre']}"
+    return [dict(r,reference_labels=labels) for r in repo.conn.execute('SELECT * FROM financial_requests ORDER BY id DESC').fetchall()]
+
+
+@router.post('/propuestas/{request_id}/decision')
+def financial_decision(request_id: int, body: FinancialDecision, current_user: AdminRequired, repo: RepoDep):
+    return decide(repo,request_id,approve=body.approve,evidence=body.evidence,actor=current_user['username'])
+
+
+@router.get('/explorador', dependencies=[require_permission('finanzas','ver')])
+def financial_explorer(current_user: CurrentUser, repo: RepoDep, desde: str, hasta: str,
+    category_id: int | None = None, subcategory_id: int | None = None, service_id: int | None = None,
+    family_id: int | None = None, client_id: int | None = None, origen_negocio: str | None = None):
+    from aglegal.indicators import explorer
+    return explorer(repo,desde=desde,hasta=hasta,category_id=category_id,subcategory_id=subcategory_id,
+        service_id=service_id,family_id=family_id,client_id=client_id,origen_negocio=origen_negocio)

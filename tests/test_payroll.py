@@ -149,3 +149,165 @@ def test_tasa_de_ley_fuera_de_rango_es_rechazada(repo):
             tramos_renta=[], recargo_hora_extra_pct=0.5, recargo_nocturnidad_pct=0.25,
             horas_jornada_mensual=240, created_at=now_iso(),
         )
+
+
+def _calculated(repo, person, **extra):
+    return repo.create_payroll(personal_id=person, period='2026-08', payment_date='2026-08-31',
+        modo='calculado', salario_base_text='800', notes='', created_at=now_iso(), **extra)
+
+
+def test_cash_moves_only_when_each_payroll_component_is_paid(repo, persona_con_cuenta):
+    pid = _calculated(repo, persona_con_cuenta)
+    p = repo.get_payroll(pid)
+    assert p['cash_model'] == 'separado'
+    assert repo.get_expense(p['expense_id'])['amount_cents'] == p['amount_cents']
+    rows = [r for r in repo.list_payroll_obligations() if r['payroll_id'] == pid]
+    assert {r['kind'] for r in rows} == {'ISSS','AFP','ISR'}
+    assert p['amount_cents'] + sum(r['amount_cents'] for r in rows) == p['costo_empresa_cents']
+    paid = []
+    for r in rows:
+        eid = repo.pay_payroll_obligation(r['id'], payment_date='2026-09-05', reference='Transferencia', actor='tester')
+        # A retry cannot create a second expense.
+        assert repo.pay_payroll_obligation(r['id'], payment_date='2026-09-05', reference='Transferencia', actor='tester') == eid
+        e = repo.get_expense(eid)
+        assert e['amount_cents'] == r['amount_cents'] and e['expense_date'] == '2026-09-05'
+        assert e['account_id'] == repo.get_expense(p['expense_id'])['account_id']
+        paid.append(eid)
+    with pytest.raises(ValueError, match='obligaciones'):
+        repo.delete_payroll(pid)
+    with pytest.raises(ValueError, match='Nóminas'):
+        repo.delete_expense(paid[0])
+    for r, eid in zip(rows,paid):
+        repo.reverse_payroll_obligation(r['id'],reason='Referencia incorrecta',actor='tester')
+        assert repo.get_expense(eid) is None
+    repo.delete_payroll(pid,username='tester')
+    assert repo.get_expense(p['expense_id']) is None
+    assert not [r for r in repo.list_payroll_obligations() if r['payroll_id'] == pid]
+    assert repo.conn.execute("SELECT 1 FROM workflow_events WHERE entity_type='payroll' AND entity_id=%s AND event='Anulación'",(pid,)).fetchone()
+
+
+def test_calculated_net_cannot_diverge_and_expense_cannot_be_edited_directly(repo, persona_con_cuenta):
+    pid = _calculated(repo,persona_con_cuenta)
+    p = repo.get_payroll(pid)
+    with pytest.raises(ValueError, match='neto calculado'):
+        repo.update_payroll(pid,payment_date='2026-08-31',notes='',amount_text='1',username='tester')
+    with pytest.raises(ValueError, match='Nóminas'):
+        repo.update_expense(p['expense_id'],detail='Cambio externo',amount_text='1',expense_date='2026-08-31',notes='')
+    with pytest.raises(ValueError, match='Nóminas'):
+        repo.delete_expense(p['expense_id'])
+    assert repo.get_payroll(pid)['amount_cents'] == p['amount_cents']
+
+
+def test_failed_payroll_insert_does_not_leave_an_orphan_expense(repo, persona_con_cuenta, monkeypatch):
+    before = len(repo.list_expenses())
+    execute = repo.conn.execute
+    def fail(sql, params=()):
+        if sql.startswith('INSERT INTO payrolls'):
+            raise RuntimeError('simulated failure')
+        return execute(sql,params)
+    with monkeypatch.context() as patch:
+        patch.setattr(repo.conn,'execute',fail)
+        with pytest.raises(RuntimeError):
+            _calculated(repo,persona_con_cuenta)
+    assert len(repo.list_expenses()) == before
+    assert not repo.conn.execute('SELECT 1 FROM payrolls WHERE personal_id=%s',(persona_con_cuenta,)).fetchone()
+
+
+@pytest.mark.parametrize('period,payment_date,amount', [
+    ('2026-99','2026-08-31','50'),('2026-08','2026-02-30','50'),
+    ('2026-08','2026-08-31','0'),('2026-08','2026-08-31','-1'),
+    ('2025-12','2026-08-31','50'),
+])
+def test_invalid_manual_payroll_cannot_write_expenses(repo,persona_con_cuenta,period,payment_date,amount):
+    before=len(repo.list_expenses())
+    with pytest.raises(ValueError):
+        repo.create_payroll(personal_id=persona_con_cuenta,period=period,payment_date=payment_date,
+                            notes='',created_at=now_iso(),amount_text=amount)
+    assert len(repo.list_expenses()) == before
+
+
+def test_preview_can_warn_but_negative_payment_cannot_be_saved(repo,persona_con_cuenta):
+    before=len(repo.list_expenses())
+    with pytest.raises(ValueError,match='negativo'):
+        _calculated(repo,persona_con_cuenta,descuento_prestamos_text='900')
+    assert len(repo.list_expenses()) == before
+
+
+def test_concurrent_duplicate_payroll_leaves_exactly_one_expense(repo,persona_con_cuenta):
+    from concurrent.futures import ThreadPoolExecutor
+    from aglegal.db import connect
+    from aglegal.repositories import Repository
+    before=len(repo.list_expenses())
+    def create():
+        conn=connect()
+        try:
+            return _calculated(Repository(conn),persona_con_cuenta)
+        except ValueError as exc:
+            assert 'Ya existe' in str(exc)
+            return None
+        finally:
+            conn.close()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results=list(pool.map(lambda _:create(),range(2)))
+    assert sum(r is not None for r in results)==1
+    assert len(repo.list_expenses()) == before+1
+
+
+def test_payroll_permissions_are_independent_of_finance_and_config_roundtrips(repo,persona_con_cuenta):
+    from fastapi.testclient import TestClient
+    from api.app.main import app
+    from api.app.deps import get_current_user
+    user=dict(id=1,username='payroll_only',role='Nóminas',is_admin=False,
+              permissions={'nominas.ver','nominas.crear','nominas.editar'})
+    app.dependency_overrides[get_current_user]=lambda:user
+    try:
+        with TestClient(app) as client:
+            response=client.get('/payroll/personal')
+            assert response.status_code==200
+            assert any(r['id']==persona_con_cuenta for r in response.json())
+            assert client.get('/finanzas/personal').status_code==403
+            assert client.get('/payroll/obligaciones').status_code==200
+            cfg=client.get('/payroll/config/vigente').json()
+            assert cfg['tramos_renta'][0]['hasta']==550
+            assert cfg['tramos_renta'][1]['cuota_fija']==17.67
+            saved=client.post('/payroll/config',json={**cfg,'vigente_desde':'2035-01-01'})
+            assert saved.status_code==201,saved.text
+            assert saved.json()['tramos_renta']==cfg['tramos_renta']
+            user['permissions']={'nominas.ver'}
+            assert client.post('/payroll',json=dict(employee_name='No autorizado',period='2026-08',payment_date='2026-08-31',amount=10)).status_code==403
+            assert client.post('/payroll/obligaciones/1/pagar',json=dict(payment_date='2026-08-31',reference='No autorizado')).status_code==403
+            assert client.post('/payroll/config',json={**cfg,'vigente_desde':'2036-01-01'}).status_code==403
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_external_person_has_explicit_account(repo,cuenta_personal):
+    pid=repo.create_payroll(employee_name='Colaborador externo',account_id=cuenta_personal,
+        amount_text='75.50',period='2026-08',payment_date='2026-08-31',notes='Ajuste calculado',created_at=now_iso())
+    row=repo.get_payroll(pid)
+    assert row['personal_id'] is None
+    assert repo.get_expense(row['expense_id'])['account_id']==cuenta_personal
+    assert row['amount_cents']==7550
+
+
+def test_payroll_neither_settles_nor_recreates_commissions(repo,catalogo,cuenta_personal):
+    import uuid
+    from datetime import date
+    person=catalogo['persona_id']
+    repo.conn.execute('UPDATE personal SET account_id=%s WHERE id=%s',(cuenta_personal,person));repo.conn.commit()
+    month=date.today().isoformat()[:7]
+    case=repo.create_case(client_id=catalogo['cliente_id'],title='Nómina y comisión',status='Abierto',priority='Media',
+        opened_at=month+'-01',created_at=now_iso(),honorarios_contratados_text='1000',service_id=catalogo['servicio_id'])
+    repo.set_negocio_originadores(case,originadores=[dict(personal_id=person,porcentaje_participacion=100,tipo_origen='Cliente nuevo')],created_at=now_iso())
+    repo.create_income(client_id=catalogo['cliente_id'],case_id=case,amount_text='500',income_date=month+'-01',
+                       created_at=now_iso(),account_id=catalogo['cuenta_id'])
+    commission=repo.list_comisiones(case_id=case)[0]
+    pid=_calculated(repo,person)
+    assert repo.get_comision(commission['id'])['estado']=='Calculada'
+    repo.approve_commission(commission['id'],eligible=True,evidence='Origen comprobado',actor='tester')
+    settled=repo.settle_commissions(commission_ids=[commission['id']],payment_date=date.today().isoformat(),
+        reference='Pago separado',account_id=cuenta_personal,request_key=uuid.uuid4().hex,actor='tester')
+    assert settled['expense_id'] != repo.get_payroll(pid)['expense_id']
+    repo.delete_payroll(pid)
+    assert repo.get_comision(commission['id'])['estado']=='Pagada'
+    assert repo.get_expense(settled['expense_id']) is not None

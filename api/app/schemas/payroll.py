@@ -5,7 +5,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 
-class PayrollIn(BaseModel):
+class PayrollInput(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
+
+class PayrollIn(PayrollInput):
+    account_id: int | None = None
     employee_name: str = ""
     role: str = ""
     period: str
@@ -26,7 +31,7 @@ class PayrollIn(BaseModel):
     otros_descuentos: float = 0
 
 
-class PayrollUpdate(BaseModel):
+class PayrollUpdate(PayrollInput):
     payment_date: str
     notes: str = ""
     amount: float
@@ -61,9 +66,9 @@ class PayrollOut(BaseModel):
     afp_patronal: float = 0
     total_devengado: float = 0
     total_descuentos: float = 0
-    # Lo que la planilla le cuesta al despacho: devengado + aporte patronal (el neto es
-    # solo la parte que recibe la persona; lo retenido también lo desembolsa la firma).
+    # Accrued labor cost; cash comprises net pay plus remittances when paid.
     costo_empresa: float = 0
+    cash_model: str = "legacy"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -97,7 +102,7 @@ class PayrollOut(BaseModel):
         return cls(**d)
 
 
-class PayrollPreviewIn(BaseModel):
+class PayrollPreviewIn(PayrollInput):
     salario_base: float
     horas_extra_cantidad: float = 0
     nocturnidad_horas: float = 0
@@ -151,14 +156,14 @@ class PayrollPreviewOut(BaseModel):
         )
 
 
-class PayrollConfigTramoRenta(BaseModel):
+class PayrollConfigTramoRenta(PayrollInput):
     sobre_exceso_de: float
     hasta: float | None = None
     cuota_fija: float
     porcentaje_exceso: float
 
 
-class PayrollConfigIn(BaseModel):
+class PayrollConfigIn(PayrollInput):
     vigente_desde: str
     isss_tasa_empleado: float
     isss_tasa_patronal: float
@@ -168,7 +173,7 @@ class PayrollConfigIn(BaseModel):
     afp_tope_cotizable: float | None = None
     tope_salario_indemnizacion: float | None = None
     tramos_renta: list[PayrollConfigTramoRenta] = []
-    recargo_hora_extra_pct: float = 0.5
+    recargo_hora_extra_pct: float = 1.0
     recargo_nocturnidad_pct: float = 0.25
     horas_jornada_mensual: float = 240
     notas: str = ""
@@ -197,13 +202,17 @@ class PayrollConfigOut(BaseModel):
         isss_tope = d.pop("isss_tope_cotizable_cents")
         afp_tope = d.pop("afp_tope_cotizable_cents")
         indemnizacion_tope = d.pop("tope_salario_indemnizacion_cents", None)
+        d['tramos_renta'] = [dict(sobre_exceso_de=t['sobre_exceso_de_cents']/100,
+            hasta=t['hasta_cents']/100 if t.get('hasta_cents') is not None else None,
+            cuota_fija=t['cuota_fija_cents']/100,porcentaje_exceso=t['porcentaje_exceso'])
+            for t in (d['tramos_renta'] or [])]
         d["isss_tope_cotizable"] = isss_tope / 100 if isss_tope is not None else None
         d["afp_tope_cotizable"] = afp_tope / 100 if afp_tope is not None else None
         d["tope_salario_indemnizacion"] = indemnizacion_tope / 100 if indemnizacion_tope is not None else None
         return cls(**d)
 
 
-class AguinaldoIn(BaseModel):
+class AguinaldoIn(PayrollInput):
     salario_base: float
     anios_antiguedad: float
     dias_trabajados_en_anio: int | None = None
@@ -224,7 +233,7 @@ class AguinaldoOut(BaseModel):
         )
 
 
-class VacacionesIn(BaseModel):
+class VacacionesIn(PayrollInput):
     salario_base: float
     dias: float = 15
 
@@ -239,7 +248,7 @@ class VacacionesOut(BaseModel):
         return cls(salario_dias=r.salario_dias_cents / 100, recargo_30=r.recargo_30_cents / 100, total=r.total_cents / 100)
 
 
-class IndemnizacionIn(BaseModel):
+class IndemnizacionIn(PayrollInput):
     salario_base: float
     anios_servicio: float
     fecha: str | None = None

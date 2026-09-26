@@ -29,7 +29,7 @@ class FinancialWorkflowRepository:
 
     def incomplete_collection_plans(self):
         return [dict(r) for r in self.conn.execute('''SELECT cs.id, cs.title FROM cases cs
-            WHERE cs.archived_at IS NULL AND cs.estado_cobro <> 'Suspendido'
+            WHERE cs.archived_at IS NULL
               AND (cs.mes_cobro_esperado IS NULL OR cs.probabilidad_cobro IS NULL)
               AND cs.honorarios_contratados_cents > COALESCE((SELECT SUM(monto_neto_operativo_cents)
                     FROM incomes WHERE case_id=cs.id),0) ORDER BY cs.id''').fetchall()]

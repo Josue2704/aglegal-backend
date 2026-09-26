@@ -10,6 +10,7 @@ from aglegal.db import now_iso
 from aglegal.repositories import ATTACH_ENTITY_TYPES
 
 from ..deps import CurrentUser, DbDep, RepoDep
+from ..access import check_attachment
 from ..schemas.attachment import AttachmentOut
 
 router = APIRouter(prefix="/attachments", tags=["attachments"])
@@ -24,6 +25,7 @@ def list_attachments(
     current_user: CurrentUser,
     repo: RepoDep,
 ) -> list[AttachmentOut]:
+    check_attachment(current_user, entity_type, entity_id, 'ver', repo.conn)
     return [AttachmentOut(**dict(row)) for row in repo.list_attachments(entity_type=entity_type, entity_id=entity_id)]
 
 
@@ -43,6 +45,7 @@ _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 @router.get("/avatar/{entity_type}/{entity_id}", response_model=AttachmentOut)
 def get_avatar(entity_type: str, entity_id: int, current_user: CurrentUser, conn: DbDep) -> AttachmentOut:
     """Return the avatar attachment for an entity, or 404 if none."""
+    check_attachment(current_user, entity_type, entity_id, 'ver', conn)
     row = conn.execute(
         "SELECT * FROM attachments WHERE entity_type=%s AND entity_id=%s AND doc_role='avatar' ORDER BY id DESC LIMIT 1",
         (entity_type, entity_id),
@@ -61,6 +64,7 @@ async def upload_attachment(
     file: UploadFile = File(...),
     doc_role: str | None = Form(None),
 ) -> AttachmentOut:
+    check_attachment(current_user, entity_type, entity_id, 'editar', conn)
     if entity_type not in ATTACH_ENTITY_TYPES:
         raise HTTPException(400, f"Tipo inválido. Valores permitidos: {ATTACH_ENTITY_TYPES}")
 
@@ -68,13 +72,15 @@ async def upload_attachment(
     if suffix not in _ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Tipo de archivo no permitido: {suffix}")
 
-    role = doc_role if doc_role in _VALID_DOC_ROLES else None
+    if doc_role and doc_role not in _VALID_DOC_ROLES:
+        raise HTTPException(400, 'Clasificación de documento inválida')
+    role = doc_role or None
 
     # Avatar must be an image
     if role == "avatar" and suffix not in _IMAGE_EXTENSIONS:
         raise HTTPException(400, "El avatar debe ser una imagen (png, jpg, jpeg, webp)")
 
-    content = await file.read()
+    content = await file.read(_MAX_UPLOAD_BYTES + 1)
     if len(content) > _MAX_UPLOAD_BYTES:
         raise HTTPException(413, "El archivo supera el límite de 20 MB")
 
@@ -109,6 +115,7 @@ def download_attachment(attachment_id: int, current_user: CurrentUser, conn: DbD
     row = conn.execute("SELECT * FROM attachments WHERE id=%s", (attachment_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Adjunto no encontrado")
+    check_attachment(current_user, row['entity_type'], row['entity_id'], 'ver', conn)
     path = Path(str(row["stored_path"]))
     if not path.exists():
         raise HTTPException(404, "Archivo no encontrado en disco")
@@ -117,4 +124,8 @@ def download_attachment(attachment_id: int, current_user: CurrentUser, conn: DbD
 
 @router.delete("/{attachment_id}", status_code=204)
 def delete_attachment(attachment_id: int, current_user: CurrentUser, repo: RepoDep):
+    row = repo.conn.execute('SELECT * FROM attachments WHERE id=%s',(attachment_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, 'Adjunto no encontrado')
+    check_attachment(current_user, row['entity_type'], row['entity_id'], 'editar', repo.conn)
     repo.delete_attachment(attachment_id)

@@ -192,7 +192,7 @@ def test_avisa_cuando_la_cita_choca_con_otra(repo, catalogo):
     assert repo.create_session(consult_type="Tercera", start_time="10:30", end_time="11:00", **base)
 
 
-def test_un_caso_cerrado_o_suspendido_sale_de_la_cartera(repo, catalogo, codigo_unico):
+def test_cerrar_o_suspender_no_elimina_deuda_de_la_cartera(repo, catalogo, codigo_unico):
     caso = _caso(repo, catalogo, honorarios="900", titulo=f"Caso que se cae {codigo_unico}")
     repo.conn.execute("UPDATE cases SET mes_cobro_esperado=%s WHERE id=%s", (MES, caso))
     repo.conn.commit()
@@ -201,4 +201,4 @@ def test_un_caso_cerrado_o_suspendido_sale_de_la_cartera(repo, catalogo, codigo_
     repo.update_case(caso, title=f"Caso que se cae {codigo_unico}", status="Cerrado", priority="Media",
                      opened_at=f"{MES}-01", closed_at=None, honorarios_contratados_text="900",
                      mes_cobro_esperado=MES, estado_cobro="Suspendido")
-    assert not any(c["id"] == caso for c in repo.cartera_pendiente_ponderada(mes=MES)["casos"])
+    assert any(c["id"] == caso for c in repo.cartera_pendiente_ponderada(mes=MES)["casos"])

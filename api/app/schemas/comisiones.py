@@ -42,6 +42,8 @@ class TramoComisionOut(BaseModel):
 
 
 class ComisionOut(BaseModel):
+    client_id: int | None = None
+    client_name: str | None = None
     estado: str = 'Calculada'
     evidencia: str = ''
     aprobado_por: str | None = None

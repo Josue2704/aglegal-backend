@@ -17,6 +17,7 @@ class ExpenseIn(BaseModel):
 
 
 class ExpenseOut(BaseModel):
+    payroll_id: int | None = None
     id: int
     detail: str | None = None
     concept: str

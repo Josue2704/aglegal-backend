@@ -12,12 +12,16 @@ class TareaInicialIn(BaseModel):
     notes: str | None = None
     es_critico: bool = False
     responsible_username: str = ""
-    costo_estimado: float | None = None
+    costo_estimado: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     asignados: list[str] = []
     etiqueta_ids: list[int] = []
 
 
 class CaseIn(BaseModel):
+    origen_negocio: str = ''
+    canal_captacion: str = ''
+    tipo_comercial: str = ''
+    originador_id: int | None = None
     alcance: str = ''
     condiciones_cobro: str = ''
     revision_confirmada: bool = False
@@ -45,6 +49,10 @@ class CaseIn(BaseModel):
 
 
 class CaseUpdate(BaseModel):
+    origen_negocio: str | None = None
+    canal_captacion: str | None = None
+    tipo_comercial: str | None = None
+    motivo_atribucion: str = ''
     title: str
     status: str
     priority: str
@@ -68,6 +76,9 @@ class CaseUpdate(BaseModel):
 
 
 class CaseOut(BaseModel):
+    origen_negocio: str = ''
+    canal_captacion: str = ''
+    tipo_comercial: str = ''
     id: int
     client_id: int
     client_name: str | None = None
@@ -183,6 +194,7 @@ class GlobalCaseTaskOut(BaseModel):
 
 
 class CaseAttachmentOut(BaseModel):
+    doc_role: str | None = None
     id: int
     entity_type: str
     entity_id: int
@@ -221,16 +233,16 @@ class CaseTaskIn(BaseModel):
     responsible_username: str = ""
     es_critico: bool = False
     # Lo que se le cobra de mas al cliente (sube los honorarios del expediente).
-    monto_adicional: float | None = None
+    monto_adicional: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     cobro_anticipado: bool = False
     autorizado_por: str = ""
     fecha_autorizacion: str | None = None
     # Lo que costo hacerla (genera el costo directo del expediente).
-    costo_real: float | None = None
+    costo_real: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     costo_account_id: int | None = None
     costo_es_reembolsable: bool = False
     # Lo que se calcula que va a costar, al planearla: al cerrarla se compara con el real.
-    costo_estimado: float | None = None
+    costo_estimado: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     # Quienes la trabajan, ademas del responsable que responde por ella.
     asignados: list[str] = []
     etiqueta_ids: list[int] = []
@@ -312,7 +324,7 @@ class CaseTaskCierreIn(BaseModel):
     """Cerrar la tarea con todo lo que hay que dejar por escrito."""
     completed_at: str | None = None
     completed_notes: str
-    costo_real: float | None = None
+    costo_real: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     costo_account_id: int | None = None
     costo_es_reembolsable: bool | None = None
 
@@ -331,7 +343,7 @@ class PlantillaTareaIn(BaseModel):
     orden: int = 0
     dias_plazo_relativo: int | None = None
     es_critico_default: bool = False
-    costo_estimado: float | None = None
+    costo_estimado: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     honorario_sugerido: float | None = None
     descripcion: str = ""
     responsable_sugerido: str = ""

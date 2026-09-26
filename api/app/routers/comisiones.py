@@ -20,15 +20,21 @@ def list_originadores(
 
 @router.put("/originadores/{case_id}", response_model=list[OriginadorOut])
 def set_originadores(case_id: int, body: OriginadoresSetIn, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("comisiones", "editar")) -> list[OriginadorOut]:
-    try:
-        repo.set_negocio_originadores(
-            case_id,
-            originadores=[o.model_dump() for o in body.originadores],
-            created_at=now_iso(),
-        )
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from None
-    return [OriginadorOut.from_row(row) for row in repo.list_negocio_originadores(case_id)]
+    with repo.conn.transaction():
+        try:
+            before=[OriginadorOut.from_row(r).model_dump() for r in repo.list_negocio_originadores(case_id)]
+            repo.set_negocio_originadores(
+                case_id,
+                originadores=[o.model_dump() for o in body.originadores],
+                created_at=now_iso(),
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        from aglegal.workflow import record_event
+        record_event(repo,'case',case_id,'Originadores modificados',current_user['username'],
+            dict(before=before,after=[o.model_dump() for o in body.originadores]))
+        repo.conn.commit()
+        return [OriginadorOut.from_row(row) for row in repo.list_negocio_originadores(case_id)]
 
 
 @router.get("", response_model=list[ComisionOut])

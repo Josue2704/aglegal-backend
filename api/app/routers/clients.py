@@ -4,23 +4,25 @@ from fastapi import APIRouter, HTTPException
 
 from aglegal.db import now_iso
 
-from ..deps import AdminRequired, CurrentUser, LawyerRequired, RepoDep
+from ..deps import AdminRequired, CurrentUser, LawyerRequired, RepoDep, require_permission
 from ..schemas.client import ClientIn, ClientOut, HistoryItem
+
+from ..access import require_any, check
 
 router = APIRouter(prefix="/clients", tags=["clients"])
 
 
-@router.get("", response_model=list[ClientOut])
+@router.get("", response_model=list[ClientOut], dependencies=[require_permission('clientes', 'ver')])
 def list_clients(current_user: CurrentUser, repo: RepoDep, search: str | None = None, archived: bool = False) -> list[ClientOut]:
     return [ClientOut(**dict(row)) for row in repo.list_clients(search=search, archived=archived)]
 
 
-@router.get("/choices")
+@router.get("/choices", dependencies=[require_any('clientes.ver','clientes.crear','clientes.editar','expedientes.ver','expedientes.crear','expedientes.editar','tareas.ver','tareas.crear','tareas.editar','agenda.ver','agenda.crear','agenda.editar','pipeline.ver','pipeline.crear','pipeline.editar','flujo_caja.ver','flujo_caja.crear','flujo_caja.editar','facturas.ver','facturas.crear','facturas.editar')])
 def client_choices(current_user: CurrentUser, repo: RepoDep) -> list[dict]:
     return [{"id": cid, "name": name} for cid, name in repo.client_choices()]
 
 
-@router.post("", response_model=ClientOut, status_code=201)
+@router.post("", response_model=ClientOut, status_code=201, dependencies=[require_permission('clientes', 'crear')])
 def create_client(body: ClientIn, current_user: CurrentUser, repo: RepoDep) -> ClientOut:
     if not current_user["is_admin"] and "clientes.crear" not in current_user["permissions"]:
         from fastapi import HTTPException
@@ -40,7 +42,7 @@ def create_client(body: ClientIn, current_user: CurrentUser, repo: RepoDep) -> C
     return ClientOut(**dict(row))
 
 
-@router.put("/{client_id}", response_model=ClientOut)
+@router.put("/{client_id}", response_model=ClientOut, dependencies=[require_permission('clientes', 'editar')])
 def update_client(client_id: int, body: ClientIn, current_user: CurrentUser, repo: RepoDep) -> ClientOut:
     if not current_user["is_admin"] and "clientes.editar" not in current_user["permissions"]:
         from fastapi import HTTPException
@@ -62,16 +64,16 @@ def update_client(client_id: int, body: ClientIn, current_user: CurrentUser, rep
     return ClientOut(**dict(row))
 
 
-@router.delete("/{client_id}", status_code=204)
-def archive_client(client_id: int, current_user: LawyerRequired, repo: RepoDep):
+@router.delete("/{client_id}", status_code=204, dependencies=[require_permission('clientes', 'eliminar')])
+def archive_client(client_id: int, current_user: CurrentUser, repo: RepoDep):
     """Antes borraba el cliente sin posibilidad de recuperarlo. Ahora lo archiva
     (papelera) — el registro y su historial se conservan, solo desaparece de las
     vistas activas. El purgado permanente vive aparte, en /{client_id}/purge."""
     repo.archive_client(client_id, archived_at=now_iso())
 
 
-@router.post("/{client_id}/restore", response_model=ClientOut)
-def restore_client(client_id: int, current_user: LawyerRequired, repo: RepoDep) -> ClientOut:
+@router.post("/{client_id}/restore", response_model=ClientOut, dependencies=[require_permission('clientes', 'editar')])
+def restore_client(client_id: int, current_user: CurrentUser, repo: RepoDep) -> ClientOut:
     repo.restore_client(client_id)
     row = repo.conn.execute("SELECT * FROM clients WHERE id=%s", (client_id,)).fetchone()
     if not row:
@@ -85,7 +87,7 @@ def purge_client(client_id: int, current_user: AdminRequired, repo: RepoDep):
     repo.delete_client(client_id)
 
 
-@router.get("/{client_id}", response_model=ClientOut)
+@router.get("/{client_id}", response_model=ClientOut, dependencies=[require_permission('clientes', 'ver')])
 def get_client(client_id: int, current_user: CurrentUser, repo: RepoDep) -> ClientOut:
     row = repo.conn.execute("SELECT * FROM clients WHERE id=%s", (client_id,)).fetchone()
     if not row:
@@ -93,18 +95,24 @@ def get_client(client_id: int, current_user: CurrentUser, repo: RepoDep) -> Clie
     return ClientOut(**dict(row))
 
 
-@router.get("/{client_id}/history", response_model=list[HistoryItem])
+@router.get("/{client_id}/history", response_model=list[HistoryItem], dependencies=[require_permission('clientes', 'ver')])
 def client_history(client_id: int, current_user: CurrentUser, repo: RepoDep) -> list[HistoryItem]:
+    check(current_user, 'agenda.ver')
+    check(current_user, 'flujo_caja.ver')
     return [HistoryItem(**item) for item in repo.client_history(client_id)]
 
 
-@router.get("/{client_id}/statement")
+@router.get("/{client_id}/statement", dependencies=[require_permission('clientes', 'ver')])
 def client_statement(client_id: int, current_user: CurrentUser, repo: RepoDep) -> dict:
     """Estado de cuenta completo del cliente: sesiones, facturas, pagos y saldo."""
     row = repo.conn.execute("SELECT * FROM clients WHERE id=%s", (client_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Cliente no encontrado")
 
+    check(current_user, 'facturas.ver')
+    check(current_user, 'flujo_caja.ver')
+    check(current_user, 'agenda.ver')
+    check(current_user, 'expedientes.ver')
     # Sessions summary
     sessions = repo.conn.execute(
         """SELECT id, session_date, start_time, end_time, consult_type, status, notes
@@ -123,17 +131,11 @@ def client_statement(client_id: int, current_user: CurrentUser, repo: RepoDep) -
     ).fetchall()
 
     # Invoices
-    invoices = repo.conn.execute(
-        """SELECT id, invoice_number, invoice_date AS issued_at, total_cents, status
-           FROM invoices WHERE client_id=%s ORDER BY invoice_date DESC""",
-        (client_id,),
-    ).fetchall()
-
-    total_invoiced_cents = sum(int(i["total_cents"] or 0) for i in invoices)
-    paid_invoices_cents = sum(
-        int(i["total_cents"] or 0) for i in invoices if str(i["status"]).lower() == "pagada"
-    )
-    pending_invoices_cents = total_invoiced_cents - paid_invoices_cents
+    invoices = [dict(i,issued_at=i['invoice_date']) for i in repo.list_invoices(client_id)
+                if i['status'] not in ('Borrador','Cancelada')]
+    total_invoiced_cents = sum(i['total_cents'] for i in invoices)
+    paid_invoices_cents = sum(i['paid_cents'] for i in invoices)
+    pending_invoices_cents = sum(i['balance_cents'] for i in invoices)
 
     # Incomes linked to client
     incomes = repo.conn.execute(
@@ -181,7 +183,7 @@ def client_statement(client_id: int, current_user: CurrentUser, repo: RepoDep) -
             "paid_invoices_cents": paid_invoices_cents,
             "pending_invoices_cents": pending_invoices_cents,
             "total_received_cents": total_received_cents,
-            "balance_cents": pending_invoices_cents - total_received_cents,
+            "balance_cents": pending_invoices_cents,
             "invoices": [dict(i) for i in invoices],
             "incomes": [dict(i) for i in incomes[:20]],
         },

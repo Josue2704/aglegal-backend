@@ -239,6 +239,8 @@ def test_aging_excluye_los_expedientes_ya_cobrados(repo, catalogo):
     periodo = "2042"
     caso = _caso(repo, catalogo, opened_at=f"{periodo}-01-01", honorarios="300",
                  mes_cobro_esperado=f"{periodo}-01", estado_cobro="Cobrado")
+    # El estado manual no acredita dinero recibido: el saldo se cancela con un cobro.
+    _cobro(repo, catalogo, caso, "300", f"{periodo}-01-15")
 
     aging = repo.aging_cartera(fecha_corte=f"{periodo}-06-01")
 

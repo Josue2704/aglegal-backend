@@ -13,7 +13,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 @router.get('/choices')
 def assignment_choices(current_user: CurrentUser, repo: RepoDep):
     """Directorio mínimo para asignar trabajo, sin datos de administración."""
-    if not current_user['is_admin'] and not any(p.split('.')[0] in ('pipeline','expedientes','tareas') for p in current_user['permissions']):
+    if not current_user['is_admin'] and not any(p.split('.')[0] in ('pipeline','expedientes','tareas','agenda','catalogo') for p in current_user['permissions']):
         raise HTTPException(403, 'Sin acceso al directorio de responsables')
     return [dict(r) for r in repo.conn.execute('SELECT username,full_name FROM users WHERE active=1 ORDER BY full_name,username').fetchall()]
 

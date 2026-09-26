@@ -1,12 +1,13 @@
-from pydantic import BaseModel, ConfigDict
+from typing import Annotated, Literal
+from pydantic import BaseModel, ConfigDict, StringConstraints
 
 
 CLIENT_TYPES = ["Física", "Jurídica"]
 
 
 class ClientIn(BaseModel):
-    name: str
-    client_type: str = "Física"
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    client_type: Literal["Física", "Jurídica"] = "Física"
     id_number: str = ""
     phone: str = ""
     phone2: str = ""

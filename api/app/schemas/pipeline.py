@@ -44,6 +44,7 @@ class OportunidadTransicion(BaseModel):
     responsable_expediente: str = ""
     client_id_existente: int | None = None
     originador_id: int | None = None
+    costos_directos_estimados: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     honorarios_pactados: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     alcance: str = ""
     condiciones_cobro: str = ""

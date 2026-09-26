@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from ..deps import CurrentUser, RepoDep, require_permission
+from ..access import require_any
 from ..schemas.dashboard import (
     CashflowTotals,
     GrossProfitItem,
@@ -23,12 +24,17 @@ def upcoming_sessions(
     days: int = 7,
     _: dict = _can_view,
 ) -> list[dict]:
+    if not current_user['is_admin'] and 'agenda.ver' not in current_user['permissions']:
+        return []
     return [dict(r) for r in repo.upcoming_sessions(days=days)]
 
 
 @router.get("/alerts")
-def alerts(current_user: CurrentUser, repo: RepoDep, stale_days: int = 15, _: dict = _can_view) -> dict:
-    return repo.dashboard_alerts(stale_days=stale_days)
+def alerts(current_user: CurrentUser, repo: RepoDep, stale_days: int = 15, _: dict = require_any('dashboard.ver','tareas.ver','expedientes.ver','pipeline.ver','finanzas.ver','comisiones.ver','flujo_caja.ver')) -> dict:
+    result=repo.dashboard_alerts(stale_days=stale_days)
+    modules={'overdue_tasks':'tareas','critical_tasks':'tareas','stale_cases':'expedientes',
+        'overdue_billing':'flujo_caja','budget_deviation':'finanzas','seguimiento_vencido':'pipeline','casos_sin_originador':'comisiones'}
+    return {k:v if current_user['is_admin'] or modules[k]+'.ver' in current_user['permissions'] else ([] if isinstance(v,list) else None) for k,v in result.items()}
 
 
 @router.get("/search")
@@ -37,11 +43,13 @@ def global_search(
     current_user: CurrentUser,
     repo: RepoDep,
     limit: int = 8,
-    _: dict = _can_view,
+    _: dict = require_any('dashboard.ver','clientes.ver','expedientes.ver','agenda.ver','facturas.ver','tareas.ver','pipeline.ver'),
 ) -> dict:
     if not q or len(q.strip()) < 2:
         return {"clients": [], "cases": [], "sessions": [], "invoices": [], "tasks": [], "oportunidades": []}
-    return repo.global_search(q.strip(), limit=limit)
+    result=repo.global_search(q.strip(), limit=limit)
+    modules={'clients':'clientes','cases':'expedientes','sessions':'agenda','invoices':'facturas','tasks':'tareas','oportunidades':'pipeline'}
+    return {k:v if current_user['is_admin'] or modules[k]+'.ver' in current_user['permissions'] else [] for k,v in result.items()}
 
 
 @router.get("/kpis", response_model=MonthlyMetrics)

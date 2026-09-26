@@ -91,7 +91,7 @@ def transicionar_oportunidad(oportunidad_id: int, body: OportunidadTransicion, c
         motivo_perdida_tipo=body.motivo_perdida_tipo, crear_cliente=body.crear_cliente,
         cliente_documento=body.cliente_documento, cliente_telefono=body.cliente_telefono,
         cliente_email=body.cliente_email, responsable_expediente=body.responsable_expediente,
-        client_id_existente=body.client_id_existente, honorarios_pactados=body.honorarios_pactados,
+        client_id_existente=body.client_id_existente, honorarios_pactados=body.honorarios_pactados, costos_directos_estimados=body.costos_directos_estimados,
         alcance=body.alcance, condiciones_cobro=body.condiciones_cobro,
         revision_confirmada=body.revision_confirmada, revision_observaciones=body.revision_observaciones,
         opposing_party=body.opposing_party, tareas_iniciales=[t.model_dump() for t in body.tareas_iniciales],

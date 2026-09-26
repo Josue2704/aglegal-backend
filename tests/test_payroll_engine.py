@@ -22,7 +22,7 @@ CONFIG_BASE = PayrollConfig(
     afp_tasa_patronal=0.0875,
     afp_tope_cotizable_cents=None,
     tramos_renta=[],
-    recargo_hora_extra_pct=0.5,
+    recargo_hora_extra_pct=1.0,
     recargo_nocturnidad_pct=0.25,
     horas_jornada_mensual=240,
 )
@@ -58,12 +58,13 @@ def test_afp_con_tope_configurado_explicitamente_si_lo_respeta():
 
 def test_horas_extra_se_pagan_con_recargo_sobre_el_valor_hora_ordinario():
     # Salario 80,000 cents ($800, bajo el tope de $1,000) / 240 horas = $3.33/hora ordinaria;
-    # extra con 50% de recargo = $5/hora
+    # extra con 100% de recargo
     c = calcular_planilla(salario_base_cents=80_000, config=CONFIG_BASE, horas_extra_cantidad=10)
-    valor_hora_extra = (80_000 / 240) * 1.5
+    valor_hora_extra = (80_000 / 240) * 2.0
     assert c.horas_extra_monto_cents == round(valor_hora_extra * 10)
-    # Las horas extra suman al devengado pero NO cotizan ISSS/AFP (solo el salario base sí)
-    assert c.isss_empleado_cents == round(80_000 * 0.03)
+    # Las horas extra integran la remuneración salarial cotizable.
+    assert c.isss_empleado_cents == round(c.total_devengado_cents * 0.03)
+    assert c.afp_empleado_cents == round(c.total_devengado_cents * 0.0725)
 
 
 def test_nocturnidad_aplica_su_propio_recargo():
@@ -103,11 +104,11 @@ def test_neto_negativo_se_permite_pero_avisa():
     assert any("negativo" in a.lower() for a in c.advertencias)
 
 
-def test_bonificaciones_y_otros_ingresos_no_cotizan_ni_generan_renta_extra_en_isss_afp():
+def test_bonificaciones_salariales_cotizan_y_respetan_el_tope_isss():
     con_bono = calcular_planilla(salario_base_cents=100_000, config=CONFIG_BASE, bonificaciones_cents=50_000)
     sin_bono = calcular_planilla(salario_base_cents=100_000, config=CONFIG_BASE)
     assert con_bono.isss_empleado_cents == sin_bono.isss_empleado_cents
-    assert con_bono.afp_empleado_cents == sin_bono.afp_empleado_cents
+    assert con_bono.afp_empleado_cents == round(150_000 * 0.0725)
     assert con_bono.total_devengado_cents == sin_bono.total_devengado_cents + 50_000
 
 

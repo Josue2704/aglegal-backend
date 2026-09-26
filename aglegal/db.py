@@ -1452,6 +1452,135 @@ def _migrate(conn: PgConnection) -> None:
         _set_schema_version(conn, 47)
 
 
+    if v < 48:
+        conn.execute('''CREATE TABLE IF NOT EXISTS commission_exclusions (
+            income_id INTEGER REFERENCES incomes(id) ON DELETE CASCADE,
+            personal_id INTEGER REFERENCES personal(id), reason TEXT NOT NULL,
+            created_at TEXT NOT NULL, PRIMARY KEY(income_id,personal_id))''')
+        _set_schema_version(conn, 48)
+
+    if v < 49:
+        conn.execute("""
+            ALTER TABLE cases ADD COLUMN IF NOT EXISTS origen_negocio TEXT NOT NULL DEFAULT '';
+            ALTER TABLE cases ADD COLUMN IF NOT EXISTS canal_captacion TEXT NOT NULL DEFAULT '';
+            ALTER TABLE cases ADD COLUMN IF NOT EXISTS tipo_comercial TEXT NOT NULL DEFAULT '';
+            UPDATE cases cs SET origen_negocio=o.origen_negocio,canal_captacion=o.canal_captacion
+                FROM oportunidades o WHERE cs.opportunity_id=o.id AND cs.origen_negocio='';
+            CREATE OR REPLACE VIEW case_collection_state AS
+                SELECT cs.id, CASE
+                    WHEN cs.honorarios_contratados_cents>0 AND cs.honorarios_contratados_cents <=
+                        COALESCE((SELECT SUM(monto_neto_operativo_cents) FROM incomes WHERE case_id=cs.id),0) THEN 'Cobrado'
+                    WHEN EXISTS(SELECT 1 FROM invoices WHERE case_id=cs.id AND status NOT IN ('Borrador','Cancelada')) THEN 'Facturado pendiente de cobro'
+                    WHEN cs.status='Cerrado' THEN 'Finalizado pendiente de facturar'
+                    WHEN cs.status='En pausa' THEN 'Suspendido'
+                    ELSE 'En ejecución' END AS estado_cobro FROM cases cs;
+        """)
+        _set_schema_version(conn, 49)
+
+    if v < 50:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS financial_requests (
+                id SERIAL PRIMARY KEY, entity TEXT NOT NULL, entity_id INTEGER, action TEXT NOT NULL,
+                payload JSONB NOT NULL, before_value JSONB, after_value JSONB,
+                reason TEXT NOT NULL, requester TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Pendiente',
+                reviewer TEXT, evidence TEXT, created_at TEXT NOT NULL, reviewed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS catalog_reviews (
+                id SERIAL PRIMARY KEY, solicitud_id INTEGER NOT NULL REFERENCES solicitudes_catalogo(id),
+                responsible TEXT NOT NULL, activated_at TEXT NOT NULL, due_date TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Pendiente', evidence TEXT, reviewed_at TEXT, reviewer TEXT
+            );
+            CREATE TABLE IF NOT EXISTS internal_notifications (
+                id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+                message TEXT NOT NULL, review_id INTEGER NOT NULL REFERENCES catalog_reviews(id),
+                created_at TEXT NOT NULL, read_at TEXT
+            );
+        """)
+        _set_schema_version(conn, 50)
+
+    if v < 51:
+        # Preserve historical explicit eligibility decisions when first enabling reconciliation.
+        conn.execute("""INSERT INTO commission_exclusions(income_id,personal_id,reason,created_at)
+            SELECT DISTINCT ON(c.income_id,c.personal_id) c.income_id,c.personal_id,
+                COALESCE(NULLIF(a.motivo,''),'Decisión de elegibilidad anterior'),a.created_at
+            FROM comisiones c JOIN comisiones a ON a.ajusta_a_commission_id=c.id
+            JOIN incomes i ON i.id=c.income_id
+            WHERE a.motivo='Reversión manual' OR EXISTS (
+                SELECT 1 FROM workflow_events e WHERE e.entity_type='comision'
+                AND e.entity_id=c.id AND e.event='No elegible')
+            ORDER BY c.income_id,c.personal_id,a.id DESC
+            ON CONFLICT(income_id,personal_id) DO NOTHING RETURNING income_id""")
+        _set_schema_version(conn, 51)
+
+    if v < 52:
+        conn.execute("""CREATE OR REPLACE VIEW case_collection_state AS
+            SELECT cs.id, CASE
+                WHEN cs.honorarios_contratados_cents>0 AND cs.honorarios_contratados_cents <=
+                    COALESCE((SELECT SUM(monto_neto_operativo_cents) FROM incomes WHERE case_id=cs.id),0) THEN 'Cobrado'
+                WHEN EXISTS(SELECT 1 FROM invoices inv WHERE inv.case_id=cs.id
+                    AND inv.status NOT IN ('Borrador','Cancelada') AND inv.total_cents >
+                    COALESCE((SELECT SUM(p.amount_cents) FROM invoice_payments p
+                        WHERE p.invoice_id=inv.id AND p.released_at IS NULL),0)) THEN 'Facturado pendiente de cobro'
+                WHEN cs.status='Cerrado' THEN 'Finalizado pendiente de facturar'
+                WHEN cs.status='En pausa' THEN 'Suspendido'
+                ELSE 'En ejecución' END AS estado_cobro FROM cases cs""")
+        _set_schema_version(conn, 52)
+
+    if v < 53:
+        conn.execute("""
+            ALTER TABLE payrolls ADD COLUMN IF NOT EXISTS cash_model TEXT NOT NULL DEFAULT 'legacy';
+            CREATE TABLE IF NOT EXISTS payroll_obligations (
+                id SERIAL PRIMARY KEY, payroll_id INTEGER NOT NULL REFERENCES payrolls(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK(kind IN ('ISSS','AFP','ISR')),
+                amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+                expense_id INTEGER UNIQUE REFERENCES expenses(id), payment_date TEXT,
+                reference TEXT, actor TEXT, UNIQUE(payroll_id,kind)
+            );
+        """)
+        _set_schema_version(conn, 53)
+
+    if v < 54:
+        # Correct the shipped 50% daytime overtime premium without editing any
+        # existing configuration or paid payroll. Later custom versions take precedence.
+        conn.execute("""INSERT INTO payroll_config(vigente_desde,isss_tasa_empleado,isss_tasa_patronal,
+            isss_tope_cotizable_cents,afp_tasa_empleado,afp_tasa_patronal,afp_tope_cotizable_cents,
+            tope_salario_indemnizacion_cents,tramos_renta,recargo_hora_extra_pct,
+            recargo_nocturnidad_pct,horas_jornada_mensual,notas,created_at)
+            SELECT '2025-05-02',isss_tasa_empleado,isss_tasa_patronal,isss_tope_cotizable_cents,
+            afp_tasa_empleado,afp_tasa_patronal,afp_tope_cotizable_cents,tope_salario_indemnizacion_cents,
+            tramos_renta,1.0,recargo_nocturnidad_pct,horas_jornada_mensual,
+            'Corrección técnica del recargo diurno a 100%% (art.169 CT). Conserva las versiones y pagos anteriores.',%s
+            FROM payroll_config WHERE vigente_desde='2025-05-01' AND recargo_hora_extra_pct=0.5
+            ON CONFLICT(vigente_desde) DO NOTHING""",(now_iso(),))
+        _set_schema_version(conn, 54)
+
+    if v < 55:
+        conn.execute("""
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS end_date TEXT;
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS gcal_owner TEXT;
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS outlook_owner TEXT;
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS outlook_event_id TEXT;
+            CREATE TABLE IF NOT EXISTS calendar_oauth_states (
+                id SERIAL PRIMARY KEY, digest TEXT UNIQUE NOT NULL, username TEXT NOT NULL,
+                provider TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS calendar_sync_jobs (
+                id SERIAL PRIMARY KEY, session_id INTEGER NOT NULL, provider TEXT NOT NULL,
+                owner TEXT NOT NULL, event_id TEXT, operation TEXT NOT NULL,
+                payload JSONB NOT NULL, status TEXT NOT NULL DEFAULT 'Pendiente',
+                error TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL, UNIQUE(session_id,provider)
+            );
+            ALTER TABLE google_tokens ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '';
+            ALTER TABLE outlook_tokens ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '';
+            UPDATE sessions SET gcal_owner=(SELECT username FROM google_tokens LIMIT 1)
+                WHERE gcal_event_id IS NOT NULL AND gcal_owner IS NULL AND (SELECT COUNT(*) FROM google_tokens)=1;
+            UPDATE sessions SET outlook_owner=(SELECT username FROM outlook_tokens LIMIT 1)
+                WHERE outlook_event_id IS NOT NULL AND outlook_owner IS NULL AND (SELECT COUNT(*) FROM outlook_tokens)=1;
+            CREATE INDEX IF NOT EXISTS ix_sessions_google_owner ON sessions(gcal_owner,gcal_event_id);
+        """)
+        _set_schema_version(conn, 55)
+
 # ── Seeds ─────────────────────────────────────────────────────────────────────
 
 # All permissions in the system — (module, action, label)

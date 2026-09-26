@@ -9,6 +9,7 @@ class SessionIn(BaseModel):
     client_id: int | None = None
     case_id: int | None = None
     session_date: str
+    end_date: str | None = None
     start_time: str | None = None
     end_time: str | None = None
     consult_type: str
@@ -32,6 +33,9 @@ class SessionOut(BaseModel):
     notes: str | None = None
     status: str
     monto_adicional: float = 0
+    calendar_error: str | None = None
+    gcal_owner: str | None = None
+    end_date: str | None = None
     created_at: str
 
     model_config = ConfigDict(from_attributes=True)

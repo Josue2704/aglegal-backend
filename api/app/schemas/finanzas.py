@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 # --- Plan de cuentas
 
 class CuentaIn(BaseModel):
+    motivo: str = ""
     account_code: str
     tipo: str
     grupo: str
@@ -22,6 +23,7 @@ class CuentaIn(BaseModel):
 
 
 class CuentaUpdate(BaseModel):
+    motivo: str = ""
     grupo: str
     subgrupo: str = ""
     nombre: str
@@ -227,6 +229,7 @@ class PuntoEquilibrioOut(BaseModel):
 # --- Presupuesto por familia (forecast) y proyección de cierre de mes
 
 class ForecastIn(BaseModel):
+    motivo: str = ""
     family_id: int
     mes: str
     volumen_meta: float | None = None
@@ -235,6 +238,7 @@ class ForecastIn(BaseModel):
 
 
 class ForecastUpdate(BaseModel):
+    motivo: str = ""
     volumen_meta: float | None = None
     ticket_objetivo: float | None = None
     margen_directo_objetivo_pct: float

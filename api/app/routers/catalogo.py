@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
 from aglegal.db import now_iso
 
 from ..deps import CurrentUser, RepoDep, require_permission
+from ..access import require_any
 from ..schemas.case import (
     CopiarPlantillaIn,
     EtiquetaTareaIn,
@@ -70,7 +71,7 @@ def servicio_choices(
     q: str | None = None,
     estado: str = "Activo",
     limit: int = Query(25, le=100),
-    _: dict = require_permission("catalogo", "ver"),
+    _: dict = require_any('catalogo.ver','expedientes.crear','expedientes.editar','pipeline.crear','pipeline.editar','flujo_caja.crear','flujo_caja.editar'),
 ) -> list[ServicioChoice]:
     """Búsqueda por código o nombre — usada para seleccionar servicio en expedientes."""
     return [ServicioChoice.from_row(row) for row in repo.servicio_choices(q=q, estado=estado, limit=limit)]
@@ -81,7 +82,7 @@ def servicio_choices(
 # conviene poder ajustar rápido, no una alta/baja del catálogo de precios/servicios.
 
 @router.get("/servicios/{service_id}/plantilla-tareas", response_model=list[PlantillaTareaOut])
-def list_plantilla_tareas(service_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_permission("catalogo", "ver")) -> list[PlantillaTareaOut]:
+def list_plantilla_tareas(service_id: int, current_user: CurrentUser, repo: RepoDep, _: dict = require_any('catalogo.ver','expedientes.crear','pipeline.editar')) -> list[PlantillaTareaOut]:
     return [PlantillaTareaOut.from_row(row) for row in repo.list_plantilla_tareas(service_id)]
 
 

@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any, Iterable
 from pathlib import Path
 import os
+import math
 import re
 import shutil
 import uuid
@@ -13,6 +14,7 @@ import uuid
 from psycopg2.extras import Json
 
 from .db import now_iso
+from .payroll_payments import PayrollPaymentsRepository
 from .billing import BillingRepository
 from .financial_workflow import FinancialWorkflowRepository
 from .workflow import workflow_atomic, record_event
@@ -20,8 +22,8 @@ from .payroll_engine import PayrollConfig, calcular_aguinaldo, calcular_indemniz
 from .security import hash_password, verify_password
 
 
-SESSION_STATUSES = ["Pendiente", "En proceso", "Finalizada"]
-ATTACH_ENTITY_TYPES = ["session", "income", "expense", "case", "client", "cost", "user"]
+SESSION_STATUSES = ["Pendiente", "En proceso", "Finalizada", "Cancelada"]
+ATTACH_ENTITY_TYPES = ["case_task", "session", "income", "expense", "case", "client", "cost", "user"]
 CASE_STATUSES = ["Abierto", "En trámite", "En pausa", "Cerrado"]
 # Columnas del tablero de tareas. "En espera" es la que más importa en un despacho:
 # separa lo que nadie está trabajando porque depende de un tercero (cliente, tribunal,
@@ -140,7 +142,7 @@ class DashboardSummary:
         return self.total_incomes_cents - self.total_expenses_cents
 
 
-class Repository(FinancialWorkflowRepository, BillingRepository):
+class Repository(PayrollPaymentsRepository, FinancialWorkflowRepository, BillingRepository):
     def __init__(self, conn: Any):
         self.conn = conn
 
@@ -250,18 +252,13 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         ).fetchall())
 
     def list_case_all_attachments(self, case_id: int) -> list[Any]:
-        """Return attachments for the case itself plus attachments from its sessions."""
         return list(self.conn.execute(
-            "SELECT a.*, "
-            "CASE WHEN a.entity_type='session' THEN s.session_date ELSE NULL END AS session_date, "
-            "CASE WHEN a.entity_type='session' THEN s.consult_type ELSE NULL END AS session_type "
+            "SELECT a.*, s.session_date, s.consult_type AS session_type, t.title AS task_title "
             "FROM attachments a "
-            "LEFT JOIN sessions s ON (a.entity_type='session' AND a.entity_id = s.id) "
-            "WHERE (a.entity_type='case' AND a.entity_id=%s) "
-            "   OR (a.entity_type='session' AND s.case_id=%s) "
-            "ORDER BY a.created_at DESC",
-            (int(case_id), int(case_id)),
-        ).fetchall())
+            "LEFT JOIN sessions s ON a.entity_type='session' AND a.entity_id=s.id "
+            "LEFT JOIN case_tasks t ON a.entity_type='case_task' AND a.entity_id=t.id "
+            "WHERE (a.entity_type='case' AND a.entity_id=%s) OR s.case_id=%s OR t.case_id=%s "
+            "ORDER BY a.created_at DESC,a.id DESC",(case_id,case_id,case_id)).fetchall())
 
     @workflow_atomic
     def create_client(
@@ -398,7 +395,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             conditions.append("s.client_id=%s")
             params.append(int(client_id))
         if start_date:
-            conditions.append("s.session_date>=%s")
+            conditions.append("COALESCE(s.end_date,s.session_date)>=%s")
             params.append(start_date)
         if end_date:
             conditions.append("s.session_date<=%s")
@@ -426,6 +423,32 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             ).fetchall()
         )
 
+    def _validate_session(self, client_id, case_id, session_date, start_time, end_time, consult_type, end_date=None):
+        from datetime import date, time
+        try:
+            date.fromisoformat(session_date)
+            date.fromisoformat(end_date or session_date)
+            if (end_date or session_date) < session_date:
+                raise ValueError()
+            if bool(start_time) != bool(end_time):
+                raise ValueError()
+            if start_time:
+                time.fromisoformat(start_time)
+                time.fromisoformat(end_time)
+                if (end_date or session_date) == session_date and end_time <= start_time:
+                    raise ValueError()
+        except (ValueError, TypeError):
+            raise ValueError('Fecha u horario inválido: indica ambas horas y un fin posterior al inicio')
+        if client_id and not self.conn.execute('SELECT 1 FROM clients WHERE id=%s',(client_id,)).fetchone():
+            raise ValueError('Cliente no encontrado')
+        if not consult_type.strip():
+            raise ValueError('El tipo de consulta es requerido')
+        if case_id:
+            case = self.conn.execute('SELECT client_id FROM cases WHERE id=%s',(case_id,)).fetchone()
+            if not case or case['client_id'] != client_id:
+                raise ValueError('El expediente no pertenece al cliente seleccionado')
+
+    @workflow_atomic
     def create_session(
         self,
         *,
@@ -438,17 +461,19 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         created_at: str,
         start_time: str | None = None,
         end_time: str | None = None,
+        end_date: str | None = None,
         monto_adicional_text: str = "0",
         username: str = "",
         permitir_solape: bool = False,
     ) -> int:
         if status not in SESSION_STATUSES:
             raise ValueError("Estado inválido")
-        if start_time and end_time and end_time <= start_time:
-            raise ValueError("La hora de fin debe ser posterior a la hora de inicio")
+        self._validate_session(client_id, case_id, session_date, start_time, end_time, consult_type, end_date)
         if not permitir_solape:
-            self._avisar_solape_agenda(session_date, start_time, end_time)
+            self._avisar_solape_agenda(session_date, start_time, end_time, end_date=end_date)
         monto_cents = self._to_cents_or_zero(monto_adicional_text)
+        if monto_cents < 0:
+            raise ValueError("El monto adicional no puede ser negativo")
         if monto_cents > 0 and not case_id:
             raise ValueError("Una sesión con monto adicional debe estar ligada a un expediente")
         cur = self.conn.execute(
@@ -469,7 +494,8 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             ),
         )
         session_id = int(cur.lastrowid)
-        if monto_cents > 0:
+        self.conn.execute("UPDATE sessions SET end_date=%s WHERE id=%s",(end_date or session_date,session_id))
+        if monto_cents > 0 and status != "Cancelada":
             self._registrar_honorarios_log(
                 case_id=case_id, origen_tipo="sesion", origen_id=session_id, monto_cents=monto_cents,
                 motivo=f"Sesión adicional: {consult_type.strip()}", username=username or "sistema",
@@ -478,22 +504,23 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         return session_id
 
     def _avisar_solape_agenda(self, fecha: str, inicio: str | None, fin: str | None,
-                              excluir_id: int | None = None) -> None:
+                              excluir_id: int | None = None, end_date: str | None = None) -> None:
         """Dos citas encima no son necesariamente un error (el despacho es más de una persona),
         pero agendarlas sin darse cuenta sí lo es. Se avisa con cuál choca y quién decide es
         el usuario, volviendo a guardar con `permitir_solape`."""
         if not inicio or not fin:
             return
-        extra, params = "", [fecha, fin, inicio]
+        extra, params = "", [f"{end_date or fecha}T{fin}", f"{fecha}T{inicio}"]
         if excluir_id:
             extra = " AND s.id <> %s"
             params.append(int(excluir_id))
         chocan = self.conn.execute(
             f"""SELECT s.consult_type, s.start_time, s.end_time, cl.name AS client_name
                 FROM sessions s LEFT JOIN clients cl ON cl.id = s.client_id
-                WHERE s.session_date = %s AND s.status <> 'Finalizada'
+                WHERE s.status NOT IN ('Finalizada','Cancelada')
                   AND s.start_time IS NOT NULL AND s.end_time IS NOT NULL
-                  AND s.start_time < %s AND s.end_time > %s{extra}
+                  AND (s.session_date || 'T' || s.start_time) < %s
+                  AND (COALESCE(s.end_date,s.session_date) || 'T' || s.end_time) > %s{extra}
                 ORDER BY s.start_time LIMIT 3""",
             tuple(params),
         ).fetchall()
@@ -508,6 +535,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
                 "Si aun así quieres agendarla, vuelve a guardar confirmando el cruce."
             )
 
+    @workflow_atomic
     def update_session(
         self,
         session_id: int,
@@ -519,13 +547,31 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         status: str,
         start_time: str | None = None,
         end_time: str | None = None,
+        end_date: str | None = None,
+        client_id: int | None = None,
+        update_client: bool = False,
+        username: str = "",
+        permitir_solape: bool = False,
     ) -> None:
-        self.conn.execute('SELECT pg_advisory_xact_lock(74185245)')
+        old = self.get_session(session_id)
+        if not old:
+            raise ValueError('Sesión no encontrada')
+        end_date = end_date or (old.get('end_date') if session_date == old['session_date'] else None) or session_date
+        client_id = client_id if update_client else old['client_id']
+        self._validate_session(client_id, case_id, session_date, start_time, end_time, consult_type, end_date)
+        if status != 'Finalizada' and self._factura_viva_de('sessions',session_id):
+            raise ValueError('La cita está facturada; cancela o corrige la factura antes de cambiar su estado')
+        if (old['case_id'] != case_id or old['client_id'] != client_id) and (
+            old['monto_adicional_cents'] or self._factura_viva_de('sessions',session_id)):
+            raise ValueError('No se puede cambiar el cliente o expediente de una cita con honorarios o factura')
+        if not permitir_solape and (old['session_date'],old['start_time'],old['end_time'],old.get('end_date') or old['session_date']) != (session_date,start_time,end_time,end_date):
+            self._avisar_solape_agenda(session_date,start_time,end_time,session_id,end_date=end_date)
         if status not in SESSION_STATUSES:
             raise ValueError("Estado inválido")
         self.conn.execute(
-            "UPDATE sessions SET case_id=%s, session_date=%s, start_time=%s, end_time=%s, consult_type=%s, notes=%s, status=%s WHERE id=%s",
+            "UPDATE sessions SET client_id=%s, case_id=%s, session_date=%s, start_time=%s, end_time=%s, consult_type=%s, notes=%s, status=%s WHERE id=%s",
             (
+                client_id,
                 int(case_id) if case_id else None,
                 session_date,
                 (start_time or "").strip() or None,
@@ -536,8 +582,18 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
                 int(session_id),
             ),
         )
+        self.conn.execute("UPDATE sessions SET end_date=%s WHERE id=%s",(end_date,session_id))
+        was_cancelled, is_cancelled = old['status'] == 'Cancelada', status == 'Cancelada'
+        if was_cancelled and not is_cancelled:
+            self.conn.execute('UPDATE sessions SET gcal_event_id=NULL WHERE id=%s',(session_id,))
+        if was_cancelled != is_cancelled and old['monto_adicional_cents'] and old['case_id']:
+            delta = int(old['monto_adicional_cents']) * (-1 if is_cancelled else 1)
+            self._registrar_honorarios_log(case_id=old['case_id'],origen_tipo='sesion',origen_id=session_id,
+                monto_cents=delta,motivo=('Cancelación' if is_cancelled else 'Reactivación') + ': ' + consult_type,
+                username=username or 'sistema')
         self.conn.commit()
 
+    @workflow_atomic
     def delete_session(self, session_id: int, *, username: str = "") -> None:
         self.conn.execute('SELECT pg_advisory_xact_lock(74185245)')
         factura = self._factura_viva_de("sessions", session_id)
@@ -547,10 +603,10 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
                 "Quítala de la factura o cancélala antes de borrar la cita."
             )
         row = self.conn.execute(
-            "SELECT case_id, consult_type, monto_adicional_cents FROM sessions WHERE id=%s", (int(session_id),)
+            "SELECT case_id, consult_type, monto_adicional_cents, status FROM sessions WHERE id=%s", (int(session_id),)
         ).fetchone()
         self.conn.execute("DELETE FROM sessions WHERE id = %s", (int(session_id),))
-        if row and row["monto_adicional_cents"] and row["case_id"]:
+        if row and row["monto_adicional_cents"] and row["case_id"] and row["status"] != "Cancelada":
             self._registrar_honorarios_log(
                 case_id=row["case_id"], origen_tipo="sesion", origen_id=int(session_id),
                 monto_cents=-int(row["monto_adicional_cents"]),
@@ -582,7 +638,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         self.conn.execute(
             "INSERT INTO google_tokens(username, access_token, refresh_token, expiry_at) VALUES(%s,%s,%s,%s) "
             "ON CONFLICT(username) DO UPDATE SET access_token=excluded.access_token, "
-            "refresh_token=excluded.refresh_token, expiry_at=excluded.expiry_at",
+            "refresh_token=COALESCE(NULLIF(excluded.refresh_token, ''), google_tokens.refresh_token), expiry_at=excluded.expiry_at, last_error=''",
             (username, access_token, refresh_token, expiry_at),
         )
         self.conn.commit()
@@ -765,23 +821,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         # Si cambió lo que determina la comisión (monto neto, expediente o mes de cobro), la
         # comisión ya reconocida se revierte con un ajuste trazable y se recalcula — nunca se
         # edita la fila original ni se deja pagando sobre un monto que ya no es el real.
-        cambio_relevante = (
-            int(anterior["monto_neto_operativo_cents"] or 0) != neto_cents
-            or (anterior["case_id"] or None) != (int(case_id) if case_id else None)
-            or str(anterior["income_date"])[:7] != str(income_date)[:7]
-            or (str(anterior['income_date']) != str(income_date) and bool(self.conn.execute(
-                'SELECT 1 FROM incomes WHERE case_id=%s AND id<>%s AND income_date BETWEEN %s AND %s',
-                (case_id, income_id, min(str(anterior['income_date']), income_date), max(str(anterior['income_date']), income_date)),
-            ).fetchone()))
-        )
-        ahora = now_iso()
-        if cambio_relevante:
-            self._revertir_comisiones_income(int(income_id), motivo=f"Corrección del cobro #{income_id}", created_at=ahora)
-        if cambio_relevante:
-            for cid in {anterior['case_id'], case_id} - {None}:
-                self._resincronizar_comisiones_caso(cid, revertir=True, created_at=ahora)
-        else:
-            self.reconocer_comision_income(int(income_id), created_at=ahora, commit=False)
+        self.reconocer_comision_income(int(income_id), created_at=now_iso(), commit=False)
         self.conn.commit()
 
     @workflow_atomic
@@ -850,7 +890,9 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
 
     # --- Expenses
     _EXPENSE_SELECT = (
-        "SELECT e.*, ac.account_code, ac.nombre AS account_nombre "
+        "SELECT e.*, ac.account_code, ac.nombre AS account_nombre, "
+        "COALESCE((SELECT p.id FROM payrolls p WHERE p.expense_id=e.id LIMIT 1), "
+        "(SELECT o.payroll_id FROM payroll_obligations o WHERE o.expense_id=e.id)) AS payroll_id "
         "FROM expenses e "
         "LEFT JOIN plan_cuentas ac ON ac.id=e.account_id "
     )
@@ -922,6 +964,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         monto_fondos_terceros_text: str = "",
     ) -> None:
         self.guard_commission_expense(expense_id)
+        self.guard_payroll_expense(expense_id)
         amount_cents = _to_cents(amount_text)
         concept = (detail or "").strip() or "(Sin detalle)"
         self._validate_movement_account(account_id, expected_tipo="Egreso")
@@ -951,6 +994,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
     @workflow_atomic
     def delete_expense(self, expense_id: int) -> None:
         self.guard_commission_expense(expense_id)
+        self.guard_payroll_expense(expense_id)
         self.conn.execute("DELETE FROM expenses WHERE id = %s", (int(expense_id),))
         self.conn.commit()
 
@@ -1154,16 +1198,30 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             ("AFP empleado", afp_tasa_empleado), ("AFP patronal", afp_tasa_patronal),
             ("recargo de hora extra", recargo_hora_extra_pct), ("recargo de nocturnidad", recargo_nocturnidad_pct),
         ):
-            if tasa < 0 or tasa > 1:
+            if not math.isfinite(tasa) or tasa < 0 or tasa > 1:
                 raise ValueError(f"La tasa de {nombre} debe estar entre 0 y 1 (ej. 0.075 = 7.5%)")
-        if horas_jornada_mensual <= 0:
+        if not math.isfinite(horas_jornada_mensual) or horas_jornada_mensual <= 0:
             raise ValueError("Las horas de jornada mensual deben ser mayores a 0")
+        previous_ceiling = 0
         for i, tramo in enumerate(tramos_renta, start=1):
-            faltantes = {"sobre_exceso_de_cents", "cuota_fija_cents", "porcentaje_exceso"} - set(tramo)
-            if faltantes:
-                raise ValueError(f"Tramo de renta #{i}: faltan campos {sorted(faltantes)}")
+            required = {'sobre_exceso_de_cents','cuota_fija_cents','porcentaje_exceso','hasta_cents'}
+            if required - set(tramo):
+                raise ValueError(f"Tramo de renta #{i}: faltan campos")
+            floor, ceiling = tramo['sobre_exceso_de_cents'], tramo['hasta_cents']
+            fee, rate = tramo['cuota_fija_cents'], tramo['porcentaje_exceso']
+            values = [floor,fee,rate] + ([ceiling] if ceiling is not None else [])
+            if any(not math.isfinite(v) or v < 0 for v in values) or rate > 1:
+                raise ValueError(f"Tramo de renta #{i}: importes o tasa inválidos")
+            if previous_ceiling is None or floor != previous_ceiling or (ceiling is not None and ceiling <= floor):
+                raise ValueError("Los tramos de renta deben ser consecutivos, ordenados y comenzar en cero")
+            previous_ceiling = ceiling
+        if tramos_renta and previous_ceiling is not None:
+            raise ValueError("El último tramo de renta debe quedar sin límite superior")
         def _to_cents_or_none(text: str) -> int | None:
-            return _to_cents(text) if (text or "").strip() else None
+            cents = _to_cents(text) if (text or "").strip() else None
+            if cents is not None and cents <= 0:
+                raise ValueError("El tope debe ser mayor a cero o quedar vacío")
+            return cents
 
         try:
             cur = self.conn.execute(
@@ -1251,6 +1309,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         )
         return calculo, config_row
 
+    @workflow_atomic
     def create_payroll(
         self,
         *,
@@ -1271,7 +1330,14 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         descuento_faltas_text: str = "",
         descuento_prestamos_text: str = "",
         otros_descuentos_text: str = "",
+        account_id: int | None = None,
+        username: str = "",
     ) -> int:
+        period = (period or '').strip()
+        if not _MES_RE.fullmatch(period):
+            raise ValueError("Período inválido: usa YYYY-MM")
+        date.fromisoformat(period + '-01')
+        payment_date = self.payroll_payment_date(payment_date)
         if modo not in ("calculado", "manual"):
             raise ValueError("Modo inválido")
         if modo == "calculado" and personal_id is None:
@@ -1279,13 +1345,18 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         # Preferir el catálogo de Personal (PER-XXX, ya usado por gastos fijos y comisiones)
         # en vez de texto libre — un solo lugar con el nombre correcto de cada colaborador,
         # sin depender de que alguien lo escriba igual en dos pantallas distintas.
-        account_id: int | None = None
         if personal_id is not None:
-            persona = self.conn.execute("SELECT persona, cargo, account_id FROM personal WHERE id=%s", (int(personal_id),)).fetchone()
+            persona = self.conn.execute("SELECT persona, cargo, account_id, mes_inicio, mes_fin, estado FROM personal WHERE id=%s", (int(personal_id),)).fetchone()
             if not persona:
                 raise ValueError("Persona del catálogo no encontrada")
+            if period < persona['mes_inicio'] or (persona['mes_fin'] and period > persona['mes_fin']):
+                raise ValueError("El período está fuera de la relación laboral registrada")
+            if persona['estado'] != 'Activo' and not persona['mes_fin']:
+                raise ValueError("La persona está inactiva y no tiene fecha de baja registrada")
             employee = str(persona["persona"])
             role = str(persona["cargo"] or role or "")
+            if account_id is not None and account_id != persona['account_id']:
+                raise ValueError("La cuenta debe ser la vinculada a la persona")
             account_id = persona["account_id"]
         else:
             employee = (employee_name or "").strip()
@@ -1312,6 +1383,8 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
                 otros_descuentos_text=otros_descuentos_text,
                 fecha_config=payment_date,
             )
+            if calculo.advertencias:
+                raise ValueError("No se puede guardar la planilla: " + "; ".join(calculo.advertencias))
             amount_cents = calculo.neto_cents
             if self.conn.execute(
                 "SELECT 1 FROM payrolls WHERE personal_id=%s AND period=%s AND modo='calculado'",
@@ -1323,10 +1396,9 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
                 raise ValueError("Monto requerido")
             amount_cents = _to_cents(amount_text)
 
-        # El gasto del mes es lo que la planilla le cuesta al despacho, no el neto de la
-        # boleta: lo retenido (ISSS/AFP/renta) también sale de la caja de la firma, solo
-        # que hacia el Estado, y el aporte patronal encima. En modo manual no hay desglose,
-        # así que el monto tecleado es a la vez el neto y el costo.
+        if amount_cents < 0 or (modo == 'manual' and amount_cents == 0):
+            raise ValueError("El monto de pago debe ser positivo; el neto calculado no puede ser negativo")
+        # El costo laboral y la salida de caja son distintos: las obligaciones se pagan aparte.
         costo_empresa_cents = (
             calculo.total_devengado_cents + calculo.isss_patronal_cents + calculo.afp_patronal_cents
             if calculo is not None else amount_cents
@@ -1334,7 +1406,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         detail = f"Nómina - {employee} - {period.strip()}"
         expense_id = self.create_expense(
             detail=detail,
-            amount_text=str(costo_empresa_cents / 100),
+            amount_text=str(Decimal(amount_cents) / 100),
             expense_date=payment_date,
             notes=notes,
             created_at=created_at,
@@ -1367,9 +1439,23 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
                 (employee, (role or "").strip(), period.strip(), amount_cents, payment_date.strip(), (notes or "").strip(),
                  expense_id, personal_id, created_at, "manual", costo_empresa_cents),
             )
+        payroll_id = int(cur.lastrowid)
+        self.conn.execute("UPDATE payrolls SET cash_model='separado' WHERE id=%s", (payroll_id,))
+        if calculo is not None:
+            for kind, cents in [('ISSS', calculo.isss_empleado_cents + calculo.isss_patronal_cents),
+                                ('AFP', calculo.afp_empleado_cents + calculo.afp_patronal_cents),
+                                ('ISR', calculo.renta_cents)]:
+                if cents:
+                    self.conn.execute("INSERT INTO payroll_obligations(payroll_id,kind,amount_cents) VALUES(%s,%s,%s)",
+                                      (payroll_id,kind,cents))
+        record_event(self, 'payroll', payroll_id, 'Registro de pago', actor=username,
+                     details={'employee_name':employee, 'period':period, 'amount_cents':amount_cents,
+                              'costo_empresa_cents':costo_empresa_cents,'expense_id':expense_id,
+                              'payment_date':payment_date})
         self.conn.commit()
-        return int(cur.lastrowid)
+        return payroll_id
 
+    @workflow_atomic
     def update_payroll(
         self,
         payroll_id: int,
@@ -1379,13 +1465,17 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         amount_text: str,
         username: str,
     ) -> None:
-        """Solo corrige fecha de pago, notas y el monto neto — no recalcula el desglose de
-        ley (para eso hay que borrar y recrear). Cada cambio queda en `payroll_audit_log`
-        para que una corrección posterior al pago tenga registro de quién y qué cambió."""
+        """Preserve calculated breakdowns; only manual amounts may change."""
         row = self.get_payroll(payroll_id)
-        if not payment_date.strip():
-            raise ValueError("Fecha de pago requerida")
+        payment_date = self.payroll_payment_date(payment_date)
         amount_cents = _to_cents(amount_text)
+        if amount_cents < 0 or (row['modo'] == 'manual' and amount_cents == 0):
+            raise ValueError("Monto de pago inválido")
+        if row['modo'] == 'calculado' and amount_cents != row['amount_cents']:
+            raise ValueError("El neto calculado no se puede editar sin recalcular el desglose; anula y genera nuevamente la planilla")
+        if self.conn.execute("SELECT 1 FROM payroll_obligations WHERE payroll_id=%s AND expense_id IS NOT NULL AND payment_date<%s",
+                             (payroll_id,payment_date)).fetchone():
+            raise ValueError("La fecha no puede ser posterior al pago de sus obligaciones")
         fecha = now_iso()
         cambios = [
             ("payment_date", row["payment_date"], payment_date.strip()),
@@ -1396,8 +1486,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             "UPDATE payrolls SET payment_date=%s, notes=%s, amount_cents=%s WHERE id=%s",
             (payment_date.strip(), (notes or "").strip(), amount_cents, int(payroll_id)),
         )
-        # Corregir el neto mueve el costo del despacho en la misma cantidad: lo retenido y
-        # el aporte patronal no se recalculan aquí (para eso hay que rehacer la planilla).
+        # Manual corrections move net and cost together. Calculated amounts are immutable.
         costo_empresa_cents = int(row["costo_empresa_cents"] or row["amount_cents"]) + (amount_cents - int(row["amount_cents"]))
         self.conn.execute(
             "UPDATE payrolls SET costo_empresa_cents=%s WHERE id=%s", (costo_empresa_cents, int(payroll_id))
@@ -1405,7 +1494,8 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         if row["expense_id"]:
             self.conn.execute(
                 "UPDATE expenses SET amount_cents=%s, expense_date=%s, notes=%s WHERE id=%s",
-                (costo_empresa_cents, payment_date.strip(), (notes or "").strip(), int(row["expense_id"])),
+                (amount_cents if row['cash_model'] == 'separado' else costo_empresa_cents,
+                 payment_date.strip(), (notes or "").strip(), int(row["expense_id"])),
             )
         for campo, antes, despues in cambios:
             if antes != despues:
@@ -1423,8 +1513,15 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             ).fetchall()
         )
 
-    def delete_payroll(self, payroll_id: int) -> None:
-        row = self.conn.execute("SELECT expense_id FROM payrolls WHERE id=%s", (int(payroll_id),)).fetchone()
+    @workflow_atomic
+    def delete_payroll(self, payroll_id: int, *, username: str = "", reason: str = "Anulación de registro") -> None:
+        row = self.get_payroll(payroll_id)
+        if self.conn.execute("SELECT 1 FROM payroll_obligations WHERE payroll_id=%s AND expense_id IS NOT NULL", (payroll_id,)).fetchone():
+            raise ValueError("Anula primero los pagos de obligaciones de esta planilla")
+        record_event(self, 'payroll', payroll_id, 'Anulación', actor=username,
+                     details={'employee_name':row['employee_name'], 'period':row['period'],
+                              'amount_cents':row['amount_cents'], 'expense_id':row['expense_id'],
+                              'reason':reason, 'corrections':[dict(r) for r in self.list_payroll_audit_log(payroll_id)]})
         self.conn.execute("DELETE FROM payrolls WHERE id=%s", (int(payroll_id),))
         if row and row["expense_id"]:
             self.conn.execute("DELETE FROM expenses WHERE id=%s", (int(row["expense_id"]),))
@@ -1527,7 +1624,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             where.append("cs.status = %s")
             params.append(status)
         if estado_cobro:
-            where.append("cs.estado_cobro = %s")
+            where.append("financial.estado_cobro = %s")
             params.append(estado_cobro)
         if client_id:
             where.append("cs.client_id = %s")
@@ -1544,7 +1641,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
 
         w = (" WHERE " + " AND ".join(where)) if where else ""
         sql = (
-            "SELECT cs.*, cl.name AS client_name, "
+            "SELECT cs.*, financial.estado_cobro, cl.name AS client_name, "
             "sv.service_code, sv.nombre AS service_nombre, "
             "sc.id AS subcategory_id, sc.subcategory_code, sc.nombre AS subcategory_nombre, "
             "ct.id AS category_id, ct.category_code, ct.nombre AS category_nombre, "
@@ -1554,7 +1651,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             ")) AS saldo_pendiente_cents, "
             "COALESCE((SELECT SUM(monto_neto_operativo_cents) FROM costs WHERE case_id = cs.id), 0) AS costos_directos_reales_cents, "
             "(COALESCE(cs.fecha_cierre_real, CURRENT_DATE::text)::date - cs.opened_at::date) AS dias_duracion "
-            "FROM cases cs JOIN clients cl ON cl.id=cs.client_id "
+            "FROM cases cs JOIN case_collection_state financial ON financial.id=cs.id JOIN clients cl ON cl.id=cs.client_id "
             "LEFT JOIN servicios sv ON sv.id = cs.service_id "
             "LEFT JOIN subcategorias sc ON sc.id = sv.subcategory_id "
             "LEFT JOIN categorias ct ON ct.id = sc.category_id "
@@ -1613,14 +1710,15 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         return f"{prefix}{next_num:04d}"
 
     def get_case(self, case_id: int) -> Any:
-        row = self.conn.execute("SELECT * FROM cases WHERE id=%s", (int(case_id),)).fetchone()
+        row = self.conn.execute("SELECT cs.*, f.estado_cobro FROM cases cs JOIN case_collection_state f ON f.id=cs.id WHERE cs.id=%s", (int(case_id),)).fetchone()
         if not row:
             raise ValueError("Expediente no encontrado")
         return row
 
     @workflow_atomic
     def open_case(self, *, alcance: str, condiciones_cobro: str, revision_confirmada: bool,
-                  revision_observaciones: str, username: str, **data) -> int:
+                  revision_observaciones: str, username: str, origen_negocio: str = '', canal_captacion: str = '',
+                  tipo_comercial: str = '', originador_id: int | None = None, **data) -> int:
         if not alcance.strip() or not condiciones_cobro.strip() or not revision_confirmada:
             raise ValueError('Confirma alcance, condiciones de cobro y revisión de apertura')
         if not data.get('service_id') or data.get('honorarios_contratados_text') in ('',None):
@@ -1646,7 +1744,24 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         if (conflicto['clientes'] or conflicto['casos']) and not revision_observaciones.strip():
             raise ValueError('Documenta la revisión de posibles conflictos')
         data['proxima_accion'] = data.get('proxima_accion') or tareas[0]['titulo']
+        if origen_negocio not in ORIGENES_NEGOCIO or canal_captacion not in CANALES_CAPTACION:
+            raise ValueError('Selecciona el origen del negocio y el canal de captación')
+        if tipo_comercial not in ('Cliente nuevo','Venta cruzada','Cliente existente'):
+            raise ValueError('Selecciona el tipo comercial')
+        if origen_negocio in ORIGENES_CON_COMISION and not originador_id:
+            raise ValueError('Selecciona al responsable comercial que originó el negocio')
+        if originador_id and tipo_comercial == 'Cliente existente':
+            raise ValueError('Cliente existente sin venta nueva no genera comisión')
+        if originador_id and not self.conn.execute("SELECT 1 FROM personal WHERE id=%s AND estado='Activo'",(originador_id,)).fetchone():
+            raise ValueError('Selecciona un originador activo')
         cid = self.create_case(**data)
+        self.conn.execute('UPDATE cases SET origen_negocio=%s,canal_captacion=%s,tipo_comercial=%s WHERE id=%s',
+            (origen_negocio,canal_captacion,tipo_comercial,cid))
+        if originador_id:
+            self.set_negocio_originadores(cid,originadores=[dict(personal_id=originador_id,
+                porcentaje_participacion=100,tipo_origen=tipo_comercial)],created_at=data['created_at'])
+        record_event(self,'case',cid,'Atribución comercial de apertura',username,
+            dict(origen_negocio=origen_negocio,canal_captacion=canal_captacion,tipo_comercial=tipo_comercial,originador_id=originador_id))
         record_event(self,'case',cid,'Apertura confirmada',username,
             {'alcance':alcance.strip(),'condiciones_cobro':condiciones_cobro.strip(),
              'revision':revision_observaciones.strip(),'honorarios_pactados_cents':pactado,
@@ -1694,7 +1809,10 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         if not (internal_ref or "").strip():
             internal_ref = self._generate_case_ref(opened_at)
         honorarios_cents = self._to_cents_or_zero(honorarios_contratados_text)
-        costos_cents = self._to_cents_or_zero(costos_directos_estimados_text)
+        costos_cents = (sum(self._to_cents_or_zero(str(t.get('costo_estimado') or 0)) for t in (tareas_iniciales or []))
+                        if costos_directos_estimados_text in ('',None) else self._to_cents_or_zero(costos_directos_estimados_text))
+        if costos_cents < 0:
+            raise ValueError('El presupuesto de costos no puede ser negativo')
         cur = self.conn.execute(
             "INSERT INTO cases(client_id, title, status, priority, opened_at, closed_at, notes, created_at, "
             "internal_ref, official_ref, opposing_party, court_entity, responsible_username, "
@@ -2468,7 +2586,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
                LEFT JOIN clients cl ON cl.id = s.client_id
                LEFT JOIN cases ca ON ca.id = s.case_id
                WHERE s.session_date >= %s AND s.session_date <= %s
-                 AND s.status != 'Realizada'
+                 AND s.status NOT IN ('Realizada','Finalizada','Cancelada')
                ORDER BY s.session_date, s.start_time NULLS LAST""",
             (today, until),
         ).fetchall()
@@ -2522,13 +2640,13 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         overdue_billing_rows = self.conn.execute(
             """
             WITH saldos AS (
-                SELECT cs.id, cs.title, cl.name AS client_name, cs.mes_cobro_esperado, cs.estado_cobro,
+                SELECT cs.id, cs.title, cl.name AS client_name, cs.mes_cobro_esperado, (SELECT f.estado_cobro FROM case_collection_state f WHERE f.id=cs.id) AS estado_cobro,
                        cs.responsible_username,
                        (cs.honorarios_contratados_cents - COALESCE(
                            (SELECT SUM(monto_neto_operativo_cents) FROM incomes WHERE case_id = cs.id), 0
                        )) AS saldo_pendiente_cents
                 FROM cases cs LEFT JOIN clients cl ON cl.id = cs.client_id
-                WHERE cs.mes_cobro_esperado IS NOT NULL AND cs.mes_cobro_esperado < %s AND cs.estado_cobro <> 'Cobrado'
+                WHERE cs.mes_cobro_esperado IS NOT NULL AND cs.mes_cobro_esperado < %s
                   AND cs.archived_at IS NULL
             )
             SELECT * FROM saldos WHERE saldo_pendiente_cents > 0 ORDER BY mes_cobro_esperado ASC LIMIT 20
@@ -4163,14 +4281,12 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         rows = self.conn.execute(
             f"""
             WITH saldos AS (
-                SELECT cs.id, cs.title, cs.estado_cobro, cs.mes_cobro_esperado, cs.probabilidad_cobro,
+                SELECT cs.id, cs.title, financial.estado_cobro, cs.mes_cobro_esperado, cs.probabilidad_cobro,
                        (cs.honorarios_contratados_cents - COALESCE(
                            (SELECT SUM(monto_neto_operativo_cents) FROM incomes WHERE case_id = cs.id), 0
                        )) AS saldo_pendiente_cents
-                FROM cases cs
+                FROM cases cs JOIN case_collection_state financial ON financial.id=cs.id
                 WHERE cs.archived_at IS NULL
-                  AND cs.estado_cobro <> 'Suspendido'
-                  AND NOT (cs.status = 'Cerrado' AND cs.estado_cobro = 'En ejecución')
                   {mes_filter}
             )
             SELECT * FROM saldos WHERE saldo_pendiente_cents > 0 ORDER BY saldo_pendiente_cents DESC
@@ -4344,6 +4460,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         revision_observaciones: str = "", opposing_party: str = "",
         tareas_iniciales: list[dict] | None = None,
         originador_id: int | None = None,
+        costos_directos_estimados: float | None = None,
         mes_cobro_esperado: str | None = None, probabilidad_cobro: float | None = None,
     ) -> int | None:
         """Avanza el estado de una oportunidad. Si nuevo_estado='Ganado', crea el expediente
@@ -4457,6 +4574,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             created_at=fecha,
             service_id=int(current["service_id"]),
             honorarios_contratados_text=str(honorarios_pactados),
+            costos_directos_estimados_text=str(costos_directos_estimados) if costos_directos_estimados is not None else "",
             mes_cobro_esperado=mes_cobro_esperado, probabilidad_cobro=probabilidad_cobro,
             opposing_party=opposing_party,
             tareas_iniciales=tareas_iniciales,
@@ -4483,6 +4601,9 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         if current['origen_negocio'] in ORIGENES_CON_COMISION and not self.list_negocio_originadores(case_id):
             record_event(self,'case',case_id,'Originador pendiente de asignación',usuario_id,
                          {'notas':'Revisar la atribución comercial en los originadores del expediente.'})
+        self.conn.execute('UPDATE cases SET origen_negocio=%s,canal_captacion=%s,tipo_comercial=%s WHERE id=%s',
+            (current['origen_negocio'],current['canal_captacion'],
+             'Venta cruzada' if self.conn.execute('SELECT 1 FROM cases WHERE client_id=%s AND id<>%s',(client_id,case_id)).fetchone() else 'Cliente nuevo',case_id))
         self.conn.execute('INSERT INTO opportunity_conversions(opportunity_id,case_id,created_at) VALUES(%s,%s,%s)',
                           (oportunidad_id,case_id,fecha))
         record_event(self,'case',case_id,'Apertura confirmada',usuario_id,
@@ -4556,7 +4677,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         }
 
     def conversion_comercial(self, *, mes: str | None = None, origen: str | None = None, service_id: int | None = None) -> dict:
-        """Ganados / Cotizados — KPI de conversión comercial (solo cuenta lo que de verdad pasó por Cotizado)."""
+        """Ganados / propuestas: incluye los acuerdos ganados sin etapa Cotizado explícita."""
         filters, params = [], []
         if mes:
             filters.append("substring(COALESCE(fecha_cotizado,fecha_prospecto),1,7)=%s")
@@ -4570,7 +4691,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         where = ' WHERE ' + ' AND '.join(filters) if filters else ''
         row = self.conn.execute(
             f"""SELECT
-                 COUNT(*) FILTER (WHERE fecha_cotizado IS NOT NULL) AS cotizados,
+                 COUNT(*) FILTER (WHERE fecha_cotizado IS NOT NULL OR estado = 'Ganado') AS cotizados,
                  COUNT(*) FILTER (WHERE estado = 'Ganado') AS ganados,
                  COUNT(*) FILTER (WHERE estado = 'Perdido') AS perdidos,
                  COUNT(*) FILTER (WHERE estado = 'Prospecto') AS prospectos,
@@ -4609,6 +4730,10 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             self._resincronizar_comisiones_caso(case_id, revertir=bool(antes), created_at=created_at)
             self.conn.commit()
             return
+        for origin in originadores:
+            participation = float(origin['porcentaje_participacion'])
+            if not 0 < participation <= 100:
+                raise ValueError('Cada participación debe ser mayor que cero y no superar 100%')
         total = sum(float(o["porcentaje_participacion"]) for o in originadores)
         if abs(total - 100) > 0.01:
             raise ValueError(f"Los porcentajes de participación deben sumar 100% (suman {total:.2f}%)")
@@ -4642,14 +4767,8 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         )
 
     def _resincronizar_comisiones_caso(self, case_id: int, *, revertir: bool, created_at: str) -> None:
-        incomes = self.conn.execute(
-            "SELECT id FROM incomes WHERE case_id=%s ORDER BY income_date ASC, id ASC", (int(case_id),)
-        ).fetchall()
-        if revertir:
-            for inc in incomes:
-                self._revertir_comisiones_income(int(inc["id"]), motivo="Recálculo de cobros, costos u originadores", created_at=created_at)
-        for inc in incomes:
-            self.reconocer_comision_income(int(inc["id"]), created_at=created_at, commit=False)
+        from .commission_reconciliation import reconcile
+        reconcile(self, created_at)
 
     @staticmethod
     def _formula_comision_tramos(utilidad_cents: int) -> int:
@@ -4701,62 +4820,13 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
 
     @workflow_atomic
     def reconocer_comision_income(self, income_id: int, *, created_at: str, commit: bool = True) -> list[Any]:
-        """Punto de entrada: al cobrarse efectivamente un honorario, reconoce la comisión de cada originador
-        del expediente. Idempotente — si este cobro ya tiene comisión vigente (no revertida), la devuelve sin duplicar."""
-        income = self.conn.execute("SELECT * FROM incomes WHERE id=%s", (int(income_id),)).fetchone()
-        if not income:
-            raise ValueError("Ingreso no encontrado")
-        existentes = self._comisiones_vigentes_income(int(income_id))
-        if existentes:
-            return [self.get_comision(int(r["id"])) for r in existentes]
-        if not income["case_id"]:
-            return []  # solo los cobros ligados a un expediente pueden generar comisión
-
-        originadores = self.list_negocio_originadores(income["case_id"])
-        if not originadores:
-            return []  # expediente sin originadores configurados — nada que reconocer todavía
-
-        caso = self.conn.execute(
-            """SELECT cs.honorarios_contratados_cents, COALESCE(cs.internal_ref || ' — ', '') || cs.title AS case_label,
-                      COALESCE((SELECT SUM(monto_neto_operativo_cents) FROM costs WHERE case_id = cs.id), 0) AS costos_directos_reales_cents
-               FROM cases cs WHERE cs.id=%s""",
-            (income["case_id"],),
-        ).fetchone()
-        honorarios = int(caso["honorarios_contratados_cents"] or 0)
-        costos = int(caso["costos_directos_reales_cents"] or 0)
-        # Se recuperan primero los costos reales: cada abono solo aporta la utilidad
-        # incremental que queda después de cubrirlos. Orden estable por fecha e id.
-        prior = int(self.conn.execute("""SELECT COALESCE(SUM(monto_neto_operativo_cents),0) AS total
-            FROM incomes WHERE case_id=%s AND (income_date,id) < (%s,%s)""",
-            (income['case_id'],income['income_date'],income_id)).fetchone()['total'])
-        collected = int(income['monto_neto_operativo_cents'])
-        utilidad_directa_total_cents = max(0, prior + collected - costos) - max(0, prior - costos)
-        mes = str(income["income_date"])[:7]
-        adjustment_period = self.conn.execute("""SELECT MAX(r.mes_reconocimiento) AS mes
-            FROM comisiones r JOIN comisiones original ON original.id=r.ajusta_a_commission_id
-            WHERE original.income_id=%s AND original.liquidacion_id IS NOT NULL""", (income_id,)).fetchone()['mes']
-        if adjustment_period:
-            mes = max(mes, adjustment_period)
-
-        ids: list[int] = []
-        for orig in originadores:
-            share_cents = round(utilidad_directa_total_cents * float(orig["porcentaje_participacion"]) / 100)
-            comision_cents, acumulado_antes_cents, acumulado_despues_cents = self._comision_marginal(
-                personal_id=orig["personal_id"], mes=mes, tipo_origen=orig["tipo_origen"], utilidad_incremento_cents=share_cents,
-            )
-            cur = self.conn.execute(
-                """INSERT INTO comisiones(income_id, case_id, personal_id, tipo_origen, porcentaje_participacion,
-                       base_utilidad_directa_cents, comision_cents, mes_reconocimiento,
-                       base_acumulada_antes_cents, base_acumulada_despues_cents, fecha_cobro, case_label, created_at)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (int(income_id), income["case_id"], orig["personal_id"], orig["tipo_origen"], orig["porcentaje_participacion"],
-                 share_cents, comision_cents, mes, acumulado_antes_cents, acumulado_despues_cents,
-                 str(income["income_date"]), caso["case_label"], created_at),
-            )
-            ids.append(int(cur.lastrowid))
+        if not self.get_income(income_id):
+            raise ValueError('Ingreso no encontrado')
+        from .commission_reconciliation import reconcile
+        reconcile(self, created_at)
         if commit:
             self.conn.commit()
-        return [self.get_comision(cid) for cid in ids]
+        return [self.get_comision(r['id']) for r in self._comisiones_vigentes_income(income_id)]
 
     def _comisiones_vigentes_income(self, income_id: int) -> list[Any]:
         return list(self.conn.execute(
@@ -4766,15 +4836,16 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
 
     def _revertir_comisiones_income(self, income_id: int, *, motivo: str, created_at: str) -> None:
         for c in self._comisiones_vigentes_income(income_id):
-            self.revertir_comision(int(c["id"]), created_at=created_at, motivo=motivo, commit=False)
+            self.revertir_comision(int(c["id"]), created_at=created_at, motivo=motivo, commit=False, exclude=False)
 
     def get_comision(self, commission_id: int) -> Any:
         row = self.conn.execute(
-            """SELECT c.*, p.person_code, p.persona AS persona_nombre,
+            """SELECT c.*, cs.client_id, cl.name AS client_name, p.person_code, p.persona AS persona_nombre,
                       COALESCE(cs.title, c.case_label) AS case_title, COALESCE(i.income_date, c.fecha_cobro) AS income_date
                FROM comisiones c
                JOIN personal p ON p.id = c.personal_id
                LEFT JOIN cases cs ON cs.id = c.case_id
+               LEFT JOIN clients cl ON cl.id=cs.client_id
                LEFT JOIN incomes i ON i.id = c.income_id
                WHERE c.id=%s""",
             (int(commission_id),),
@@ -4799,11 +4870,12 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             params.append(int(income_id))
         clause = " WHERE " + " AND ".join(where) if where else ""
         return list(self.conn.execute(
-            f"""SELECT c.*, p.person_code, p.persona AS persona_nombre,
+            f"""SELECT c.*, cs.client_id, cl.name AS client_name, p.person_code, p.persona AS persona_nombre,
                        COALESCE(cs.title, c.case_label) AS case_title, COALESCE(i.income_date, c.fecha_cobro) AS income_date
                 FROM comisiones c
                 JOIN personal p ON p.id = c.personal_id
                 LEFT JOIN cases cs ON cs.id = c.case_id
+               LEFT JOIN clients cl ON cl.id=cs.client_id
                 LEFT JOIN incomes i ON i.id = c.income_id
                 {clause}
                 ORDER BY c.created_at DESC""",
@@ -4811,7 +4883,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         ).fetchall())
 
     @workflow_atomic
-    def revertir_comision(self, commission_id: int, *, created_at: str, motivo: str = "Reversión manual", commit: bool = True) -> Any:
+    def revertir_comision(self, commission_id: int, *, created_at: str, motivo: str = "Reversión manual", commit: bool = True, exclude: bool = True) -> Any:
         """Reversión trazable: crea un movimiento nuevo negativo referenciando el original — nunca edita el histórico.
         Si fue pagada, se compensa desde el siguiente período; si no, se anula el devengo original."""
         original = self.get_comision(commission_id)
@@ -4838,6 +4910,11 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         if not paid:
             self.conn.execute("UPDATE comisiones SET estado='Anulada' WHERE id=%s", (adjustment_id,))
         record_event(self, 'comision', commission_id, 'Reversión', '', {'ajuste_id': adjustment_id, 'motivo': motivo})
+        if exclude and original['income_id']:
+            self.conn.execute("""INSERT INTO commission_exclusions(income_id,personal_id,reason,created_at) VALUES(%s,%s,%s,%s) ON CONFLICT(income_id,personal_id) DO UPDATE SET reason=EXCLUDED.reason RETURNING income_id""",
+                (original['income_id'],original['personal_id'],motivo,created_at))
+            from .commission_reconciliation import reconcile
+            reconcile(self, created_at)
         if commit:
             self.conn.commit()
         return self.get_comision(adjustment_id)
@@ -4847,8 +4924,8 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         return list(self.conn.execute(
             """SELECT p.id AS personal_id, p.person_code, p.persona AS persona_nombre,
                       COALESCE(SUM(c.comision_cents), 0) AS total_comision_cents,
-                      COALESCE(SUM(c.base_utilidad_directa_cents) FILTER (WHERE c.ajusta_a_commission_id IS NULL), 0) AS total_utilidad_directa_cents,
-                      COUNT(*) FILTER (WHERE c.ajusta_a_commission_id IS NULL) AS movimientos,
+                      COALESCE(SUM(c.base_utilidad_directa_cents) FILTER (WHERE c.ajusta_a_commission_id IS NULL AND c.estado <> 'Anulada'), 0) AS total_utilidad_directa_cents,
+                      COUNT(*) FILTER (WHERE c.ajusta_a_commission_id IS NULL AND c.estado <> 'Anulada') AS movimientos,
                       COUNT(*) FILTER (WHERE c.ajusta_a_commission_id IS NOT NULL) AS ajustes
                FROM personal p
                JOIN comisiones c ON c.personal_id = p.id AND c.mes_reconocimiento = %s
@@ -5368,7 +5445,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         self._meses_rango(d, h)
         if agrupar_por not in ('originador','canal'):
             raise ValueError('Agrupación inválida')
-        origin_expression = "COALESCE(op.canal_captacion, 'Sin canal')" if agrupar_por == 'canal' else "COALESCE(pe.persona, 'Sin originador')"
+        origin_expression = "COALESCE(NULLIF(cs.canal_captacion,''),op.canal_captacion, 'Sin canal')" if agrupar_por == 'canal' else "COALESCE(pe.persona, 'Sin originador')"
         rows = self.conn.execute(
             f"""WITH cobros AS (
                    SELECT i.case_id, SUM(i.monto_neto_operativo_cents) AS ingresos_cents
@@ -5380,20 +5457,22 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
                    FROM costs co
                    WHERE substring(co.cost_date,1,7) BETWEEN %s AND %s
                    GROUP BY co.case_id
-               )
+               ), negocios AS (SELECT case_id FROM cobros UNION SELECT case_id FROM costos_caso)
                SELECT {origin_expression} AS origen,
-                      COALESCE(no.tipo_origen, 'Sin clasificar') AS tipo_origen,
-                      COUNT(DISTINCT cb.case_id) AS casos,
+                      COALESCE(no.tipo_origen, NULLIF(cs.tipo_comercial,''), 'Sin clasificar') AS tipo_origen,
+                      COUNT(DISTINCT base.case_id) AS casos,
+                      JSONB_AGG(DISTINCT JSONB_BUILD_OBJECT('id',base.case_id,'title',COALESCE(cs.title,'Operaciones sin expediente'))) AS expedientes,
                       SUM(cb.ingresos_cents * COALESCE(no.porcentaje_participacion, 100) / 100.0) AS ingresos_cents,
                       SUM(COALESCE(cc.costos_cents, 0) * COALESCE(no.porcentaje_participacion, 100) / 100.0) AS costos_cents
-               FROM cobros cb
-               LEFT JOIN cases cs ON cs.id=cb.case_id
+               FROM negocios base
+               LEFT JOIN cobros cb ON cb.case_id IS NOT DISTINCT FROM base.case_id
+               LEFT JOIN cases cs ON cs.id=base.case_id
                LEFT JOIN oportunidades op ON op.id=cs.opportunity_id
-               LEFT JOIN negocio_originadores no ON no.case_id = cb.case_id
+               LEFT JOIN negocio_originadores no ON no.case_id = base.case_id
                LEFT JOIN personal pe ON pe.id = no.personal_id
-               LEFT JOIN costos_caso cc ON cc.case_id = cb.case_id
+               LEFT JOIN costos_caso cc ON cc.case_id IS NOT DISTINCT FROM base.case_id
                GROUP BY 1, 2
-               ORDER BY 4 DESC""",
+               ORDER BY 5 DESC""",
             (d, h, d, h),
         ).fetchall()
         resultado = []
@@ -5403,7 +5482,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             utilidad_cents = ingresos_cents - costos_cents
             resultado.append({
                 "origen": r["origen"], "tipo_origen": r["tipo_origen"],
-                "casos": int(r["casos"]),
+                "casos": int(r["casos"]), "expedientes": r["expedientes"],
                 "ingresos_cents": ingresos_cents,
                 "costos_directos_cents": costos_cents,
                 "utilidad_directa_cents": utilidad_cents,
@@ -5411,7 +5490,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             })
         return resultado
 
-    def dias_promedio_cobro(self, *, desde: str, hasta: str) -> dict:
+    def dias_promedio_cobro(self, *, desde: str, hasta: str, service_id: int | None = None, client_id: int | None = None) -> dict:
         """KPI-016 — días entre la facturación (o el cierre del expediente) y el cobro.
 
         Un cobro sin factura ni fecha de cierre no tiene desde cuándo contar: se informa
@@ -5423,7 +5502,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
             """SELECT i.id,
                       COALESCE(inv.invoice_date, cs.fecha_cierre_real) AS fecha_referencia,
                       i.income_date,
-                      sv.service_code, sv.nombre AS service_nombre
+                      sv.service_code, sv.nombre AS service_nombre, sv.id AS service_id, i.client_id
                FROM incomes i
                LEFT JOIN invoice_payments payment ON payment.income_id=i.id AND payment.released_at IS NULL
                LEFT JOIN invoices inv ON inv.id = payment.invoice_id AND inv.status <> 'Cancelada'
@@ -5437,6 +5516,8 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         por_servicio: dict[str, dict] = {}
         sin_referencia = 0
         for r in rows:
+            if service_id is not None and r['service_id']!=service_id: continue
+            if client_id is not None and r['client_id']!=client_id: continue
             if not r["fecha_referencia"]:
                 sin_referencia += 1
                 continue
@@ -5477,14 +5558,14 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
         fecha de apertura, que es lo más antiguo que se puede afirmar con certeza."""
         corte = date.fromisoformat(fecha_corte) if fecha_corte else date.today()
         rows = self.conn.execute(
-            """SELECT cs.id, cs.title, cs.estado_cobro, cs.mes_cobro_esperado, cs.opened_at,
+            """SELECT cs.id, cs.title, (SELECT f.estado_cobro FROM case_collection_state f WHERE f.id=cs.id) AS estado_cobro, cs.mes_cobro_esperado, cs.opened_at,
                       cl.name AS client_name,
                       (cs.honorarios_contratados_cents - COALESCE(
                           (SELECT SUM(monto_neto_operativo_cents) FROM incomes WHERE case_id = cs.id), 0
                       )) AS saldo_pendiente_cents
                FROM cases cs
                LEFT JOIN clients cl ON cl.id = cs.client_id
-               WHERE cs.archived_at IS NULL AND cs.estado_cobro <> 'Cobrado'""",
+               WHERE cs.archived_at IS NULL""",
         ).fetchall()
 
         tramos = {t: {"tramo": t, "saldo_cents": 0, "casos": 0} for t in self._AGING_TRAMOS}
@@ -5826,6 +5907,7 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
 
         raise ValueError(f"Tipo de registro no soportado para Baja: {tipo}")
 
+    @workflow_atomic
     def transition_solicitud(
         self, solicitud_id: int, *, estado: str, resultado_revision_duplicidad: str | None = None,
         aprobador: str | None = None, observaciones: str | None = None, created_at: str, usuario_id: int | None = None,
@@ -5872,6 +5954,8 @@ class Repository(FinancialWorkflowRepository, BillingRepository):
                 raise ValueError(f"Tipo de solicitud no soportado: {current['tipo_solicitud']}")
             fields["estado"] = "Activo"
             fields["codigo_definitivo"] = codigo_real
+            from .governance import schedule_catalog_review
+            schedule_catalog_review(self,solicitud_id,aprobador.strip(),created_at)
             obs = f"{obs}\n{nota}" if obs else nota
         else:
             fields["estado"] = estado

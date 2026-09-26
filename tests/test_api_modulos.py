@@ -168,6 +168,7 @@ def test_flujo_completo_expediente_tareas_honorarios_factura(app_client, servici
 
     # Crear expediente con tareas iniciales (las de la plantilla)
     r = app_client.post("/cases", json={
+        "origen_negocio":"Orgánico", "canal_captacion":"Google", "tipo_comercial":"Cliente nuevo",
         "client_id": cliente_id, "title": "Caso API", "status": "Abierto", "priority": "Media", "opened_at": "2026-03-01",
         "service_id": servicio_id, "honorarios_contratados": 1000, "responsible_username":"admin",
         "alcance":"Servicio contratado", "condiciones_cobro":"Al finalizar", "revision_confirmada":True,"mes_cobro_esperado":"2026-12","probabilidad_cobro":0.7,
@@ -202,7 +203,7 @@ def test_flujo_completo_expediente_tareas_honorarios_factura(app_client, servici
     assert next(c for c in app_client.get("/cases").json() if c["id"] == case_id)["honorarios_contratados"] == 1350
 
     # Facturar solo trabajo de este expediente; otro expediente del mismo cliente no debe colarse
-    otro = app_client.post("/cases", json={"client_id": cliente_id, "title": "Otro caso", "status": "Abierto", "priority": "Baja", "opened_at": "2026-03-01", "service_id":servicio_id, "honorarios_contratados":0,"responsible_username":"admin","alcance":"Servicio gratuito", "condiciones_cobro":"Sin cobro", "revision_confirmada":True,"mes_cobro_esperado":"2026-12","probabilidad_cobro":0.7,"tareas_iniciales":[{"titulo":"Revisar", "due_date":"2026-03-02"}]}).json()
+    otro = app_client.post("/cases", json={"origen_negocio":"Orgánico","canal_captacion":"Otro","tipo_comercial":"Cliente existente","client_id": cliente_id, "title": "Otro caso", "status": "Abierto", "priority": "Baja", "opened_at": "2026-03-01", "service_id":servicio_id, "honorarios_contratados":0,"responsible_username":"admin","alcance":"Servicio gratuito", "condiciones_cobro":"Sin cobro", "revision_confirmada":True,"mes_cobro_esperado":"2026-12","probabilidad_cobro":0.7,"tareas_iniciales":[{"titulo":"Revisar", "due_date":"2026-03-02"}]}).json()
     tarea_otro = app_client.post(f"/cases/{otro['id']}/tasks", json={"title": "Tarea del otro caso"}).json()
 
     sin_filtro = app_client.get(f"/invoices/unbilled/{cliente_id}").json()
@@ -273,8 +274,10 @@ def test_flujo_nomina_completo(app_client, repo):
     assert app_client.post("/payroll", json=body).status_code == 422
 
     r = app_client.put(f"/payroll/{pago['id']}", json={"payment_date": "2026-06-01", "notes": "corregido", "amount": pago["amount"] + 1})
+    assert r.status_code == 422, r.text
+    r = app_client.put(f"/payroll/{pago['id']}", json={"payment_date": "2026-06-01", "notes": "corregido", "amount": pago["amount"]})
     assert r.status_code == 200, r.text
-    assert {e["campo"] for e in app_client.get(f"/payroll/{pago['id']}/audit-log").json()} >= {"amount_cents", "payment_date"}
+    assert {e["campo"] for e in app_client.get(f"/payroll/{pago['id']}/audit-log").json()} >= {"payment_date", "notes"}
 
     # Persona sin cuenta contable enlazada → error claro, no 500
     sin_cuenta = app_client.post("/finanzas/personal", json={"persona": f"Sin cuenta {u}", "mes_inicio": "2026-01"}).json()
@@ -300,7 +303,7 @@ def test_config_de_nomina_nueva_version_por_api(app_client):
     r = app_client.post("/payroll/config", json={
         "vigente_desde": "2032-01-01", "isss_tasa_empleado": 0.03, "isss_tasa_patronal": 0.075, "isss_tope_cotizable": 1000,
         "afp_tasa_empleado": 0.0725, "afp_tasa_patronal": 0.0875, "afp_tope_cotizable": None,
-        "tope_salario_indemnizacion": 1612.8, "tramos_renta": [{"sobre_exceso_de": 0, "hasta": 600, "cuota_fija": 0, "porcentaje_exceso": 0}],
+        "tope_salario_indemnizacion": 1612.8, "tramos_renta": [{"sobre_exceso_de": 0, "hasta": None, "cuota_fija": 0, "porcentaje_exceso": 0}],
     })
     assert r.status_code == 201, r.text
     assert r.json()["tope_salario_indemnizacion"] == 1612.8 and r.json()["afp_tope_cotizable"] is None

@@ -40,7 +40,7 @@ def send_reminders(
            FROM sessions s
            LEFT JOIN clients cl ON cl.id = s.client_id
            WHERE s.session_date = %s
-             AND s.status NOT IN ('Finalizada')
+             AND s.status NOT IN ('Finalizada','Cancelada')
              AND cl.email IS NOT NULL AND cl.email != ''""",
         (tomorrow,),
     ).fetchall()
@@ -58,7 +58,7 @@ def send_reminders(
            LEFT JOIN clients cl ON cl.id = s.client_id
            WHERE s.session_date = %s
              AND s.start_time >= %s AND s.start_time <= %s
-             AND s.status NOT IN ('Finalizada')
+             AND s.status NOT IN ('Finalizada','Cancelada')
              AND cl.email IS NOT NULL AND cl.email != ''""",
         (today_str, now_time, two_h_later),
     ).fetchall()

@@ -12,6 +12,7 @@ reutilizar tanto en el endpoint de vista previa como en la creación real de la 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 
 
 @dataclass
@@ -94,7 +95,7 @@ def calcular_planilla(
         ("horas extra", horas_extra_cantidad),
         ("horas de nocturnidad", nocturnidad_horas),
     ):
-        if valor < 0:
+        if not isfinite(valor) or valor < 0:
             raise ValueError(f"Las {nombre} no pueden ser negativas")
     for nombre, valor in (
         ("bonificaciones", bonificaciones_cents),
@@ -103,10 +104,12 @@ def calcular_planilla(
         ("descuento por préstamos", descuento_prestamos_cents),
         ("otros descuentos", otros_descuentos_cents),
     ):
-        if valor < 0:
+        if not isfinite(valor) or valor < 0:
             raise ValueError(f"El monto de {nombre} no puede ser negativo")
 
     advertencias: list[str] = []
+    if horas_extra_cantidad and config.recargo_hora_extra_pct < 1:
+        advertencias.append("El recargo diurno configurado es menor al 100%; corrige la configuración antes de pagar horas extra")
 
     valor_hora_ordinaria = salario_base_cents / config.horas_jornada_mensual if config.horas_jornada_mensual else 0
     valor_hora_extra = valor_hora_ordinaria * (1 + config.recargo_hora_extra_pct)
@@ -131,16 +134,12 @@ def calcular_planilla(
         + otros_ingresos_cents
     )
 
-    # ISSS y AFP se calculan sobre el salario devengado regular (sin horas extra ni bonos
-    # ocasionales, que no cotizan) y respetan el tope de cotización de ley, si existe.
-    base_cotizable_isss = (
-        salario_devengado_base if config.isss_tope_cotizable_cents is None
-        else min(salario_devengado_base, config.isss_tope_cotizable_cents)
-    )
-    base_cotizable_afp = (
-        salario_devengado_base if config.afp_tope_cotizable_cents is None
-        else min(salario_devengado_base, config.afp_tope_cotizable_cents)
-    )
+    # Remuneración salarial: incluye extras, nocturnidad y bonos por servicios.
+    # Gratificaciones extraordinarias/viáticos no pertenecen a estos campos.
+    base_cotizable_isss = (total_devengado_cents if config.isss_tope_cotizable_cents is None
+                          else min(total_devengado_cents, config.isss_tope_cotizable_cents))
+    base_cotizable_afp = (total_devengado_cents if config.afp_tope_cotizable_cents is None
+                         else min(total_devengado_cents, config.afp_tope_cotizable_cents))
     isss_empleado_cents = round(base_cotizable_isss * config.isss_tasa_empleado)
     isss_patronal_cents = round(base_cotizable_isss * config.isss_tasa_patronal)
     afp_empleado_cents = round(base_cotizable_afp * config.afp_tasa_empleado)

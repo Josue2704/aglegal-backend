@@ -120,7 +120,7 @@ def test_el_gasto_se_agrupa_por_centro_de_costo(repo, catalogo, codigo_unico):
     assert por_centro["Administración"]["porcentaje"] == pytest.approx(0.8108, abs=1e-4)
 
 
-def test_la_planilla_se_asienta_por_lo_que_le_cuesta_al_despacho(repo, catalogo, codigo_unico):
+def test_la_planilla_se_asienta_por_el_neto_pagado_y_separa_el_costo(repo, catalogo, codigo_unico):
     mes = "2027-06"
     _supuestos(repo)
     cuenta = _cuenta_egreso(repo, codigo_unico, sufijo="003", nombre=f"Salario {codigo_unico}")
@@ -135,10 +135,18 @@ def test_la_planilla_se_asienta_por_lo_que_le_cuesta_al_despacho(repo, catalogo,
     assert p["costo_empresa_cents"] == 93_000    # $800 devengado + $130 patronal
     assert esperado == 93_000
     gasto = next(e for e in repo.list_expenses() if e["id"] == p["expense_id"])
-    assert gasto["amount_cents"] == 93_000
+    assert gasto["amount_cents"] == p["amount_cents"]
 
     fila = repo.resumen_mensual(desde=mes, hasta=mes)["meses"][0]
-    assert fila["gastos_reales_cents"] == 93_000
+    assert fila["gastos_reales_cents"] == p["amount_cents"]
+    obligations = [r for r in repo.list_payroll_obligations() if r['payroll_id'] == pid]
+    next_month_before = repo.utilidad_operativa_real(mes='2027-07')['gastos_operativos_reales_cents']
+    for obligation in obligations:
+        repo.pay_payroll_obligation(obligation['id'], payment_date='2027-07-05',
+                                    reference='Remesa comprobada',actor='tester')
+    assert repo.resumen_mensual(desde=mes,hasta=mes)['meses'][0]['gastos_reales_cents'] == p['amount_cents']
+    next_month = repo.utilidad_operativa_real(mes='2027-07')['gastos_operativos_reales_cents']
+    assert next_month - next_month_before == p['costo_empresa_cents'] - p['amount_cents']
 
 
 def test_corregir_el_neto_mueve_el_costo_en_la_misma_cantidad(repo, catalogo, codigo_unico):
